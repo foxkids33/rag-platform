@@ -1,0 +1,9 @@
+[project]
+name = "rag-platform-worker"
+version = "0.1.0"
+description = "RAG Platform ingestion worker"
+requires-python = ">=3.12"
+dependencies = [
+  "redis>=5.2,<7",
+  "pydantic-settings>=2.7,<3",
+]
