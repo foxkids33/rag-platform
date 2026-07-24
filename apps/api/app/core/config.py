@@ -20,6 +20,11 @@ class Settings(BaseSettings):
     minio_secret_key: str = "minio123"
     minio_bucket: str = "rag-documents"
     minio_secure: bool = False
+    upload_max_mb: int = 100
+
+    @property
+    def upload_max_bytes(self) -> int:
+        return self.upload_max_mb * 1024 * 1024
 
     vllm_base_url: str = "http://localhost:8001"
     vllm_api_key: str = ""

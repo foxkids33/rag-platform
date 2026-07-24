@@ -1,0 +1,150 @@
+from __future__ import annotations
+
+import hashlib
+import re
+import uuid
+from datetime import datetime
+from pathlib import Path
+
+from anyio import to_thread
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
+from pydantic import BaseModel, ConfigDict
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.config import settings
+from app.db.models import Document, Workspace
+from app.db.session import get_db
+from app.services.storage import StorageError, storage
+
+router = APIRouter(prefix="/workspaces/{workspace_id}/documents", tags=["documents"])
+
+ALLOWED_EXTENSIONS = {".txt", ".md", ".csv", ".json", ".html", ".htm", ".xml"}
+READ_CHUNK_SIZE = 1024 * 1024
+
+
+class DocumentOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    workspace_id: uuid.UUID | None
+    filename: str
+    object_key: str
+    mime_type: str | None
+    sha256: str
+    status: str
+    created_at: datetime
+
+
+def _safe_filename(filename: str) -> str:
+    name = Path(filename).name.strip()
+    name = re.sub(r"[^\w.()\- ]+", "_", name, flags=re.UNICODE)
+    return name[:500] or "document"
+
+
+async def _hash_and_measure(file: UploadFile) -> tuple[str, int]:
+    digest = hashlib.sha256()
+    total_size = 0
+
+    while chunk := await file.read(READ_CHUNK_SIZE):
+        digest.update(chunk)
+        total_size += len(chunk)
+        if total_size > settings.upload_max_bytes:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail=f"File exceeds the {settings.upload_max_mb} MB upload limit",
+            )
+
+    await file.seek(0)
+    return digest.hexdigest(), total_size
+
+
+@router.get("", response_model=list[DocumentOut])
+async def list_workspace_documents(
+    workspace_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+):
+    workspace = await db.get(Workspace, workspace_id)
+    if workspace is None:
+        raise HTTPException(status_code=404, detail="Workspace not found")
+
+    result = await db.execute(
+        select(Document)
+        .where(Document.workspace_id == workspace_id)
+        .order_by(Document.created_at.desc())
+    )
+    return list(result.scalars())
+
+
+@router.post("", response_model=DocumentOut, status_code=status.HTTP_201_CREATED)
+async def upload_workspace_document(
+    workspace_id: uuid.UUID,
+    file: UploadFile = File(...),
+    db: AsyncSession = Depends(get_db),
+):
+    workspace = await db.get(Workspace, workspace_id)
+    if workspace is None:
+        raise HTTPException(status_code=404, detail="Workspace not found")
+
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="Uploaded file has no filename")
+
+    safe_filename = _safe_filename(file.filename)
+    extension = Path(safe_filename).suffix.lower()
+    if extension not in ALLOWED_EXTENSIONS:
+        allowed = ", ".join(sorted(ALLOWED_EXTENSIONS))
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail=f"Unsupported file type. Allowed extensions: {allowed}",
+        )
+
+    sha256, size = await _hash_and_measure(file)
+    if size == 0:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty")
+
+    document_id = uuid.uuid4()
+    object_key = f"workspaces/{workspace_id}/documents/{document_id}/{safe_filename}"
+    content_type = file.content_type or "application/octet-stream"
+
+    uploaded = False
+    try:
+        try:
+            await to_thread.run_sync(
+                lambda: storage.upload(
+                    object_key=object_key,
+                    stream=file.file,
+                    size=size,
+                    content_type=content_type,
+                )
+            )
+            uploaded = True
+        except StorageError as exc:
+            raise HTTPException(status_code=503, detail="Object storage is unavailable") from exc
+
+        document = Document(
+            id=document_id,
+            workspace_id=workspace_id,
+            knowledge_base_version_id=None,
+            filename=safe_filename,
+            object_key=object_key,
+            mime_type=content_type,
+            sha256=sha256,
+            status="UPLOADED",
+        )
+        db.add(document)
+
+        try:
+            await db.commit()
+            await db.refresh(document)
+        except Exception:
+            await db.rollback()
+            if uploaded:
+                try:
+                    await to_thread.run_sync(storage.delete, object_key)
+                except StorageError:
+                    pass
+            raise
+
+        return document
+    finally:
+        await file.close()
