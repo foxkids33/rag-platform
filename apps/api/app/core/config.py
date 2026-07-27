@@ -27,9 +27,15 @@ class Settings(BaseSettings):
     def upload_max_bytes(self) -> int:
         return self.upload_max_mb * 1024 * 1024
 
-    vllm_base_url: str = "http://localhost:8001"
+    vllm_base_url: str = "http://vllm-host:8000"
     vllm_api_key: str = ""
     vllm_model: str = ""
+    llm_timeout_seconds: float = 180.0
+    llm_max_tokens: int = 800
+    llm_temperature: float = 0.1
+    rag_context_max_chars: int = 12000
+    rag_source_max_chars: int = 2200
+    rag_source_limit: int = 5
     embedding_base_url: str = "http://embedding:8080"
     embedding_model: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
     embedding_dim: int = 1024

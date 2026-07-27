@@ -6,6 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api.router import api_router
 from app.core.config import settings
 from app.services.embeddings import embeddings
+from app.services.llm import llm
 from app.services.queue import ingestion_queue
 
 
@@ -13,6 +14,7 @@ from app.services.queue import ingestion_queue
 async def lifespan(_: FastAPI):
     yield
     await embeddings.close()
+    await llm.close()
     await ingestion_queue.close()
 
 
