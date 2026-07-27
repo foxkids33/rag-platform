@@ -59,7 +59,8 @@ npm run dev
 3. Добавить upload + ingestion worker.
 4. Добавить Docling и hierarchical parent/child chunking.
 5. Добавить embeddings + pgvector HNSW.
-6. Добавить PostgreSQL FTS + RRF + cross-encoder reranking.
-7. Подключить внутренний vLLM и SSE streaming.
-8. Добавить историю диалога.
-9. Перенести граф исследования и добавить настоящий knowledge graph.
+6. Добавить PostgreSQL FTS + RRF.
+7. Добавить cross-encoder reranking.
+8. Подключить внутренний vLLM и SSE streaming.
+9. Добавить историю диалога.
+10. Перенести граф исследования и добавить настоящий knowledge graph.

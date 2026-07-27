@@ -86,7 +86,15 @@ async def _store_chunks(
                         :id, :document_id, :parent_chunk_id, :chunk_index, :text, :parent_text,
                         :heading, :heading_breadcrumb, :page_start, :page_end,
                         CAST(:embedding AS vector),
-                        to_tsvector('russian', :search_text), CAST(:metadata AS json)
+                        (
+                            setweight(
+                                to_tsvector('russian', coalesce(:heading_text, '')),
+                                'A'
+                            )
+                            || setweight(to_tsvector('russian', :search_text), 'B')
+                            || setweight(to_tsvector('simple', :search_text), 'C')
+                        ),
+                        CAST(:metadata AS json)
                     )
                     """
                 ),
@@ -103,6 +111,11 @@ async def _store_chunks(
                     "page_end": chunk.page_end,
                     "embedding": _vector_literal(vector),
                     "search_text": chunk.search_text,
+                    "heading_text": " ".join(
+                        value
+                        for value in (chunk.heading_breadcrumb, chunk.heading)
+                        if value
+                    ),
                     "metadata": json.dumps(chunk.metadata, ensure_ascii=False),
                 },
             )
