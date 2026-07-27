@@ -179,3 +179,39 @@ async def upload_workspace_document(
         raise
     finally:
         await file.close()
+
+
+@router.post("/{document_id}/reindex", response_model=DocumentOut, status_code=status.HTTP_202_ACCEPTED)
+async def reindex_workspace_document(
+    workspace_id: uuid.UUID,
+    document_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+):
+    document = await db.get(Document, document_id)
+    if document is None or document.workspace_id != workspace_id:
+        raise HTTPException(status_code=404, detail="Document not found")
+    if document.status in {"QUEUED", "PROCESSING"}:
+        raise HTTPException(status_code=409, detail="Document is already being processed")
+
+    previous_status = document.status
+    job = IngestionJob(
+        id=uuid.uuid4(),
+        document_id=document.id,
+        status="QUEUED",
+        progress=0,
+    )
+    document.status = "QUEUED"
+    db.add(job)
+    await db.commit()
+
+    try:
+        await ingestion_queue.enqueue(job.id)
+    except QueueError as exc:
+        job.status = "FAILED"
+        job.error = "Ingestion queue is unavailable"
+        document.status = previous_status
+        await db.commit()
+        raise HTTPException(status_code=503, detail="Ingestion queue is unavailable") from exc
+
+    await db.refresh(document)
+    return document

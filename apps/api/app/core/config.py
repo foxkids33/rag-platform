@@ -30,9 +30,10 @@ class Settings(BaseSettings):
     vllm_base_url: str = "http://localhost:8001"
     vllm_api_key: str = ""
     vllm_model: str = ""
-    embedding_base_url: str = "http://localhost:8080"
-    embedding_model: str = "BAAI/bge-m3"
+    embedding_base_url: str = "http://embedding:8080"
+    embedding_model: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
     embedding_dim: int = 1024
+    embedding_timeout_seconds: float = 120.0
     rerank_base_url: str = "http://localhost:8081"
     rerank_model: str = "BAAI/bge-reranker-v2-m3"
 

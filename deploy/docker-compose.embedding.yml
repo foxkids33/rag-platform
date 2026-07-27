@@ -1,0 +1,36 @@
+services:
+  embedding:
+    build:
+      context: ../apps/embedding
+    environment:
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2}
+      EMBEDDING_NATIVE_DIM: ${EMBEDDING_NATIVE_DIM:-384}
+      EMBEDDING_DIM: ${EMBEDDING_DIM:-1024}
+      EMBEDDING_CACHE_DIR: /models
+    ports:
+      - "8080:8080"
+    volumes:
+      - embedding_models:/models
+    healthcheck:
+      test: ["CMD", "/app/.venv/bin/python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health/ready', timeout=5)"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 120s
+
+  api:
+    environment:
+      EMBEDDING_BASE_URL: http://embedding:8080
+    depends_on:
+      embedding:
+        condition: service_healthy
+
+  worker:
+    environment:
+      EMBEDDING_BASE_URL: http://embedding:8080
+    depends_on:
+      embedding:
+        condition: service_healthy
+
+volumes:
+  embedding_models:

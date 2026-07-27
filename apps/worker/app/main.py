@@ -11,8 +11,9 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from app.config import settings
-from app.storage import storage
 from app.document_processing import ParsedChunk, parse_document
+from app.embeddings import embeddings
+from app.storage import storage
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("rag-worker")
@@ -55,24 +56,36 @@ async def _claim_job(job_id: uuid.UUID) -> dict | None:
         return dict(row)
 
 
-async def _store_chunks(document_id: uuid.UUID, chunks: list[ParsedChunk]) -> None:
+def _vector_literal(vector: list[float]) -> str:
+    return "[" + ",".join(f"{value:.9g}" for value in vector) + "]"
+
+
+async def _store_chunks(
+    document_id: uuid.UUID,
+    chunks: list[ParsedChunk],
+    vectors: list[list[float]],
+) -> None:
+    if len(chunks) != len(vectors):
+        raise ValueError("Chunk and embedding counts do not match")
+
     async with engine.begin() as connection:
         await connection.execute(
             text("DELETE FROM document_chunks WHERE document_id = :document_id"),
             {"document_id": document_id},
         )
 
-        for index, chunk in enumerate(chunks):
+        for index, (chunk, vector) in enumerate(zip(chunks, vectors, strict=True)):
             await connection.execute(
                 text(
                     """
                     INSERT INTO document_chunks (
                         id, document_id, parent_chunk_id, chunk_index, text, parent_text,
                         heading, heading_breadcrumb, page_start, page_end,
-                        search_vector, metadata
+                        embedding, search_vector, metadata
                     ) VALUES (
                         :id, :document_id, :parent_chunk_id, :chunk_index, :text, :parent_text,
                         :heading, :heading_breadcrumb, :page_start, :page_end,
+                        CAST(:embedding AS vector),
                         to_tsvector('russian', :search_text), CAST(:metadata AS json)
                     )
                     """
@@ -88,6 +101,7 @@ async def _store_chunks(document_id: uuid.UUID, chunks: list[ParsedChunk]) -> No
                     "heading_breadcrumb": chunk.heading_breadcrumb,
                     "page_start": chunk.page_start,
                     "page_end": chunk.page_end,
+                    "embedding": _vector_literal(vector),
                     "search_text": chunk.search_text,
                     "metadata": json.dumps(chunk.metadata, ensure_ascii=False),
                 },
@@ -142,7 +156,8 @@ async def process_job(job_id: uuid.UUID) -> None:
         if not chunks:
             raise ValueError("Document produced no chunks")
 
-        await _store_chunks(document_id, chunks)
+        vectors = await embeddings.embed([chunk.search_text for chunk in chunks])
+        await _store_chunks(document_id, chunks, vectors)
         logger.info("Document %s indexed into %d chunks", document_id, len(chunks))
     except Exception as exc:
         logger.exception("Ingestion job %s failed", job_id)
@@ -173,6 +188,7 @@ async def main() -> None:
                 await asyncio.sleep(2)
     finally:
         await redis.aclose()
+        await embeddings.close()
         await engine.dispose()
 
 

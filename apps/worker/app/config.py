@@ -24,6 +24,11 @@ class Settings(BaseSettings):
     docling_chunk_max_tokens: int = 450
     chunk_tokenizer_model: str = "BAAI/bge-m3"
 
+    embedding_base_url: str = "http://embedding:8080"
+    embedding_dim: int = 1024
+    embedding_timeout_seconds: float = 120.0
+    embedding_batch_size: int = 32
+
 
 @lru_cache
 def get_settings() -> Settings:
