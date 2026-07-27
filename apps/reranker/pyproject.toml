@@ -1,0 +1,22 @@
+[project]
+name = "rag-platform-reranker"
+version = "0.1.0"
+description = "Local multilingual cross-encoder reranking service"
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi>=0.115,<1",
+  "pydantic-settings>=2.7,<3",
+  "safetensors>=0.5,<1",
+  "sentencepiece>=0.2,<1",
+  "torch>=2.5,<3",
+  "transformers>=4.48,<5",
+  "uvicorn[standard]>=0.34,<1",
+]
+
+[dependency-groups]
+dev = [
+  "pytest>=8.3,<9",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

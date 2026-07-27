@@ -12,6 +12,7 @@ from app.core.config import settings
 from app.db.models import Workspace
 from app.db.session import get_db
 from app.services.embeddings import EmbeddingError, embeddings
+from app.services.reranker import RerankError, reranker
 
 router = APIRouter(prefix="/workspaces/{workspace_id}/search", tags=["search"])
 
@@ -25,6 +26,7 @@ class SearchRequest(BaseModel):
     query: str = Field(min_length=2, max_length=2000)
     limit: int = Field(default=8, ge=1, le=20)
     mode: Literal["hybrid", "semantic", "lexical"] = "hybrid"
+    rerank: bool = True
 
 
 class SearchResult(BaseModel):
@@ -45,12 +47,18 @@ class SearchResult(BaseModel):
     rrf_score: float
     dense_rank: int | None
     lexical_rank: int | None
+    retrieval_rank: int
+    rerank_score: float | None
 
 
 class SearchResponse(BaseModel):
     query: str
     mode: str
     candidate_limit: int
+    rerank_requested: bool
+    rerank_applied: bool
+    rerank_model: str | None
+    rerank_error: str | None
     results: list[SearchResult]
 
 
@@ -60,6 +68,21 @@ def _vector_literal(vector: list[float]) -> str:
 
 def _candidate_limit(limit: int) -> int:
     return min(MAX_CANDIDATES, max(MIN_CANDIDATES, limit * 8))
+
+
+def _rerank_candidate_limit(limit: int, retrieval_limit: int) -> int:
+    requested = max(limit, settings.rerank_candidate_limit)
+    return min(retrieval_limit, requested)
+
+
+def _build_rerank_document(result: SearchResult) -> str:
+    parts: list[str] = []
+    if result.heading_breadcrumb:
+        parts.append(result.heading_breadcrumb)
+    elif result.heading:
+        parts.append(result.heading)
+    parts.append(result.text)
+    return "\n\n".join(parts)[: settings.rerank_document_chars]
 
 
 @router.post("", response_model=SearchResponse)
@@ -85,10 +108,15 @@ async def search(
         except EmbeddingError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
     else:
-        # PostgreSQL still receives a correctly typed vector parameter, while
-        # lexical-only search remains available if the embedding service is down.
         query_vector = [0.0] * settings.embedding_dim
+
     candidate_limit = _candidate_limit(payload.limit)
+    rerank_requested = payload.rerank and settings.rerank_enabled
+    result_limit = (
+        _rerank_candidate_limit(payload.limit, candidate_limit)
+        if rerank_requested
+        else payload.limit
+    )
 
     result = await db.execute(
         text(
@@ -225,7 +253,7 @@ async def search(
                 rrf_score DESC,
                 dense_score DESC NULLS LAST,
                 lexical_score DESC NULLS LAST
-            LIMIT :limit
+            LIMIT :result_limit
             """
         ),
         {
@@ -237,14 +265,48 @@ async def search(
             "candidate_limit": candidate_limit,
             "rrf_k": RRF_K,
             "parent_preview_chars": PARENT_PREVIEW_CHARS,
-            "limit": payload.limit,
+            "result_limit": result_limit,
         },
     )
 
-    rows = [SearchResult(**dict(row)) for row in result.mappings().all()]
+    rows: list[SearchResult] = []
+    for retrieval_rank, row in enumerate(result.mappings().all(), start=1):
+        data = dict(row)
+        data["retrieval_rank"] = retrieval_rank
+        data["rerank_score"] = None
+        rows.append(SearchResult(**data))
+
+    rerank_applied = False
+    rerank_model: str | None = None
+    rerank_error: str | None = None
+
+    if rerank_requested and rows:
+        documents = [_build_rerank_document(row) for row in rows]
+        try:
+            rerank_output = await reranker.rerank(query, documents)
+        except RerankError as exc:
+            rerank_error = str(exc)
+        else:
+            rerank_model = rerank_output.model
+            rows = [
+                row.model_copy(update={"rerank_score": score})
+                for row, score in zip(rows, rerank_output.scores, strict=True)
+            ]
+            rows.sort(
+                key=lambda row: (
+                    -(row.rerank_score if row.rerank_score is not None else float("-inf")),
+                    row.retrieval_rank,
+                )
+            )
+            rerank_applied = True
+
     return SearchResponse(
         query=query,
         mode=payload.mode,
         candidate_limit=candidate_limit,
-        results=rows,
+        rerank_requested=rerank_requested,
+        rerank_applied=rerank_applied,
+        rerank_model=rerank_model,
+        rerank_error=rerank_error,
+        results=rows[: payload.limit],
     )

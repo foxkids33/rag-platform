@@ -64,3 +64,21 @@ npm run dev
 8. Подключить внутренний vLLM и SSE streaming.
 9. Добавить историю диалога.
 10. Перенести граф исследования и добавить настоящий knowledge graph.
+
+## Локальный reranker
+
+Reranker запускается отдельным Compose overlay и переставляет hybrid-кандидатов
+по прямой оценке пары «запрос + фрагмент». Если сервис недоступен, API возвращает
+исходный RRF-порядок и заполняет поле `rerank_error`, не ломая поиск.
+
+```bash
+docker compose \
+  -f deploy/docker-compose.local.yml \
+  -f deploy/docker-compose.embedding.yml \
+  -f deploy/docker-compose.reranker.yml \
+  up -d --build reranker api
+```
+
+По умолчанию используется компактный multilingual cross-encoder. Модель можно
+заменить через `RERANK_MODEL`, сохранив HTTP-контракт `/rerank`.
+

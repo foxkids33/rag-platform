@@ -34,8 +34,12 @@ class Settings(BaseSettings):
     embedding_model: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
     embedding_dim: int = 1024
     embedding_timeout_seconds: float = 120.0
-    rerank_base_url: str = "http://localhost:8081"
-    rerank_model: str = "BAAI/bge-reranker-v2-m3"
+    rerank_base_url: str = "http://reranker:8081"
+    rerank_model: str = "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1"
+    rerank_enabled: bool = True
+    rerank_timeout_seconds: float = 180.0
+    rerank_candidate_limit: int = 30
+    rerank_document_chars: int = 6000
 
 
 @lru_cache

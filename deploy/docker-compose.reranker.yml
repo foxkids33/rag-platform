@@ -1,0 +1,31 @@
+services:
+  reranker:
+    build:
+      context: ../apps/reranker
+    environment:
+      RERANK_MODEL: ${RERANK_MODEL:-cross-encoder/mmarco-mMiniLMv2-L12-H384-v1}
+      RERANK_CACHE_DIR: /models
+      RERANK_MAX_LENGTH: ${RERANK_MAX_LENGTH:-512}
+      RERANK_BATCH_SIZE: ${RERANK_BATCH_SIZE:-8}
+      RERANK_THREADS: ${RERANK_THREADS:-4}
+    ports:
+      - "8081:8081"
+    volumes:
+      - reranker_models:/models
+    healthcheck:
+      test: ["CMD", "/app/.venv/bin/python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8081/health/ready', timeout=10)"]
+      interval: 15s
+      timeout: 15s
+      retries: 40
+      start_period: 300s
+
+  api:
+    environment:
+      RERANK_BASE_URL: http://reranker:8081
+      RERANK_ENABLED: "true"
+    depends_on:
+      reranker:
+        condition: service_started
+
+volumes:
+  reranker_models:
