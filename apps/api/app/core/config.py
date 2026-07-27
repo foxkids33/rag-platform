@@ -38,8 +38,10 @@ class Settings(BaseSettings):
     rerank_model: str = "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1"
     rerank_enabled: bool = True
     rerank_timeout_seconds: float = 180.0
-    rerank_candidate_limit: int = 30
-    rerank_document_chars: int = 6000
+    rerank_candidate_limit: int = 20
+    rerank_document_chars: int = 1800
+    rerank_rank_weight: float = 0.7
+    rerank_retrieval_weight: float = 0.3
 
 
 @lru_cache

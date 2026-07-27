@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import uuid
 from typing import Literal
 
@@ -20,6 +21,20 @@ RRF_K = 60
 MIN_CANDIDATES = 40
 MAX_CANDIDATES = 200
 PARENT_PREVIEW_CHARS = 4000
+
+PAGE_MARKER_RE = re.compile(r"^\s*\d{1,4}\s+из\s+\d{1,4}\s*$", re.IGNORECASE)
+STANDALONE_PAGE_RE = re.compile(r"^\s*\d{1,4}\s*$")
+DOT_LEADER_RE = re.compile(r"\.{4,}")
+DOCUMENT_TITLE_RE = re.compile(
+    r"машина\s+больших\s+данных.*техническ(?:ий|ого)\s+обзор",
+    re.IGNORECASE,
+)
+URL_OR_EMAIL_RE = re.compile(r"(?:https?://|www\.|\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,})", re.IGNORECASE)
+WORD_RE = re.compile(r"[0-9A-Za-zА-Яа-яЁё]+(?:[.\-][0-9A-Za-zА-Яа-яЁё]+)*")
+QUERY_STOP_WORDS = {
+    "что", "такое", "какой", "какая", "какие", "как", "для", "чего", "это", "есть",
+    "или", "его", "ее", "её", "про", "при", "под", "над", "где", "когда", "зачем",
+}
 
 
 class SearchRequest(BaseModel):
@@ -48,7 +63,10 @@ class SearchResult(BaseModel):
     dense_rank: int | None
     lexical_rank: int | None
     retrieval_rank: int
-    rerank_score: float | None
+    rerank_score: float | None = None
+    rerank_rank: int | None = None
+    rerank_fusion_score: float | None = None
+    rerank_penalty: float = 0.0
 
 
 class SearchResponse(BaseModel):
@@ -75,14 +93,133 @@ def _rerank_candidate_limit(limit: int, retrieval_limit: int) -> int:
     return min(retrieval_limit, requested)
 
 
-def _build_rerank_document(result: SearchResult) -> str:
+def _clean_rerank_text(value: str) -> str:
+    """Remove PDF-to-text boilerplate that biases cross-encoder scores."""
+    cleaned_lines: list[str] = []
+    previous_line: str | None = None
+
+    for raw_line in value.replace("\x0c", "\n").splitlines():
+        line = " ".join(raw_line.split()).strip()
+        if not line:
+            if cleaned_lines and cleaned_lines[-1] != "":
+                cleaned_lines.append("")
+            continue
+        if PAGE_MARKER_RE.fullmatch(line) or STANDALONE_PAGE_RE.fullmatch(line):
+            continue
+        if DOT_LEADER_RE.search(line):
+            continue
+        if DOCUMENT_TITLE_RE.search(line):
+            continue
+        if URL_OR_EMAIL_RE.search(line):
+            continue
+        if line.casefold() in {"оглавление", "содержание"}:
+            continue
+        if line == previous_line:
+            continue
+
+        cleaned_lines.append(line)
+        previous_line = line
+
+    while cleaned_lines and cleaned_lines[-1] == "":
+        cleaned_lines.pop()
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(cleaned_lines)).strip()
+
+
+def _query_terms(query: str) -> set[str]:
+    return {
+        token.casefold()
+        for token in WORD_RE.findall(query)
+        if len(token) >= 3 and token.casefold() not in QUERY_STOP_WORDS
+    }
+
+
+def _focused_excerpt(value: str, query: str, max_chars: int) -> str:
+    cleaned = _clean_rerank_text(value)
+    if len(cleaned) <= max_chars:
+        return cleaned
+
+    terms = _query_terms(query)
+    paragraphs = [part.strip() for part in cleaned.split("\n\n") if part.strip()]
+    if not paragraphs:
+        return cleaned[:max_chars].rstrip()
+
+    def paragraph_score(paragraph: str) -> tuple[float, int]:
+        paragraph_terms = {token.casefold() for token in WORD_RE.findall(paragraph)}
+        overlap = len(terms & paragraph_terms)
+        score = float(overlap)
+        lowered = paragraph.casefold()
+        if query.casefold().startswith("что такое") and any(
+            marker in lowered
+            for marker in (" — это ", " это ", "предназначен", "предназначена")
+        ):
+            score += 1.5
+        return score, -len(paragraph)
+
+    best_index = max(range(len(paragraphs)), key=lambda index: paragraph_score(paragraphs[index]))
+    selected_indices = {best_index}
+    left = best_index - 1
+    right = best_index + 1
+
+    while left >= 0 or right < len(paragraphs):
+        candidate_indices: list[int] = []
+        if right < len(paragraphs):
+            candidate_indices.append(right)
+        if left >= 0:
+            candidate_indices.append(left)
+
+        added = False
+        for index in candidate_indices:
+            trial_indices = sorted(selected_indices | {index})
+            candidate = "\n\n".join(paragraphs[item] for item in trial_indices)
+            if len(candidate) <= max_chars:
+                selected_indices.add(index)
+                added = True
+                if index == left:
+                    left -= 1
+                else:
+                    right += 1
+                break
+        if not added:
+            break
+
+    excerpt = "\n\n".join(paragraphs[index] for index in sorted(selected_indices))
+    return excerpt[:max_chars].rstrip()
+
+
+def _build_rerank_document(result: SearchResult, query: str) -> str:
     parts: list[str] = []
-    if result.heading_breadcrumb:
-        parts.append(result.heading_breadcrumb)
-    elif result.heading:
-        parts.append(result.heading)
-    parts.append(result.text)
+    heading = result.heading_breadcrumb or result.heading
+    if heading:
+        cleaned_heading = _clean_rerank_text(heading)
+        if cleaned_heading:
+            parts.append(cleaned_heading)
+
+    excerpt = _focused_excerpt(result.text, query, settings.rerank_document_chars)
+    if excerpt:
+        parts.append(excerpt)
     return "\n\n".join(parts)[: settings.rerank_document_chars]
+
+
+def _boilerplate_penalty(result: SearchResult) -> float:
+    text_value = result.text.casefold()
+    penalty = 0.0
+    if result.chunk_index == 0:
+        penalty += 0.25
+    if "оглавление" in text_value or "содержание" in text_value:
+        penalty += 0.25
+    if len(DOT_LEADER_RE.findall(result.text)) >= 3:
+        penalty += 0.15
+    return min(0.55, penalty)
+
+
+def _rerank_fusion_score(
+    rerank_rank: int,
+    retrieval_rank: int,
+    penalty: float,
+) -> float:
+    rerank_component = settings.rerank_rank_weight / (RRF_K + rerank_rank)
+    retrieval_component = settings.rerank_retrieval_weight / (RRF_K + retrieval_rank)
+    return (rerank_component + retrieval_component) * (1.0 - penalty)
 
 
 @router.post("", response_model=SearchResponse)
@@ -273,7 +410,6 @@ async def search(
     for retrieval_rank, row in enumerate(result.mappings().all(), start=1):
         data = dict(row)
         data["retrieval_rank"] = retrieval_rank
-        data["rerank_score"] = None
         rows.append(SearchResult(**data))
 
     rerank_applied = False
@@ -281,23 +417,47 @@ async def search(
     rerank_error: str | None = None
 
     if rerank_requested and rows:
-        documents = [_build_rerank_document(row) for row in rows]
+        documents = [_build_rerank_document(row, query) for row in rows]
         try:
             rerank_output = await reranker.rerank(query, documents)
         except RerankError as exc:
             rerank_error = str(exc)
         else:
             rerank_model = rerank_output.model
-            rows = [
-                row.model_copy(update={"rerank_score": score})
-                for row, score in zip(rows, rerank_output.scores, strict=True)
-            ]
-            rows.sort(
+            score_pairs = sorted(
+                zip(rows, rerank_output.scores, strict=True),
+                key=lambda pair: (-pair[1], pair[0].retrieval_rank),
+            )
+            rerank_ranks = {row.chunk_id: rank for rank, (row, _) in enumerate(score_pairs, 1)}
+
+            reranked_rows: list[SearchResult] = []
+            for row, score in zip(rows, rerank_output.scores, strict=True):
+                rerank_rank = rerank_ranks[row.chunk_id]
+                penalty = _boilerplate_penalty(row)
+                fusion_score = _rerank_fusion_score(
+                    rerank_rank=rerank_rank,
+                    retrieval_rank=row.retrieval_rank,
+                    penalty=penalty,
+                )
+                reranked_rows.append(
+                    row.model_copy(
+                        update={
+                            "rerank_score": score,
+                            "rerank_rank": rerank_rank,
+                            "rerank_fusion_score": fusion_score,
+                            "rerank_penalty": penalty,
+                        }
+                    )
+                )
+
+            reranked_rows.sort(
                 key=lambda row: (
-                    -(row.rerank_score if row.rerank_score is not None else float("-inf")),
+                    -(row.rerank_fusion_score or 0.0),
+                    row.rerank_rank or MAX_CANDIDATES,
                     row.retrieval_rank,
                 )
             )
+            rows = reranked_rows
             rerank_applied = True
 
     return SearchResponse(

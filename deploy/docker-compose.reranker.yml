@@ -8,6 +8,7 @@ services:
       RERANK_MAX_LENGTH: ${RERANK_MAX_LENGTH:-512}
       RERANK_BATCH_SIZE: ${RERANK_BATCH_SIZE:-8}
       RERANK_THREADS: ${RERANK_THREADS:-4}
+      RERANK_MAX_DOCUMENT_CHARS: ${RERANK_DOCUMENT_CHARS:-1800}
     ports:
       - "8081:8081"
     volumes:
@@ -23,6 +24,10 @@ services:
     environment:
       RERANK_BASE_URL: http://reranker:8081
       RERANK_ENABLED: "true"
+      RERANK_CANDIDATE_LIMIT: ${RERANK_CANDIDATE_LIMIT:-20}
+      RERANK_DOCUMENT_CHARS: ${RERANK_DOCUMENT_CHARS:-1800}
+      RERANK_RANK_WEIGHT: ${RERANK_RANK_WEIGHT:-0.7}
+      RERANK_RETRIEVAL_WEIGHT: ${RERANK_RETRIEVAL_WEIGHT:-0.3}
     depends_on:
       reranker:
         condition: service_started

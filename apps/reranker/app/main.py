@@ -25,7 +25,7 @@ class Settings(BaseSettings):
     rerank_batch_size: int = 8
     rerank_threads: int = 4
     rerank_max_documents: int = 50
-    rerank_max_document_chars: int = 8000
+    rerank_max_document_chars: int = 1800
 
 
 settings = Settings()
