@@ -13,8 +13,9 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
-from app.db.models import Document, Workspace
+from app.db.models import Document, IngestionJob, Workspace
 from app.db.session import get_db
+from app.services.queue import QueueError, ingestion_queue
 from app.services.storage import StorageError, storage
 
 router = APIRouter(prefix="/workspaces/{workspace_id}/documents", tags=["documents"])
@@ -103,10 +104,12 @@ async def upload_workspace_document(
         raise HTTPException(status_code=400, detail="Uploaded file is empty")
 
     document_id = uuid.uuid4()
+    job_id = uuid.uuid4()
     object_key = f"workspaces/{workspace_id}/documents/{document_id}/{safe_filename}"
     content_type = file.content_type or "application/octet-stream"
 
     uploaded = False
+    committed = False
     try:
         try:
             await to_thread.run_sync(
@@ -129,12 +132,19 @@ async def upload_workspace_document(
             object_key=object_key,
             mime_type=content_type,
             sha256=sha256,
-            status="UPLOADED",
+            status="QUEUED",
         )
-        db.add(document)
+        job = IngestionJob(
+            id=job_id,
+            document_id=document_id,
+            status="QUEUED",
+            progress=0,
+        )
+        db.add_all([document, job])
 
         try:
             await db.commit()
+            committed = True
             await db.refresh(document)
         except Exception:
             await db.rollback()
@@ -145,6 +155,27 @@ async def upload_workspace_document(
                     pass
             raise
 
+        try:
+            await ingestion_queue.enqueue(job_id)
+        except QueueError as exc:
+            # Keep PostgreSQL and MinIO consistent when Redis is unavailable.
+            await db.delete(document)
+            await db.commit()
+            committed = False
+            try:
+                await to_thread.run_sync(storage.delete, object_key)
+            except StorageError:
+                pass
+            raise HTTPException(status_code=503, detail="Ingestion queue is unavailable") from exc
+
         return document
+    except Exception:
+        if uploaded and not committed:
+            # The object may already have been removed; MinIO deletion is idempotent.
+            try:
+                await to_thread.run_sync(storage.delete, object_key)
+            except StorageError:
+                pass
+        raise
     finally:
         await file.close()

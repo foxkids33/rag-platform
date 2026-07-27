@@ -6,12 +6,6 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
-    app_env: str = "local"
-    app_name: str = "RAG Platform"
-    api_host: str = "0.0.0.0"
-    api_port: int = 8000
-    web_origin: str = "http://localhost:5173"
-
     database_url: str = "postgresql+asyncpg://rag:rag@localhost:5432/rag"
     redis_url: str = "redis://localhost:6379/0"
     ingestion_queue: str = "rag:ingestion"
@@ -21,20 +15,10 @@ class Settings(BaseSettings):
     minio_secret_key: str = "minio123"
     minio_bucket: str = "rag-documents"
     minio_secure: bool = False
-    upload_max_mb: int = 100
 
-    @property
-    def upload_max_bytes(self) -> int:
-        return self.upload_max_mb * 1024 * 1024
-
-    vllm_base_url: str = "http://localhost:8001"
-    vllm_api_key: str = ""
-    vllm_model: str = ""
-    embedding_base_url: str = "http://localhost:8080"
-    embedding_model: str = "BAAI/bge-m3"
-    embedding_dim: int = 1024
-    rerank_base_url: str = "http://localhost:8081"
-    rerank_model: str = "BAAI/bge-reranker-v2-m3"
+    chunk_max_chars: int = 2200
+    chunk_overlap_chars: int = 300
+    chunk_min_chars: int = 180
 
 
 @lru_cache
