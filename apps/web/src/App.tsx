@@ -26,7 +26,7 @@ type DocumentRecord = {
 };
 
 const API = import.meta.env.VITE_API_BASE_URL || "http://localhost:8000";
-const ACCEPTED_FILES = ".txt,.md,.csv,.json,.html,.htm,.xml";
+const ACCEPTED_FILES = ".txt,.md,.csv,.json,.html,.htm,.xml,.pdf,.docx";
 
 async function readJson<T>(response: Response): Promise<T> {
   if (!response.ok) {
@@ -251,7 +251,7 @@ export function App() {
               tabIndex={0}
             >
               <strong>{uploading ? "Загрузка…" : "Добавить документы"}</strong>
-              <small>Перетащите или выберите TXT, MD, CSV, JSON, HTML, XML</small>
+              <small>Перетащите или выберите PDF, DOCX, TXT, MD, CSV, JSON, HTML, XML</small>
             </div>
 
             <div className="document-list">

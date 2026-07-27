@@ -19,6 +19,10 @@ class Settings(BaseSettings):
     chunk_max_chars: int = 2200
     chunk_overlap_chars: int = 300
     chunk_min_chars: int = 180
+    parent_max_chars: int = 12000
+
+    docling_chunk_max_tokens: int = 450
+    chunk_tokenizer_model: str = "BAAI/bge-m3"
 
 
 @lru_cache

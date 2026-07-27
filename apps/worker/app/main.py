@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from app.config import settings
 from app.storage import storage
-from app.text_processing import extract_text, split_into_chunks
+from app.document_processing import ParsedChunk, parse_document
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("rag-worker")
@@ -55,7 +55,7 @@ async def _claim_job(job_id: uuid.UUID) -> dict | None:
         return dict(row)
 
 
-async def _store_chunks(document_id: uuid.UUID, chunks: list[str]) -> None:
+async def _store_chunks(document_id: uuid.UUID, chunks: list[ParsedChunk]) -> None:
     async with engine.begin() as connection:
         await connection.execute(
             text("DELETE FROM document_chunks WHERE document_id = :document_id"),
@@ -71,19 +71,25 @@ async def _store_chunks(document_id: uuid.UUID, chunks: list[str]) -> None:
                         heading, heading_breadcrumb, page_start, page_end,
                         search_vector, metadata
                     ) VALUES (
-                        :id, :document_id, NULL, :chunk_index, :text, :parent_text,
-                        NULL, NULL, NULL, NULL,
-                        to_tsvector('russian', :text), CAST(:metadata AS json)
+                        :id, :document_id, :parent_chunk_id, :chunk_index, :text, :parent_text,
+                        :heading, :heading_breadcrumb, :page_start, :page_end,
+                        to_tsvector('russian', :search_text), CAST(:metadata AS json)
                     )
                     """
                 ),
                 {
                     "id": uuid.uuid4(),
                     "document_id": document_id,
+                    "parent_chunk_id": chunk.parent_chunk_id,
                     "chunk_index": index,
-                    "text": chunk,
-                    "parent_text": chunk,
-                    "metadata": json.dumps({"parser": "plain_text_v1"}),
+                    "text": chunk.text,
+                    "parent_text": chunk.parent_text,
+                    "heading": chunk.heading,
+                    "heading_breadcrumb": chunk.heading_breadcrumb,
+                    "page_start": chunk.page_start,
+                    "page_end": chunk.page_end,
+                    "search_text": chunk.search_text,
+                    "metadata": json.dumps(chunk.metadata, ensure_ascii=False),
                 },
             )
 
@@ -132,11 +138,7 @@ async def process_job(job_id: uuid.UUID) -> None:
     document_id = job["document_id"]
     try:
         data = await asyncio.to_thread(storage.download, job["object_key"])
-        extracted_text = extract_text(job["filename"], data)
-        if not extracted_text:
-            raise ValueError("Document contains no extractable text")
-
-        chunks = split_into_chunks(extracted_text)
+        chunks = await asyncio.to_thread(parse_document, job["filename"], data)
         if not chunks:
             raise ValueError("Document produced no chunks")
 

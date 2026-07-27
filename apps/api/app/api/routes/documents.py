@@ -20,7 +20,7 @@ from app.services.storage import StorageError, storage
 
 router = APIRouter(prefix="/workspaces/{workspace_id}/documents", tags=["documents"])
 
-ALLOWED_EXTENSIONS = {".txt", ".md", ".csv", ".json", ".html", ".htm", ".xml"}
+ALLOWED_EXTENSIONS = {".txt", ".md", ".csv", ".json", ".html", ".htm", ".xml", ".pdf", ".docx"}
 READ_CHUNK_SIZE = 1024 * 1024
 
 
