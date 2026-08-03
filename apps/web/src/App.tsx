@@ -10,6 +10,7 @@ import {
   useState,
 } from "react";
 import { readSseEvents } from "./sse";
+import { KnowledgeBaseManager } from "./KnowledgeBaseManager";
 
 type WorkspaceSourceMode = "USER_DOCUMENTS" | "KNOWLEDGE_BASE" | "HYBRID";
 
@@ -391,6 +392,13 @@ export function App() {
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "Не удалось получить документы");
     }
+  }, []);
+
+  const refreshKnowledgeBases = useCallback(async () => {
+    const response = await fetch(`${API}/api/v1/knowledge-bases`);
+    const items = await readJson<KnowledgeBase[]>(response);
+    setKnowledgeBases(items);
+    return items;
   }, []);
 
   const refreshWorkspaces = useCallback(async () => {
@@ -977,6 +985,14 @@ export function App() {
                   : ""}
             </p>
           </section>
+
+          <KnowledgeBaseManager
+            apiBaseUrl={API}
+            knowledgeBases={knowledgeBases}
+            refreshKnowledgeBases={refreshKnowledgeBases}
+            refreshWorkspaces={refreshWorkspaces}
+            onError={setError}
+          />
 
           <section className="chat-history-section">
             <div className="section-title">
