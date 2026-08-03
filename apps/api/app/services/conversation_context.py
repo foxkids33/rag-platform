@@ -72,3 +72,39 @@ def rewrite_messages(question: str, history: list[HistoryMessage]) -> list[dict[
 
 def answer_history_messages(history: list[HistoryMessage]) -> list[dict[str, str]]:
     return [{"role": item.role, "content": item.content} for item in history]
+
+
+@dataclass(frozen=True)
+class BranchMessage:
+    id: object
+    parent_message_id: object | None
+    role: str
+    content: str
+
+
+def branch_history(
+    messages: list[BranchMessage],
+    parent_message_id: object | None,
+    *,
+    max_messages: int,
+    max_chars: int,
+) -> list[HistoryMessage]:
+    """Return only ancestors of the selected graph node, oldest first."""
+    if parent_message_id is None:
+        return []
+
+    by_id = {message.id: message for message in messages}
+    chain: list[HistoryMessage] = []
+    visited: set[object] = set()
+    current_id: object | None = parent_message_id
+
+    while current_id is not None and current_id not in visited:
+        visited.add(current_id)
+        current = by_id.get(current_id)
+        if current is None:
+            break
+        chain.append(HistoryMessage(role=current.role, content=current.content))
+        current_id = current.parent_message_id
+
+    chain.reverse()
+    return trim_history(chain, max_messages=max_messages, max_chars=max_chars)

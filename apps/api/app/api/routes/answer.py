@@ -19,8 +19,10 @@ from app.db.models import ChatMessage, ChatSession
 from app.db.session import SessionLocal, get_db
 from app.services.context_builder import BuiltContext, ContextSource, build_context
 from app.services.conversation_context import (
+    BranchMessage,
     HistoryMessage,
     answer_history_messages,
+    branch_history,
     derive_conversation_title,
     rewrite_messages,
     trim_history,
@@ -53,6 +55,7 @@ INSUFFICIENT_EVIDENCE_ANSWER = (
 class AnswerRequest(BaseModel):
     question: str = Field(min_length=2, max_length=4000)
     conversation_id: uuid.UUID | None = None
+    parent_message_id: uuid.UUID | None = None
     mode: Literal["hybrid", "semantic", "lexical"] = "hybrid"
     retrieval_limit: int = Field(default=8, ge=1, le=20)
     source_limit: int | None = Field(default=None, ge=1, le=10)
@@ -93,6 +96,7 @@ class AnswerResponse(BaseModel):
     rerank_applied: bool
     context_chars: int
     conversation_id: uuid.UUID | None
+    parent_message_id: uuid.UUID | None
     user_message_id: uuid.UUID | None
     assistant_message_id: uuid.UUID | None
     abstained: bool
@@ -113,6 +117,7 @@ class PreparedAnswer:
     messages: list[dict[str, str]]
     max_tokens: int
     conversation: ChatSession | None
+    parent_message_id: uuid.UUID | None
     history: list[HistoryMessage]
     abstained: bool
 
@@ -169,9 +174,12 @@ async def _load_conversation_history(
     db: AsyncSession,
     workspace_id: uuid.UUID,
     conversation_id: uuid.UUID | None,
-) -> tuple[ChatSession | None, list[HistoryMessage]]:
+    parent_message_id: uuid.UUID | None,
+) -> tuple[ChatSession | None, list[HistoryMessage], uuid.UUID | None]:
     if conversation_id is None:
-        return None, []
+        if parent_message_id is not None:
+            raise HTTPException(status_code=400, detail="parent_message_id requires conversation_id")
+        return None, [], None
 
     conversation = await db.get(ChatSession, conversation_id)
     if conversation is None or conversation.workspace_id != workspace_id:
@@ -180,16 +188,40 @@ async def _load_conversation_history(
     result = await db.execute(
         select(ChatMessage)
         .where(ChatMessage.session_id == conversation.id)
-        .order_by(ChatMessage.created_at.desc(), ChatMessage.id.desc())
-        .limit(max(settings.rag_history_messages * 2, settings.rag_history_messages))
+        .order_by(ChatMessage.created_at.asc(), ChatMessage.role.desc(), ChatMessage.id.asc())
     )
-    rows = list(reversed(list(result.scalars())))
-    history = trim_history(
-        [HistoryMessage(role=row.role, content=row.content) for row in rows],
+    rows = list(result.scalars())
+    by_id = {row.id: row for row in rows}
+
+    resolved_parent_id = parent_message_id
+    if resolved_parent_id is None:
+        resolved_parent_id = next(
+            (row.id for row in reversed(rows) if row.role == "assistant"),
+            None,
+        )
+
+    if resolved_parent_id is not None:
+        parent = by_id.get(resolved_parent_id)
+        if parent is None:
+            raise HTTPException(status_code=404, detail="Parent message not found in conversation")
+        if parent.role != "assistant":
+            raise HTTPException(status_code=400, detail="Branches must continue from an assistant message")
+
+    history = branch_history(
+        [
+            BranchMessage(
+                id=row.id,
+                parent_message_id=row.parent_message_id,
+                role=row.role,
+                content=row.content,
+            )
+            for row in rows
+        ],
+        resolved_parent_id,
         max_messages=settings.rag_history_messages,
         max_chars=settings.rag_history_max_chars,
     )
-    return conversation, history
+    return conversation, history, resolved_parent_id
 
 
 async def _standalone_retrieval_query(
@@ -219,10 +251,11 @@ async def _prepare_answer(
     db: AsyncSession,
 ) -> PreparedAnswer:
     question = payload.question.strip()
-    conversation, history = await _load_conversation_history(
+    conversation, history, parent_message_id = await _load_conversation_history(
         db,
         workspace_id,
         payload.conversation_id,
+        payload.parent_message_id,
     )
     retrieval_query = await _standalone_retrieval_query(question, history)
     source_limit = payload.source_limit or settings.rag_source_limit
@@ -262,6 +295,7 @@ async def _prepare_answer(
         messages=[] if abstained else _messages(question, context, history),
         max_tokens=max_tokens,
         conversation=conversation,
+        parent_message_id=parent_message_id,
         history=history,
         abstained=abstained,
     )
@@ -333,13 +367,17 @@ async def _persist_exchange(
         return None, None
 
     user_message = ChatMessage(
+        id=uuid.uuid4(),
         session_id=prepared.conversation.id,
+        parent_message_id=prepared.parent_message_id,
         role="user",
         content=prepared.question,
         metadata_={"status": "complete", "retrieval_query": prepared.retrieval_query},
     )
     assistant_message = ChatMessage(
+        id=uuid.uuid4(),
         session_id=prepared.conversation.id,
+        parent_message_id=user_message.id,
         role="assistant",
         content=output.text,
         metadata_=_assistant_metadata(
@@ -363,7 +401,9 @@ async def _persist_stream_user(
     if prepared.conversation is None:
         return None
     message = ChatMessage(
+        id=uuid.uuid4(),
         session_id=prepared.conversation.id,
+        parent_message_id=prepared.parent_message_id,
         role="user",
         content=prepared.question,
         metadata_={"status": "complete", "retrieval_query": prepared.retrieval_query},
@@ -379,6 +419,7 @@ async def _persist_stream_assistant(
     content: str,
     sources: list[AnswerSource],
     *,
+    parent_user_message_id: uuid.UUID | None,
     status: str,
     citation_audit: CitationAudit,
     output: LLMOutput | None = None,
@@ -390,7 +431,9 @@ async def _persist_stream_assistant(
         if conversation is None:
             return None
         message = ChatMessage(
+            id=uuid.uuid4(),
             session_id=conversation.id,
+            parent_message_id=parent_user_message_id,
             role="assistant",
             content=content.strip(),
             metadata_=_assistant_metadata(
@@ -461,6 +504,7 @@ async def answer(
         rerank_applied=prepared.search_response.rerank_applied,
         context_chars=prepared.context.char_count,
         conversation_id=prepared.conversation.id if prepared.conversation else None,
+        parent_message_id=prepared.parent_message_id,
         user_message_id=user_message_id,
         assistant_message_id=assistant_message_id,
         abstained=prepared.abstained,
@@ -500,6 +544,9 @@ async def answer_stream(
                     str(prepared.conversation.id) if prepared.conversation else None
                 ),
                 "user_message_id": str(user_message_id) if user_message_id else None,
+                "parent_message_id": (
+                    str(prepared.parent_message_id) if prepared.parent_message_id else None
+                ),
                 "model": (
                     "retrieval-quality-gate"
                     if prepared.abstained
@@ -543,6 +590,7 @@ async def answer_stream(
                 prepared,
                 output.text,
                 sources,
+                parent_user_message_id=user_message_id,
                 status="complete",
                 citation_audit=citation_audit,
                 output=output,
@@ -582,6 +630,7 @@ async def answer_stream(
                         prepared,
                         content,
                         sources,
+                        parent_user_message_id=user_message_id,
                         status="stopped",
                         citation_audit=citation_audit,
                     )
@@ -597,6 +646,7 @@ async def answer_stream(
                 prepared,
                 content,
                 sources,
+                parent_user_message_id=user_message_id,
                 status="error",
                 citation_audit=citation_audit,
             )
@@ -628,6 +678,7 @@ async def answer_stream(
             prepared,
             content,
             sources,
+            parent_user_message_id=user_message_id,
             status="complete",
             citation_audit=citation_audit,
             output=output,

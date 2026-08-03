@@ -82,12 +82,18 @@ The conversation explorer can be delivered first. Semantic graph extraction is
 version-bound and is enabled only after the knowledge-base publication lifecycle is
 stable.
 
+## Conversation graph
+
+Chat messages form a persisted directed tree through `parent_message_id`. A user can
+select any assistant answer as the parent of the next question. Follow-up rewriting
+and answer history then use only that node's ancestor chain, preventing facts from
+unrelated branches from leaking into the current prompt. The UI provides an
+auto-layout canvas with arrows, pan/zoom controls and a minimap.
+
 ## Remaining roadmap
 
 ```text
-KB draft/index/publish lifecycle
-  -> conversation graph explorer
-  -> Neo4j entity/relation extraction per KB version
+Neo4j entity/relation extraction per KB version
   -> GraphRAG + deep query planning
   -> answer verification and evaluation datasets
   -> Langfuse traces, metrics and feedback

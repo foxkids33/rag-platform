@@ -60,3 +60,30 @@ def test_answer_history_preserves_roles() -> None:
         {"role": "user", "content": "Вопрос"},
         {"role": "assistant", "content": "Ответ"},
     ]
+
+
+def test_branch_history_uses_only_selected_ancestors() -> None:
+    from app.services.conversation_context import BranchMessage, branch_history
+
+    messages = [
+        BranchMessage(id="u1", parent_message_id=None, role="user", content="Корень"),
+        BranchMessage(id="a1", parent_message_id="u1", role="assistant", content="Ответ 1"),
+        BranchMessage(id="u2", parent_message_id="a1", role="user", content="Ветка A"),
+        BranchMessage(id="a2", parent_message_id="u2", role="assistant", content="Ответ A"),
+        BranchMessage(id="u3", parent_message_id="a1", role="user", content="Ветка B"),
+        BranchMessage(id="a3", parent_message_id="u3", role="assistant", content="Ответ B"),
+    ]
+
+    result = branch_history(messages, "a3", max_messages=10, max_chars=1000)
+    assert [item.content for item in result] == ["Корень", "Ответ 1", "Ветка B", "Ответ B"]
+
+
+def test_branch_history_stops_on_cycle() -> None:
+    from app.services.conversation_context import BranchMessage, branch_history
+
+    messages = [
+        BranchMessage(id="a", parent_message_id="b", role="assistant", content="A"),
+        BranchMessage(id="b", parent_message_id="a", role="user", content="B"),
+    ]
+    result = branch_history(messages, "a", max_messages=10, max_chars=1000)
+    assert len(result) == 2

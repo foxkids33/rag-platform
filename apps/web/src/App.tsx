@@ -11,6 +11,7 @@ import {
 } from "react";
 import { readSseEvents } from "./sse";
 import { KnowledgeBaseManager } from "./KnowledgeBaseManager";
+import { ConversationGraph } from "./ConversationGraph";
 
 type WorkspaceSourceMode = "USER_DOCUMENTS" | "KNOWLEDGE_BASE" | "HYBRID";
 
@@ -74,6 +75,7 @@ type StoredMessageMetadata = {
 type StoredMessage = {
   id: string;
   session_id: string;
+  parent_message_id: string | null;
   role: "user" | "assistant";
   content: string;
   metadata: StoredMessageMetadata;
@@ -121,6 +123,7 @@ type StreamMetadata = {
   retrieval_query: string;
   conversation_id: string | null;
   user_message_id: string | null;
+  parent_message_id: string | null;
   model: string;
   retrieval_mode: string;
   workspace_source_mode: WorkspaceSourceMode;
@@ -140,6 +143,7 @@ type StreamMetadata = {
 };
 
 type StreamDone = {
+  assistant_message_id?: string | null;
   citation_valid?: boolean;
   cited_source_indices?: number[];
   invalid_citations?: number[];
@@ -155,6 +159,7 @@ type ChatMessage = {
   role: "user" | "assistant";
   content: string;
   status: "complete" | "streaming" | "stopped" | "error";
+  parentMessageId?: string | null;
   sources?: AnswerSource[];
   metadata?: StreamMetadata;
 };
@@ -263,6 +268,7 @@ function storedMessageToChat(message: StoredMessage): ChatMessage {
         retrieval_query: message.metadata.retrieval_query || "",
         conversation_id: message.session_id,
         user_message_id: null,
+        parent_message_id: message.parent_message_id,
         model: message.metadata.model,
         retrieval_mode: message.metadata.retrieval_mode || "hybrid",
         workspace_source_mode: message.metadata.workspace_source_mode || "USER_DOCUMENTS",
@@ -287,6 +293,7 @@ function storedMessageToChat(message: StoredMessage): ChatMessage {
     role: message.role,
     content: message.content,
     status,
+    parentMessageId: message.parent_message_id,
     sources,
     metadata,
   };
@@ -313,6 +320,8 @@ export function App() {
   const [dragging, setDragging] = useState(false);
   const [documentActionId, setDocumentActionId] = useState<string | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [viewMode, setViewMode] = useState<"chat" | "graph">("chat");
+  const [branchParentId, setBranchParentId] = useState<string | null>(null);
   const [question, setQuestion] = useState("");
   const [streamStage, setStreamStage] = useState<StreamStage>("idle");
   const [error, setError] = useState("");
@@ -329,6 +338,18 @@ export function App() {
     () => knowledgeBases.find((item) => item.id === selectedWorkspace?.base_knowledge_base_id) ?? null,
     [knowledgeBases, selectedWorkspace?.base_knowledge_base_id],
   );
+
+  const activeBranchMessages = useMemo(() => {
+    if (!branchParentId) return messages;
+    const byId = new Map(messages.map((message) => [message.id, message]));
+    const branchIds = new Set<string>();
+    let currentId: string | null | undefined = branchParentId;
+    while (currentId && !branchIds.has(currentId)) {
+      branchIds.add(currentId);
+      currentId = byId.get(currentId)?.parentMessageId;
+    }
+    return messages.filter((message) => branchIds.has(message.id));
+  }, [branchParentId, messages]);
 
   const searchableCount = documents.filter((document) => (
     document.status === "READY" && document.search_enabled
@@ -351,9 +372,14 @@ export function App() {
     && !conversationLoading
   );
 
-  const loadConversation = useCallback(async (workspaceId: string, conversationId: string) => {
+  const loadConversation = useCallback(async (
+    workspaceId: string,
+    conversationId: string,
+    focusAssistantId?: string | null,
+  ) => {
     if (!workspaceId || !conversationId) {
       setMessages([]);
+      setBranchParentId(null);
       return;
     }
     setConversationLoading(true);
@@ -362,7 +388,13 @@ export function App() {
         `${API}/api/v1/workspaces/${workspaceId}/conversations/${conversationId}`,
       );
       const detail = await readJson<ConversationDetail>(response);
-      setMessages(detail.messages.map(storedMessageToChat));
+      const mapped = detail.messages.map(storedMessageToChat);
+      setMessages(mapped);
+      const focused = focusAssistantId
+        ? mapped.find((message) => message.id === focusAssistantId && message.role === "assistant")
+        : null;
+      const latestAssistant = [...mapped].reverse().find((message) => message.role === "assistant");
+      setBranchParentId(focused?.id || latestAssistant?.id || null);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "Не удалось загрузить диалог");
     } finally {
@@ -472,6 +504,7 @@ export function App() {
           await loadConversation(selectedWorkspaceId, targetId);
         } else {
           setMessages([]);
+          setBranchParentId(null);
         }
       } catch (reason) {
         if (!cancelled) {
@@ -495,6 +528,7 @@ export function App() {
     activeRequest.current = null;
     setStreamStage("idle");
     setMessages([]);
+    setBranchParentId(null);
     setConversations([]);
     setSelectedConversationId("");
     setQuestion("");
@@ -519,6 +553,7 @@ export function App() {
       setConversations((current) => [conversation, ...current]);
       setSelectedConversationId(conversation.id);
       setMessages([]);
+      setBranchParentId(null);
       return conversation;
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "Не удалось создать диалог");
@@ -535,6 +570,7 @@ export function App() {
     setStreamStage("idle");
     setSelectedConversationId(conversationId);
     setMessages([]);
+    setBranchParentId(null);
     setError("");
     await loadConversation(selectedWorkspaceId, conversationId);
   };
@@ -556,7 +592,10 @@ export function App() {
         const nextId = remaining[0]?.id || "";
         setSelectedConversationId(nextId);
         if (nextId) await loadConversation(selectedWorkspaceId, nextId);
-        else setMessages([]);
+        else {
+          setMessages([]);
+          setBranchParentId(null);
+        }
       }
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "Не удалось удалить диалог");
@@ -780,6 +819,7 @@ export function App() {
       role: "user",
       content: text,
       status: "complete",
+      parentMessageId: branchParentId,
     };
     const assistantId = newMessageId("assistant");
     const assistantMessage: ChatMessage = {
@@ -787,15 +827,18 @@ export function App() {
       role: "assistant",
       content: "",
       status: "streaming",
+      parentMessageId: userMessage.id,
     };
 
     setMessages((current) => [...current, userMessage, assistantMessage]);
+    setBranchParentId(assistantId);
     setQuestion("");
     setError("");
     setStreamStage("retrieving");
 
     const controller = new AbortController();
     activeRequest.current = controller;
+    let persistedAssistantId: string | null = null;
 
     try {
       const response = await fetch(`${API}/api/v1/workspaces/${selectedWorkspaceId}/answer/stream`, {
@@ -805,6 +848,7 @@ export function App() {
         body: JSON.stringify({
           question: text,
           conversation_id: conversationId,
+          parent_message_id: userMessage.parentMessageId || null,
           mode: "hybrid",
           retrieval_limit: 8,
           source_limit: 5,
@@ -840,12 +884,14 @@ export function App() {
         }
 
         if (event.event === "error") {
-          const payload = JSON.parse(event.data) as { detail?: string };
+          const payload = JSON.parse(event.data) as { detail?: string; assistant_message_id?: string | null };
+          persistedAssistantId = payload.assistant_message_id || null;
           throw new Error(payload.detail || "Ошибка генерации ответа");
         }
 
         if (event.event === "done") {
           const payload = JSON.parse(event.data) as StreamDone;
+          persistedAssistantId = payload.assistant_message_id || null;
           setMessages((current) => current.map((message) => (
             message.id === assistantId
               ? {
@@ -873,6 +919,9 @@ export function App() {
       setStreamStage("idle");
       try {
         await refreshConversations(selectedWorkspaceId);
+        if (conversationId) {
+          await loadConversation(selectedWorkspaceId, conversationId, persistedAssistantId);
+        }
       } catch {
         // The completed answer remains visible even if the sidebar refresh fails.
       }
@@ -898,7 +947,16 @@ export function App() {
     <div className="app-shell">
       <header className="topbar">
         <div className="brand">Скала<span>^р</span><small>RAG</small></div>
-        <nav><button className="active">Чат</button><button disabled title="Будет подключено позже">Граф</button></nav>
+        <nav>
+          <button className={viewMode === "chat" ? "active" : ""} onClick={() => setViewMode("chat")}>Чат</button>
+          <button
+            className={viewMode === "graph" ? "active" : ""}
+            onClick={() => setViewMode("graph")}
+            disabled={!selectedConversationId}
+          >
+            Граф
+          </button>
+        </nav>
         <div className="status"><i className={health === "API готов" ? "online" : "offline"} />{health}</div>
       </header>
 
@@ -1146,6 +1204,20 @@ export function App() {
 
           {error && <div className="error-banner"><span>{error}</span><button onClick={() => setError("")}>×</button></div>}
 
+          {viewMode === "graph" ? (
+            <ConversationGraph
+              messages={messages.map((message) => ({
+                id: message.id,
+                role: message.role,
+                content: message.content,
+                parentMessageId: message.parentMessageId,
+                status: message.status,
+                sourceCount: message.sources?.length || 0,
+              }))}
+              activeAssistantId={branchParentId}
+              onSelectAssistant={(assistantId) => setBranchParentId(assistantId)}
+            />
+          ) : (
           <div className="conversation" aria-live="polite">
             {conversationLoading && messages.length === 0 && (
               <div className="empty-state compact-empty">
@@ -1175,7 +1247,7 @@ export function App() {
               </div>
             )}
 
-            {messages.map((message) => (
+            {activeBranchMessages.map((message) => (
               <article className={`message-row ${message.role}`} key={message.id}>
                 <div className="message-avatar" aria-hidden="true">{message.role === "user" ? "В" : "✦"}</div>
                 <div className="message-content">
@@ -1252,8 +1324,15 @@ export function App() {
             )}
             <div ref={chatEnd} />
           </div>
+          )}
 
           <div className="composer-area">
+            {branchParentId && selectedConversationId && (
+              <div className="branch-context">
+                <span>↗ Новый вопрос продолжит выбранную ветку</span>
+                <button type="button" onClick={() => setViewMode("graph")}>Выбрать другую карточку</button>
+              </div>
+            )}
             <div className={`composer ${!hasSearchableContent ? "disabled-composer" : ""}`}>
               <textarea
                 value={question}

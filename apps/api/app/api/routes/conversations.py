@@ -39,6 +39,7 @@ class ChatMessageOut(BaseModel):
 
     id: uuid.UUID
     session_id: uuid.UUID
+    parent_message_id: uuid.UUID | None
     role: str
     content: str
     metadata: dict
@@ -64,6 +65,7 @@ def _message_out(message: ChatMessage) -> ChatMessageOut:
     return ChatMessageOut(
         id=message.id,
         session_id=message.session_id,
+        parent_message_id=message.parent_message_id,
         role=message.role,
         content=message.content,
         metadata=message.metadata_ or {},
@@ -134,7 +136,7 @@ async def get_conversation(
     result = await db.execute(
         select(ChatMessage)
         .where(ChatMessage.session_id == conversation.id)
-        .order_by(ChatMessage.created_at.asc(), ChatMessage.id.asc())
+        .order_by(ChatMessage.created_at.asc(), ChatMessage.role.desc(), ChatMessage.id.asc())
     )
     messages = list(result.scalars())
     return ConversationDetail(
