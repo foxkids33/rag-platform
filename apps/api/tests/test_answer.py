@@ -3,6 +3,7 @@ import uuid
 from app.api.routes.answer import _messages
 from app.api.routes.search import SearchResult
 from app.services.context_builder import build_context, clean_context_text
+from app.services.conversation_context import HistoryMessage
 from app.services.llm import chat_completions_url
 
 
@@ -105,3 +106,28 @@ def test_chat_completions_url_supports_base_and_v1_urls() -> None:
     assert chat_completions_url("http://192.0.2.10:8000") == (
         "http://192.0.2.10:8000/v1/chat/completions"
     )
+
+
+def test_messages_include_bounded_conversation_history() -> None:
+    context = build_context(
+        "Какие у неё преимущества?",
+        [_result(text="МБД.Х снижает TCO и масштабируется.", rank=1)],
+        max_context_chars=2000,
+        max_source_chars=1000,
+        max_sources=1,
+    )
+    history = [
+        HistoryMessage(role="user", content="Что такое МБД.Х?"),
+        HistoryMessage(role="assistant", content="Это программно-аппаратный комплекс."),
+    ]
+
+    messages = _messages("Какие у неё преимущества?", context, history)
+
+    assert [item["role"] for item in messages] == [
+        "system",
+        "user",
+        "assistant",
+        "user",
+    ]
+    assert "АКТУАЛЬНЫЙ КОНТЕКСТ" in messages[-1]["content"]
+    assert "Какие у неё преимущества?" in messages[-1]["content"]

@@ -36,6 +36,10 @@ class Settings(BaseSettings):
     rag_context_max_chars: int = 12000
     rag_source_max_chars: int = 2200
     rag_source_limit: int = 5
+    rag_history_messages: int = 8
+    rag_history_max_chars: int = 8000
+    rag_rewrite_followups: bool = True
+    rag_rewrite_max_tokens: int = 160
     embedding_base_url: str = "http://embedding:8080"
     embedding_model: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
     embedding_dim: int = 1024

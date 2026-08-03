@@ -25,6 +25,38 @@ type Workspace = {
   user_id: string | null;
 };
 
+type ConversationSummary = {
+  id: string;
+  workspace_id: string;
+  title: string | null;
+  created_at: string;
+  updated_at: string;
+  message_count: number;
+};
+
+type StoredMessageMetadata = {
+  status?: "complete" | "streaming" | "stopped" | "error";
+  model?: string;
+  retrieval_query?: string;
+  retrieval_mode?: string;
+  rerank_applied?: boolean;
+  context_chars?: number;
+  sources?: AnswerSource[];
+};
+
+type StoredMessage = {
+  id: string;
+  session_id: string;
+  role: "user" | "assistant";
+  content: string;
+  metadata: StoredMessageMetadata;
+  created_at: string;
+};
+
+type ConversationDetail = ConversationSummary & {
+  messages: StoredMessage[];
+};
+
 type DocumentRecord = {
   id: string;
   workspace_id: string | null;
@@ -55,6 +87,9 @@ type AnswerSource = {
 
 type StreamMetadata = {
   question: string;
+  retrieval_query: string;
+  conversation_id: string | null;
+  user_message_id: string | null;
   model: string;
   retrieval_mode: string;
   rerank_applied: boolean;
@@ -143,6 +178,37 @@ function newMessageId(prefix: string): string {
   return `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
+function storedMessageToChat(message: StoredMessage): ChatMessage {
+  const storedStatus = message.metadata?.status;
+  const status = storedStatus === "stopped" || storedStatus === "error"
+    ? storedStatus
+    : "complete";
+  const sources = message.role === "assistant" ? message.metadata?.sources ?? [] : undefined;
+  const metadata = message.role === "assistant" && message.metadata?.model
+    ? {
+        question: "",
+        retrieval_query: message.metadata.retrieval_query || "",
+        conversation_id: message.session_id,
+        user_message_id: null,
+        model: message.metadata.model,
+        retrieval_mode: message.metadata.retrieval_mode || "hybrid",
+        rerank_applied: Boolean(message.metadata.rerank_applied),
+        context_chars: message.metadata.context_chars || 0,
+        sources: sources || [],
+      } satisfies StreamMetadata
+    : undefined;
+
+  return {
+    id: message.id,
+    role: message.role,
+    content: message.content,
+    status,
+    sources,
+    metadata,
+  };
+}
+
+
 export function App() {
   const bootstrapped = useRef(false);
   const fileInput = useRef<HTMLInputElement>(null);
@@ -154,6 +220,10 @@ export function App() {
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
   const [selectedWorkspaceId, setSelectedWorkspaceId] = useState("");
   const [documents, setDocuments] = useState<DocumentRecord[]>([]);
+  const [conversations, setConversations] = useState<ConversationSummary[]>([]);
+  const [selectedConversationId, setSelectedConversationId] = useState("");
+  const [conversationLoading, setConversationLoading] = useState(false);
+  const [conversationActionId, setConversationActionId] = useState<string | null>(null);
   const [uploading, setUploading] = useState(false);
   const [dragging, setDragging] = useState(false);
   const [documentActionId, setDocumentActionId] = useState<string | null>(null);
@@ -166,13 +236,53 @@ export function App() {
     () => workspaces.find((workspace) => workspace.id === selectedWorkspaceId) ?? null,
     [selectedWorkspaceId, workspaces],
   );
+  const selectedConversation = useMemo(
+    () => conversations.find((conversation) => conversation.id === selectedConversationId) ?? null,
+    [conversations, selectedConversationId],
+  );
 
   const searchableCount = documents.filter((document) => (
     document.status === "READY" && document.search_enabled
   )).length;
   const hasSearchableContent = searchableCount > 0 || Boolean(selectedWorkspace?.base_knowledge_base_id);
   const isStreaming = streamStage !== "idle";
-  const canSubmit = Boolean(selectedWorkspaceId && hasSearchableContent && question.trim() && !isStreaming);
+  const canSubmit = Boolean(
+    selectedWorkspaceId
+    && hasSearchableContent
+    && question.trim()
+    && !isStreaming
+    && !conversationLoading
+  );
+
+  const loadConversation = useCallback(async (workspaceId: string, conversationId: string) => {
+    if (!workspaceId || !conversationId) {
+      setMessages([]);
+      return;
+    }
+    setConversationLoading(true);
+    try {
+      const response = await fetch(
+        `${API}/api/v1/workspaces/${workspaceId}/conversations/${conversationId}`,
+      );
+      const detail = await readJson<ConversationDetail>(response);
+      setMessages(detail.messages.map(storedMessageToChat));
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Не удалось загрузить диалог");
+    } finally {
+      setConversationLoading(false);
+    }
+  }, []);
+
+  const refreshConversations = useCallback(async (workspaceId: string) => {
+    if (!workspaceId) {
+      setConversations([]);
+      return [] as ConversationSummary[];
+    }
+    const response = await fetch(`${API}/api/v1/workspaces/${workspaceId}/conversations`);
+    const items = await readJson<ConversationSummary[]>(response);
+    setConversations(items);
+    return items;
+  }, []);
 
   const loadDocuments = useCallback(async (workspaceId: string) => {
     if (!workspaceId) {
@@ -237,6 +347,32 @@ export function App() {
   }, [loadDocuments, selectedWorkspaceId]);
 
   useEffect(() => {
+    if (!selectedWorkspaceId) return;
+    let cancelled = false;
+
+    const loadHistory = async () => {
+      try {
+        const items = await refreshConversations(selectedWorkspaceId);
+        if (cancelled) return;
+        const targetId = items[0]?.id || "";
+        setSelectedConversationId(targetId);
+        if (targetId) {
+          await loadConversation(selectedWorkspaceId, targetId);
+        } else {
+          setMessages([]);
+        }
+      } catch (reason) {
+        if (!cancelled) {
+          setError(reason instanceof Error ? reason.message : "Не удалось загрузить историю");
+        }
+      }
+    };
+
+    void loadHistory();
+    return () => { cancelled = true; };
+  }, [loadConversation, refreshConversations, selectedWorkspaceId]);
+
+  useEffect(() => {
     chatEnd.current?.scrollIntoView({ behavior: isStreaming ? "auto" : "smooth", block: "end" });
   }, [isStreaming, messages]);
 
@@ -247,9 +383,74 @@ export function App() {
     activeRequest.current = null;
     setStreamStage("idle");
     setMessages([]);
+    setConversations([]);
+    setSelectedConversationId("");
     setQuestion("");
     setError("");
     setSelectedWorkspaceId(workspaceId);
+  };
+
+  const createConversation = async (): Promise<ConversationSummary | null> => {
+    if (!selectedWorkspaceId || conversationActionId) return null;
+    setConversationActionId("new");
+    setError("");
+    try {
+      const response = await fetch(
+        `${API}/api/v1/workspaces/${selectedWorkspaceId}/conversations`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ title: null }),
+        },
+      );
+      const conversation = await readJson<ConversationSummary>(response);
+      setConversations((current) => [conversation, ...current]);
+      setSelectedConversationId(conversation.id);
+      setMessages([]);
+      return conversation;
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Не удалось создать диалог");
+      return null;
+    } finally {
+      setConversationActionId(null);
+    }
+  };
+
+  const switchConversation = async (conversationId: string) => {
+    if (!selectedWorkspaceId || conversationId === selectedConversationId || isStreaming) return;
+    activeRequest.current?.abort();
+    activeRequest.current = null;
+    setStreamStage("idle");
+    setSelectedConversationId(conversationId);
+    setMessages([]);
+    setError("");
+    await loadConversation(selectedWorkspaceId, conversationId);
+  };
+
+  const deleteConversation = async (conversation: ConversationSummary) => {
+    if (!selectedWorkspaceId || conversationActionId || isStreaming) return;
+    if (!window.confirm(`Удалить диалог «${conversation.title || "Новый диалог"}»?`)) return;
+    setConversationActionId(conversation.id);
+    setError("");
+    try {
+      const response = await fetch(
+        `${API}/api/v1/workspaces/${selectedWorkspaceId}/conversations/${conversation.id}`,
+        { method: "DELETE" },
+      );
+      if (!response.ok) throw new Error(await readError(response));
+      const remaining = conversations.filter((item) => item.id !== conversation.id);
+      setConversations(remaining);
+      if (selectedConversationId === conversation.id) {
+        const nextId = remaining[0]?.id || "";
+        setSelectedConversationId(nextId);
+        if (nextId) await loadConversation(selectedWorkspaceId, nextId);
+        else setMessages([]);
+      }
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Не удалось удалить диалог");
+    } finally {
+      setConversationActionId(null);
+    }
   };
 
   const createWorkspace = async () => {
@@ -380,6 +581,13 @@ export function App() {
     const text = (rawQuestion ?? question).trim();
     if (!selectedWorkspaceId || !hasSearchableContent || !text || isStreaming) return;
 
+    let conversationId = selectedConversationId;
+    if (!conversationId) {
+      const created = await createConversation();
+      if (!created) return;
+      conversationId = created.id;
+    }
+
     const userMessage: ChatMessage = {
       id: newMessageId("user"),
       role: "user",
@@ -409,6 +617,7 @@ export function App() {
         signal: controller.signal,
         body: JSON.stringify({
           question: text,
+          conversation_id: conversationId,
           mode: "hybrid",
           retrieval_limit: 8,
           source_limit: 5,
@@ -422,6 +631,7 @@ export function App() {
       for await (const event of readSseEvents(response)) {
         if (event.event === "metadata") {
           const metadata = JSON.parse(event.data) as StreamMetadata;
+          if (metadata.conversation_id) setSelectedConversationId(metadata.conversation_id);
           setMessages((current) => current.map((message) => (
             message.id === assistantId
               ? { ...message, metadata, sources: metadata.sources }
@@ -465,6 +675,11 @@ export function App() {
     } finally {
       if (activeRequest.current === controller) activeRequest.current = null;
       setStreamStage("idle");
+      try {
+        await refreshConversations(selectedWorkspaceId);
+      } catch {
+        // The completed answer remains visible even if the sidebar refresh fails.
+      }
     }
   };
 
@@ -477,9 +692,11 @@ export function App() {
 
   const composerHint = !selectedWorkspaceId
     ? "Выберите рабочую область"
-    : !hasSearchableContent
-      ? "Добавьте документ и дождитесь статуса «Готов»"
-      : "Enter — отправить, Shift+Enter — новая строка";
+    : conversationLoading
+      ? "Загружается история диалога"
+      : !hasSearchableContent
+        ? "Добавьте документ и дождитесь статуса «Готов»"
+        : "Enter — отправить, Shift+Enter — новая строка";
 
   return (
     <div className="app-shell">
@@ -511,6 +728,55 @@ export function App() {
               {knowledgeBases.map((kb) => <option key={kb.id} value={kb.id}>{kb.name}</option>)}
             </select>
             <p className="hint">Файлы workspace ищутся вместе с выбранной готовой базой.</p>
+          </section>
+
+          <section className="chat-history-section">
+            <div className="section-title">
+              <h3>Диалоги</h3>
+              <button
+                className="text-button"
+                onClick={() => void createConversation()}
+                disabled={!selectedWorkspaceId || Boolean(conversationActionId) || isStreaming}
+              >
+                + Новый
+              </button>
+            </div>
+            <div className="chat-history-list">
+              {conversationLoading && conversations.length === 0 && (
+                <p className="empty-documents">Загрузка истории…</p>
+              )}
+              {!conversationLoading && conversations.length === 0 && (
+                <p className="empty-documents">Диалогов пока нет</p>
+              )}
+              {conversations.map((conversation) => (
+                <div
+                  className={`chat-history-item ${selectedConversationId === conversation.id ? "active" : ""}`}
+                  key={conversation.id}
+                >
+                  <button
+                    className="chat-history-select"
+                    type="button"
+                    disabled={isStreaming || conversationActionId === conversation.id}
+                    onClick={() => void switchConversation(conversation.id)}
+                  >
+                    <strong>{conversation.title || "Новый диалог"}</strong>
+                    <span>
+                      {conversation.message_count} сообщ. · {new Date(conversation.updated_at).toLocaleDateString("ru-RU")}
+                    </span>
+                  </button>
+                  <button
+                    className="chat-history-delete"
+                    type="button"
+                    disabled={isStreaming || Boolean(conversationActionId)}
+                    onClick={() => void deleteConversation(conversation)}
+                    title="Удалить диалог"
+                    aria-label="Удалить диалог"
+                  >
+                    {conversationActionId === conversation.id ? "…" : "×"}
+                  </button>
+                </div>
+              ))}
+            </div>
           </section>
 
           <section>
@@ -598,10 +864,14 @@ export function App() {
         <main className="chat">
           <div className="chat-head">
             <div>
-              <strong>{selectedWorkspace?.name || "Рабочая область"}</strong>
-              <span>{selectedWorkspace?.base_knowledge_base_id ? "Готовая база + документы workspace" : "Только документы workspace"}</span>
+              <strong>{selectedConversation?.title || "Новый диалог"}</strong>
+              <span>
+                {selectedWorkspace?.name || "Рабочая область"}
+                {selectedWorkspace?.base_knowledge_base_id ? " · база + документы" : " · документы workspace"}
+              </span>
             </div>
             <div className="chat-head-stats">
+              <span>{conversations.length} диалогов</span>
               <span>{searchableCount} в поиске</span>
               <span>Hybrid</span>
             </div>
@@ -610,7 +880,13 @@ export function App() {
           {error && <div className="error-banner"><span>{error}</span><button onClick={() => setError("")}>×</button></div>}
 
           <div className="conversation" aria-live="polite">
-            {messages.length === 0 && (
+            {conversationLoading && messages.length === 0 && (
+              <div className="empty-state compact-empty">
+                <span className="spinner" />
+                <p>Загружаю историю диалога…</p>
+              </div>
+            )}
+            {!conversationLoading && messages.length === 0 && (
               <div className="empty-state">
                 <div className="spark">✦</div>
                 <h1>Задайте вопрос по документам</h1>
@@ -696,7 +972,7 @@ export function App() {
             <div className={`composer ${!hasSearchableContent ? "disabled-composer" : ""}`}>
               <textarea
                 value={question}
-                disabled={!selectedWorkspaceId || !hasSearchableContent}
+                disabled={!selectedWorkspaceId || !hasSearchableContent || conversationLoading}
                 placeholder={hasSearchableContent ? "Спросите по подключённым документам…" : "Добавьте готовый документ для начала"}
                 rows={1}
                 onChange={(event) => setQuestion(event.target.value)}
