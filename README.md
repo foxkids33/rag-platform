@@ -66,7 +66,8 @@ npm run dev
 10. Добавить управление документами workspace: исключение из поиска и полное удаление.
 11. Добавить историю диалога и контекстные follow-up вопросы.
 12. Добавить quality gates: evidence scoring, diversity, citation audit и безопасный отказ.
-13. Перенести граф исследования и добавить настоящий knowledge graph.
+13. Добавить управление workspace и режимами источников: user-only, KB-only и hybrid.
+14. Перенести граф исследования и добавить настоящий knowledge graph.
 
 ## Локальный reranker
 
@@ -128,3 +129,17 @@ chunks и ingestion jobs удаляются каскадно. Документы
 отказ и не вызывает vLLM. После генерации проверяется, что все ссылки `[n]`
 относятся к реально переданным источникам. В JSON/SSE metadata доступны
 `evidence_status`, `evidence_score`, `abstained` и `citation_valid`.
+
+
+## Workspace и режимы источников
+
+Workspace теперь явно хранит `source_mode`:
+
+- `USER_DOCUMENTS` — retrieval только по документам текущего workspace;
+- `KNOWLEDGE_BASE` — retrieval только по активной версии выбранной готовой базы;
+- `HYBRID` — единый RRF + reranker по обоим слоям.
+
+Workspace можно создавать, переименовывать и удалять через API и UI. При удалении
+очищаются пользовательские документы в MinIO, chunks, embeddings и диалоги.
+Источники ответа содержат provenance: документ workspace либо имя и версия базы
+знаний. Неактивные версии KB никогда не участвуют в retrieval.

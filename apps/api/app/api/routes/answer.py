@@ -75,6 +75,9 @@ class AnswerSource(BaseModel):
     rerank_score: float | None
     rerank_fusion_score: float | None
     quality_score: float
+    source_scope: str
+    knowledge_base_name: str | None
+    knowledge_base_version: int | None
 
 
 class AnswerResponse(BaseModel):
@@ -84,6 +87,9 @@ class AnswerResponse(BaseModel):
     model: str
     finish_reason: str | None
     retrieval_mode: str
+    workspace_source_mode: str
+    knowledge_base_id: uuid.UUID | None
+    knowledge_base_version_id: uuid.UUID | None
     rerank_applied: bool
     context_chars: int
     conversation_id: uuid.UUID | None
@@ -128,6 +134,9 @@ def _answer_sources(sources: list[ContextSource]) -> list[AnswerSource]:
             rerank_score=source.rerank_score,
             rerank_fusion_score=source.rerank_fusion_score,
             quality_score=source.quality_score,
+            source_scope=source.source_scope,
+            knowledge_base_name=source.knowledge_base_name,
+            knowledge_base_version=source.knowledge_base_version,
         )
         for source in sources
     ]
@@ -285,6 +294,17 @@ def _assistant_metadata(
         "finish_reason": output.finish_reason if output else None,
         "retrieval_query": prepared.retrieval_query,
         "retrieval_mode": prepared.search_response.mode,
+        "workspace_source_mode": prepared.search_response.workspace_source_mode.value,
+        "knowledge_base_id": (
+            str(prepared.search_response.knowledge_base_id)
+            if prepared.search_response.knowledge_base_id
+            else None
+        ),
+        "knowledge_base_version_id": (
+            str(prepared.search_response.knowledge_base_version_id)
+            if prepared.search_response.knowledge_base_version_id
+            else None
+        ),
         "rerank_applied": prepared.search_response.rerank_applied,
         "context_chars": prepared.context.char_count,
         **_quality_payload(prepared),
@@ -435,6 +455,9 @@ async def answer(
         model=output.model,
         finish_reason=output.finish_reason,
         retrieval_mode=prepared.search_response.mode,
+        workspace_source_mode=prepared.search_response.workspace_source_mode.value,
+        knowledge_base_id=prepared.search_response.knowledge_base_id,
+        knowledge_base_version_id=prepared.search_response.knowledge_base_version_id,
         rerank_applied=prepared.search_response.rerank_applied,
         context_chars=prepared.context.char_count,
         conversation_id=prepared.conversation.id if prepared.conversation else None,
@@ -483,6 +506,17 @@ async def answer_stream(
                     else settings.vllm_model
                 ),
                 "retrieval_mode": prepared.search_response.mode,
+                "workspace_source_mode": prepared.search_response.workspace_source_mode.value,
+                "knowledge_base_id": (
+                    str(prepared.search_response.knowledge_base_id)
+                    if prepared.search_response.knowledge_base_id
+                    else None
+                ),
+                "knowledge_base_version_id": (
+                    str(prepared.search_response.knowledge_base_version_id)
+                    if prepared.search_response.knowledge_base_version_id
+                    else None
+                ),
                 "rerank_applied": prepared.search_response.rerank_applied,
                 "context_chars": prepared.context.char_count,
                 **_quality_payload(prepared),

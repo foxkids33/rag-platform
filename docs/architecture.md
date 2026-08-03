@@ -4,19 +4,16 @@
 
 Every user operation happens inside a workspace.
 
-A workspace may have:
+A workspace stores an explicit source mode:
 
-- `base_knowledge_base_id = null`: user documents only;
-- `base_knowledge_base_id = <uuid>`: predefined knowledge base;
-- any number of workspace-owned documents layered over the base knowledge base.
+- `USER_DOCUMENTS`: workspace-owned documents only;
+- `KNOWLEDGE_BASE`: the active immutable version of the selected knowledge base only;
+- `HYBRID`: both layers enter the same dense/lexical/RRF/reranker pipeline.
 
-The effective retrieval scope is therefore:
-
-```text
-active version of selected knowledge base
-OR
-workspace-owned documents
-```
+`base_knowledge_base_id` selects the predefined knowledge base. Only its
+`active_version_id` is eligible for retrieval; older and staging versions remain
+isolated. Every returned source carries provenance identifying either the workspace
+document or the knowledge-base name and version.
 
 ## Planned online RAG path
 

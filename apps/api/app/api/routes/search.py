@@ -10,10 +10,15 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
-from app.db.models import Workspace
+from app.db.models import KnowledgeBase, KnowledgeBaseVersion, Workspace
 from app.db.session import get_db
 from app.services.embeddings import EmbeddingError, embeddings
 from app.services.reranker import RerankError, reranker
+from app.services.workspace_sources import (
+    WorkspaceSourceMode,
+    includes_knowledge_base,
+    includes_workspace_documents,
+)
 
 router = APIRouter(prefix="/workspaces/{workspace_id}/search", tags=["search"])
 
@@ -67,11 +72,17 @@ class SearchResult(BaseModel):
     rerank_rank: int | None = None
     rerank_fusion_score: float | None = None
     rerank_penalty: float = 0.0
+    source_scope: Literal["workspace", "knowledge_base"] = "workspace"
+    knowledge_base_name: str | None = None
+    knowledge_base_version: int | None = None
 
 
 class SearchResponse(BaseModel):
     query: str
     mode: str
+    workspace_source_mode: WorkspaceSourceMode
+    knowledge_base_id: uuid.UUID | None
+    knowledge_base_version_id: uuid.UUID | None
     candidate_limit: int
     rerank_requested: bool
     rerank_applied: bool
@@ -232,6 +243,16 @@ async def search(
     if workspace is None:
         raise HTTPException(status_code=404, detail="Workspace not found")
 
+    source_mode = WorkspaceSourceMode(workspace.source_mode)
+    include_workspace = includes_workspace_documents(source_mode)
+    include_knowledge_base = includes_knowledge_base(source_mode)
+    knowledge_base: KnowledgeBase | None = None
+    active_version: KnowledgeBaseVersion | None = None
+    if workspace.base_knowledge_base_id is not None:
+        knowledge_base = await db.get(KnowledgeBase, workspace.base_knowledge_base_id)
+        if knowledge_base is not None and knowledge_base.active_version_id is not None:
+            active_version = await db.get(KnowledgeBaseVersion, knowledge_base.active_version_id)
+
     query = payload.query.strip()
     if len(query) < 2:
         raise HTTPException(status_code=400, detail="Query is too short")
@@ -280,12 +301,29 @@ async def search(
                     c.page_end,
                     c.embedding,
                     c.search_vector,
-                    d.filename
+                    d.filename,
+                    CASE
+                        WHEN d.workspace_id IS NOT NULL THEN 'workspace'
+                        ELSE 'knowledge_base'
+                    END AS source_scope,
+                    kb.name AS knowledge_base_name,
+                    kbv.version AS knowledge_base_version
                 FROM document_chunks AS c
                 JOIN documents AS d ON d.id = c.document_id
-                WHERE d.workspace_id = :workspace_id
-                  AND d.status = 'READY'
+                LEFT JOIN knowledge_base_versions AS kbv
+                    ON kbv.id = d.knowledge_base_version_id
+                LEFT JOIN knowledge_bases AS kb
+                    ON kb.id = kbv.knowledge_base_id
+                WHERE d.status = 'READY'
                   AND d.search_enabled IS TRUE
+                  AND (
+                      (:include_workspace AND d.workspace_id = :workspace_id)
+                      OR
+                      (
+                          :include_knowledge_base
+                          AND d.knowledge_base_version_id = :knowledge_base_version_id
+                      )
+                  )
             ),
             dense AS (
                 SELECT
@@ -342,6 +380,9 @@ async def search(
                     e.id AS chunk_id,
                     e.document_id,
                     e.filename,
+                    e.source_scope,
+                    e.knowledge_base_name,
+                    e.knowledge_base_version,
                     e.chunk_index,
                     e.text,
                     LEFT(e.parent_text, :parent_preview_chars) AS parent_text,
@@ -371,6 +412,9 @@ async def search(
                 chunk_id,
                 document_id,
                 filename,
+                source_scope,
+                knowledge_base_name,
+                knowledge_base_version,
                 chunk_index,
                 text,
                 parent_text,
@@ -396,6 +440,11 @@ async def search(
         ),
         {
             "workspace_id": workspace_id,
+            "include_workspace": include_workspace,
+            "include_knowledge_base": include_knowledge_base and active_version is not None,
+            "knowledge_base_version_id": (
+                active_version.id if active_version is not None else uuid.UUID(int=0)
+            ),
             "query": query,
             "query_vector": _vector_literal(query_vector),
             "use_dense": use_dense,
@@ -464,6 +513,9 @@ async def search(
     return SearchResponse(
         query=query,
         mode=payload.mode,
+        workspace_source_mode=source_mode,
+        knowledge_base_id=knowledge_base.id if knowledge_base else None,
+        knowledge_base_version_id=active_version.id if active_version else None,
         candidate_limit=candidate_limit,
         rerank_requested=rerank_requested,
         rerank_applied=rerank_applied,

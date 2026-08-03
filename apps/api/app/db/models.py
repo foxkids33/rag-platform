@@ -46,7 +46,11 @@ class Workspace(Base):
     base_knowledge_base_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("knowledge_bases.id", ondelete="SET NULL")
     )
+    source_mode: Mapped[str] = mapped_column(String(32), default="USER_DOCUMENTS", nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
 
 
 class Document(Base):

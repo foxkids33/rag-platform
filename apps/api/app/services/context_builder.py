@@ -57,6 +57,9 @@ class SearchResultLike(Protocol):
     rrf_score: float
     rerank_score: float | None
     rerank_fusion_score: float | None
+    source_scope: str
+    knowledge_base_name: str | None
+    knowledge_base_version: int | None
 
 
 @dataclass(frozen=True)
@@ -73,6 +76,9 @@ class ContextSource:
     retrieval_rank: int
     rerank_score: float | None
     rerank_fusion_score: float | None
+    source_scope: str
+    knowledge_base_name: str | None
+    knowledge_base_version: int | None
     quality_score: float
 
     @property
@@ -205,7 +211,13 @@ def _page_label(page_start: int | None, page_end: int | None) -> str | None:
 
 
 def _source_header(source: ContextSource) -> str:
-    details = [source.filename]
+    if source.source_scope == "knowledge_base":
+        knowledge_base = source.knowledge_base_name or "База знаний"
+        if source.knowledge_base_version is not None:
+            knowledge_base = f"{knowledge_base}, версия {source.knowledge_base_version}"
+        details = [f"база знаний: {knowledge_base}", source.filename]
+    else:
+        details = [source.filename]
     page_label = _page_label(source.page_start, source.page_end)
     if page_label:
         details.append(page_label)
@@ -299,6 +311,9 @@ def build_context(
             rerank_score=result.rerank_score,
             rerank_fusion_score=result.rerank_fusion_score,
             quality_score=quality_score,
+            source_scope=getattr(result, "source_scope", "workspace"),
+            knowledge_base_name=getattr(result, "knowledge_base_name", None),
+            knowledge_base_version=getattr(result, "knowledge_base_version", None),
         )
         block = f"{_source_header(source)}\n{source.excerpt}"
         separator_chars = 2 if blocks else 0

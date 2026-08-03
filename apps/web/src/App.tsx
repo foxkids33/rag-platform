@@ -11,18 +11,33 @@ import {
 } from "react";
 import { readSseEvents } from "./sse";
 
+type WorkspaceSourceMode = "USER_DOCUMENTS" | "KNOWLEDGE_BASE" | "HYBRID";
+
 type KnowledgeBase = {
   id: string;
   slug: string;
   name: string;
   description?: string | null;
+  active_version_id: string | null;
+  active_version: number | null;
+  active_version_status: string | null;
+  active_document_count: number;
 };
 
 type Workspace = {
   id: string;
   name: string;
   base_knowledge_base_id: string | null;
+  base_knowledge_base_name: string | null;
+  active_knowledge_base_version_id: string | null;
+  active_knowledge_base_version: number | null;
+  source_mode: WorkspaceSourceMode;
   user_id: string | null;
+  document_count: number;
+  searchable_document_count: number;
+  conversation_count: number;
+  created_at: string;
+  updated_at: string;
 };
 
 type ConversationSummary = {
@@ -39,6 +54,9 @@ type StoredMessageMetadata = {
   model?: string;
   retrieval_query?: string;
   retrieval_mode?: string;
+  workspace_source_mode?: WorkspaceSourceMode;
+  knowledge_base_id?: string | null;
+  knowledge_base_version_id?: string | null;
   rerank_applied?: boolean;
   context_chars?: number;
   abstained?: boolean;
@@ -92,6 +110,9 @@ type AnswerSource = {
   rerank_score: number | null;
   rerank_fusion_score: number | null;
   quality_score: number;
+  source_scope: "workspace" | "knowledge_base";
+  knowledge_base_name: string | null;
+  knowledge_base_version: number | null;
 };
 
 type StreamMetadata = {
@@ -101,6 +122,9 @@ type StreamMetadata = {
   user_message_id: string | null;
   model: string;
   retrieval_mode: string;
+  workspace_source_mode: WorkspaceSourceMode;
+  knowledge_base_id: string | null;
+  knowledge_base_version_id: string | null;
   rerank_applied: boolean;
   context_chars: number;
   abstained: boolean;
@@ -168,6 +192,26 @@ function statusLabel(status: string): string {
   return labels[status] || status;
 }
 
+
+function workspaceModeLabel(mode: WorkspaceSourceMode): string {
+  const labels: Record<WorkspaceSourceMode, string> = {
+    USER_DOCUMENTS: "Только документы workspace",
+    KNOWLEDGE_BASE: "Только готовая база знаний",
+    HYBRID: "База знаний + документы",
+  };
+  return labels[mode];
+}
+
+function sourceProvenance(source: AnswerSource): string {
+  if (source.source_scope === "knowledge_base") {
+    const name = source.knowledge_base_name || "База знаний";
+    return source.knowledge_base_version == null
+      ? name
+      : `${name} · версия ${source.knowledge_base_version}`;
+  }
+  return "Документ workspace";
+}
+
 function pageLabel(source: AnswerSource): string | null {
   if (source.page_start == null) return null;
   if (source.page_end == null || source.page_end === source.page_start) {
@@ -220,6 +264,9 @@ function storedMessageToChat(message: StoredMessage): ChatMessage {
         user_message_id: null,
         model: message.metadata.model,
         retrieval_mode: message.metadata.retrieval_mode || "hybrid",
+        workspace_source_mode: message.metadata.workspace_source_mode || "USER_DOCUMENTS",
+        knowledge_base_id: message.metadata.knowledge_base_id ?? null,
+        knowledge_base_version_id: message.metadata.knowledge_base_version_id ?? null,
         rerank_applied: Boolean(message.metadata.rerank_applied),
         context_chars: message.metadata.context_chars || 0,
         abstained: Boolean(message.metadata.abstained),
@@ -260,6 +307,7 @@ export function App() {
   const [selectedConversationId, setSelectedConversationId] = useState("");
   const [conversationLoading, setConversationLoading] = useState(false);
   const [conversationActionId, setConversationActionId] = useState<string | null>(null);
+  const [workspaceActionId, setWorkspaceActionId] = useState<string | null>(null);
   const [uploading, setUploading] = useState(false);
   const [dragging, setDragging] = useState(false);
   const [documentActionId, setDocumentActionId] = useState<string | null>(null);
@@ -276,11 +324,23 @@ export function App() {
     () => conversations.find((conversation) => conversation.id === selectedConversationId) ?? null,
     [conversations, selectedConversationId],
   );
+  const selectedKnowledgeBase = useMemo(
+    () => knowledgeBases.find((item) => item.id === selectedWorkspace?.base_knowledge_base_id) ?? null,
+    [knowledgeBases, selectedWorkspace?.base_knowledge_base_id],
+  );
 
   const searchableCount = documents.filter((document) => (
     document.status === "READY" && document.search_enabled
   )).length;
-  const hasSearchableContent = searchableCount > 0 || Boolean(selectedWorkspace?.base_knowledge_base_id);
+  const hasActiveKnowledgeBase = Boolean(
+    selectedKnowledgeBase?.active_version_id
+    && selectedKnowledgeBase.active_document_count > 0
+  );
+  const hasSearchableContent = selectedWorkspace?.source_mode === "USER_DOCUMENTS"
+    ? searchableCount > 0
+    : selectedWorkspace?.source_mode === "KNOWLEDGE_BASE"
+      ? hasActiveKnowledgeBase
+      : searchableCount > 0 || hasActiveKnowledgeBase;
   const isStreaming = streamStage !== "idle";
   const canSubmit = Boolean(
     selectedWorkspaceId
@@ -333,6 +393,13 @@ export function App() {
     }
   }, []);
 
+  const refreshWorkspaces = useCallback(async () => {
+    const response = await fetch(`${API}/api/v1/workspaces`);
+    const items = await readJson<Workspace[]>(response);
+    setWorkspaces(items);
+    return items;
+  }, []);
+
   useEffect(() => {
     if (bootstrapped.current) return;
     bootstrapped.current = true;
@@ -357,6 +424,7 @@ export function App() {
             body: JSON.stringify({
               name: "Мои документы",
               base_knowledge_base_id: null,
+              source_mode: "USER_DOCUMENTS",
               user_id: "local-user",
             }),
           });
@@ -489,41 +557,113 @@ export function App() {
     }
   };
 
+  const createWorkspaceRecord = async (name: string): Promise<Workspace> => {
+    const response = await fetch(`${API}/api/v1/workspaces`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        name,
+        base_knowledge_base_id: null,
+        source_mode: "USER_DOCUMENTS",
+        user_id: "local-user",
+      }),
+    });
+    return readJson<Workspace>(response);
+  };
+
   const createWorkspace = async () => {
     const name = window.prompt("Название рабочей области", "Новая рабочая область")?.trim();
-    if (!name) return;
+    if (!name || workspaceActionId) return;
 
+    setWorkspaceActionId("new");
     setError("");
     try {
-      const response = await fetch(`${API}/api/v1/workspaces`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name, base_knowledge_base_id: null, user_id: "local-user" }),
-      });
-      const workspace = await readJson<Workspace>(response);
+      const workspace = await createWorkspaceRecord(name);
       setWorkspaces((current) => [workspace, ...current]);
       switchWorkspace(workspace.id);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "Не удалось создать workspace");
+    } finally {
+      setWorkspaceActionId(null);
     }
+  };
+
+  const patchWorkspace = async (changes: Record<string, unknown>): Promise<Workspace | null> => {
+    if (!selectedWorkspace || workspaceActionId) return null;
+    setWorkspaceActionId(selectedWorkspace.id);
+    setError("");
+    try {
+      const response = await fetch(`${API}/api/v1/workspaces/${selectedWorkspace.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(changes),
+      });
+      const updated = await readJson<Workspace>(response);
+      setWorkspaces((current) => current.map((item) => item.id === updated.id ? updated : item));
+      return updated;
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Не удалось изменить workspace");
+      return null;
+    } finally {
+      setWorkspaceActionId(null);
+    }
+  };
+
+  const renameWorkspace = async () => {
+    if (!selectedWorkspace) return;
+    const name = window.prompt("Новое название workspace", selectedWorkspace.name)?.trim();
+    if (!name || name === selectedWorkspace.name) return;
+    await patchWorkspace({ name });
+  };
+
+  const deleteWorkspace = async () => {
+    if (!selectedWorkspace || workspaceActionId || isStreaming) return;
+    const confirmed = window.confirm(
+      `Удалить workspace «${selectedWorkspace.name}»? Документы, embeddings и диалоги будут удалены.`,
+    );
+    if (!confirmed) return;
+
+    const deletingId = selectedWorkspace.id;
+    setWorkspaceActionId(deletingId);
+    setError("");
+    try {
+      const response = await fetch(`${API}/api/v1/workspaces/${deletingId}`, { method: "DELETE" });
+      if (!response.ok) throw new Error(await readError(response));
+      let remaining = workspaces.filter((item) => item.id !== deletingId);
+      if (remaining.length === 0) {
+        const fallback = await createWorkspaceRecord("Мои документы");
+        remaining = [fallback];
+      }
+      setWorkspaces(remaining);
+      switchWorkspace(remaining[0].id);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Не удалось удалить workspace");
+    } finally {
+      setWorkspaceActionId(null);
+    }
+  };
+
+  const updateSourceMode = async (event: ChangeEvent<HTMLSelectElement>) => {
+    const sourceMode = event.target.value as WorkspaceSourceMode;
+    if (!selectedWorkspace) return;
+    if (sourceMode !== "USER_DOCUMENTS" && !selectedWorkspace.base_knowledge_base_id) {
+      setError("Сначала выберите готовую базу знаний");
+      return;
+    }
+    await patchWorkspace({ source_mode: sourceMode });
   };
 
   const updateKnowledgeBase = async (event: ChangeEvent<HTMLSelectElement>) => {
     if (!selectedWorkspace) return;
     const knowledgeBaseId = event.target.value || null;
-    setError("");
-
-    try {
-      const response = await fetch(`${API}/api/v1/workspaces/${selectedWorkspace.id}`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ base_knowledge_base_id: knowledgeBaseId }),
-      });
-      const updated = await readJson<Workspace>(response);
-      setWorkspaces((current) => current.map((item) => item.id === updated.id ? updated : item));
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "Не удалось изменить базу знаний");
+    const changes: Record<string, unknown> = {
+      base_knowledge_base_id: knowledgeBaseId,
+      source_mode: selectedWorkspace.source_mode,
+    };
+    if (!knowledgeBaseId && selectedWorkspace.source_mode !== "USER_DOCUMENTS") {
+      changes.source_mode = "USER_DOCUMENTS";
     }
+    await patchWorkspace(changes);
   };
 
   const uploadFiles = async (files: FileList | File[]) => {
@@ -542,6 +682,7 @@ export function App() {
         await readJson<DocumentRecord>(response);
       }
       await loadDocuments(selectedWorkspaceId);
+      await refreshWorkspaces();
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "Не удалось загрузить файл");
     } finally {
@@ -573,6 +714,7 @@ export function App() {
       );
       const updated = await readJson<DocumentRecord>(response);
       setDocuments((current) => current.map((item) => item.id === updated.id ? updated : item));
+      await refreshWorkspaces();
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "Не удалось изменить участие документа в поиске");
     } finally {
@@ -597,6 +739,7 @@ export function App() {
       );
       if (!response.ok) throw new Error(await readError(response));
       setDocuments((current) => current.filter((item) => item.id !== document.id));
+      await refreshWorkspaces();
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "Не удалось удалить документ");
     } finally {
@@ -756,23 +899,83 @@ export function App() {
           <section>
             <div className="section-title">
               <h3>Рабочая область</h3>
-              <button className="text-button" onClick={createWorkspace}>+ Новая</button>
+              <button
+                className="text-button"
+                onClick={createWorkspace}
+                disabled={Boolean(workspaceActionId) || isStreaming}
+              >
+                + Новая
+              </button>
             </div>
             <label>Workspace</label>
-            <select value={selectedWorkspaceId} onChange={(event) => switchWorkspace(event.target.value)}>
-              {workspaces.map((workspace) => <option key={workspace.id} value={workspace.id}>{workspace.name}</option>)}
-            </select>
+            <div className="workspace-selector-row">
+              <select
+                value={selectedWorkspaceId}
+                onChange={(event) => switchWorkspace(event.target.value)}
+                disabled={Boolean(workspaceActionId) || isStreaming}
+              >
+                {workspaces.map((workspace) => (
+                  <option key={workspace.id} value={workspace.id}>{workspace.name}</option>
+                ))}
+              </select>
+              <button
+                type="button"
+                className="workspace-icon-button"
+                onClick={() => void renameWorkspace()}
+                disabled={!selectedWorkspace || Boolean(workspaceActionId) || isStreaming}
+                title="Переименовать workspace"
+                aria-label="Переименовать workspace"
+              >
+                ✎
+              </button>
+              <button
+                type="button"
+                className="workspace-icon-button danger"
+                onClick={() => void deleteWorkspace()}
+                disabled={!selectedWorkspace || Boolean(workspaceActionId) || isStreaming}
+                title="Удалить workspace"
+                aria-label="Удалить workspace"
+              >
+                ×
+              </button>
+            </div>
 
-            <label className="secondary-label">База знаний</label>
+            <label className="secondary-label">Готовая база знаний</label>
             <select
               value={selectedWorkspace?.base_knowledge_base_id ?? ""}
               onChange={updateKnowledgeBase}
-              disabled={!selectedWorkspace}
+              disabled={!selectedWorkspace || Boolean(workspaceActionId)}
             >
-              <option value="">Только мои документы</option>
-              {knowledgeBases.map((kb) => <option key={kb.id} value={kb.id}>{kb.name}</option>)}
+              <option value="">Не выбрана</option>
+              {knowledgeBases.map((kb) => (
+                <option key={kb.id} value={kb.id}>
+                  {kb.name}{kb.active_version == null ? " · нет активной версии" : ` · v${kb.active_version}`}
+                </option>
+              ))}
             </select>
-            <p className="hint">Файлы workspace ищутся вместе с выбранной готовой базой.</p>
+
+            <label className="secondary-label">Источники поиска</label>
+            <select
+              value={selectedWorkspace?.source_mode ?? "USER_DOCUMENTS"}
+              onChange={updateSourceMode}
+              disabled={!selectedWorkspace || Boolean(workspaceActionId)}
+            >
+              <option value="USER_DOCUMENTS">Только документы workspace</option>
+              <option value="KNOWLEDGE_BASE" disabled={!selectedWorkspace?.base_knowledge_base_id}>
+                Только готовая база знаний
+              </option>
+              <option value="HYBRID" disabled={!selectedWorkspace?.base_knowledge_base_id}>
+                База знаний + документы
+              </option>
+            </select>
+            <p className="hint workspace-mode-hint">
+              {selectedWorkspace ? workspaceModeLabel(selectedWorkspace.source_mode) : "Выберите workspace"}
+              {selectedKnowledgeBase?.active_version != null
+                ? ` · ${selectedKnowledgeBase.name}, v${selectedKnowledgeBase.active_version}, ${selectedKnowledgeBase.active_document_count} документов`
+                : selectedWorkspace?.base_knowledge_base_id
+                  ? " · у базы нет активной версии"
+                  : ""}
+            </p>
           </section>
 
           <section className="chat-history-section">
@@ -827,7 +1030,7 @@ export function App() {
           <section>
             <div className="section-title">
               <h3>Документы</h3>
-              <span className="counter">{searchableCount}/{documents.length} в поиске</span>
+              <span className="counter">{searchableCount}/{documents.length} локальных включено</span>
             </div>
             <input
               ref={fileInput}
@@ -912,13 +1115,16 @@ export function App() {
               <strong>{selectedConversation?.title || "Новый диалог"}</strong>
               <span>
                 {selectedWorkspace?.name || "Рабочая область"}
-                {selectedWorkspace?.base_knowledge_base_id ? " · база + документы" : " · документы workspace"}
+                {selectedWorkspace ? ` · ${workspaceModeLabel(selectedWorkspace.source_mode)}` : ""}
               </span>
             </div>
             <div className="chat-head-stats">
               <span>{conversations.length} диалогов</span>
-              <span>{searchableCount} в поиске</span>
-              <span>Hybrid</span>
+              <span>{searchableCount} локальных включено</span>
+              {selectedKnowledgeBase?.active_version != null && (
+                <span>KB v{selectedKnowledgeBase.active_version}</span>
+              )}
+              <span>Hybrid retrieval</span>
             </div>
           </div>
 
@@ -937,8 +1143,11 @@ export function App() {
                 <h1>Задайте вопрос по документам</h1>
                 <p>Ответ строится по hybrid retrieval, reranker и выбранным источникам. Проверяйте утверждения по ссылкам под ответом.</p>
                 <div className="summary-card">
-                  <span><strong>{documents.length}</strong> документов</span>
-                  <span><strong>{searchableCount}</strong> участвуют в поиске</span>
+                  <span><strong>{documents.length}</strong> документов workspace</span>
+                  <span><strong>{searchableCount}</strong> локальных включено</span>
+                  {selectedKnowledgeBase?.active_version != null && (
+                    <span><strong>{selectedKnowledgeBase.active_document_count}</strong> в базе знаний</span>
+                  )}
                 </div>
                 {hasSearchableContent && (
                   <div className="suggestions">
@@ -966,6 +1175,7 @@ export function App() {
                   {message.role === "assistant" && message.metadata && (
                     <div className="answer-meta">
                       <span>{message.metadata.retrieval_mode}</span>
+                      <span>{workspaceModeLabel(message.metadata.workspace_source_mode)}</span>
                       <span>{message.metadata.rerank_applied ? "reranker применён" : "без reranker"}</span>
                       <span>{message.metadata.context_chars.toLocaleString("ru-RU")} символов контекста</span>
                       <span>
@@ -996,7 +1206,7 @@ export function App() {
                               <span className="source-summary">
                                 <strong>{sourceTitle(source)}</strong>
                                 <small>
-                                  {source.filename}
+                                  {sourceProvenance(source)} · {source.filename}
                                   {pageLabel(source) ? ` · ${pageLabel(source)}` : ""}
                                   {` · чанк ${source.chunk_index}`}
                                 </small>
@@ -1032,7 +1242,7 @@ export function App() {
               <textarea
                 value={question}
                 disabled={!selectedWorkspaceId || !hasSearchableContent || conversationLoading}
-                placeholder={hasSearchableContent ? "Спросите по подключённым документам…" : "Добавьте готовый документ для начала"}
+                placeholder={hasSearchableContent ? "Спросите по выбранным источникам…" : "Подключите источник с готовыми документами"}
                 rows={1}
                 onChange={(event) => setQuestion(event.target.value)}
                 onKeyDown={handleComposerKeyDown}
