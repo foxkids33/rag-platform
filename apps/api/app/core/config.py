@@ -40,6 +40,12 @@ class Settings(BaseSettings):
     rag_history_max_chars: int = 8000
     rag_rewrite_followups: bool = True
     rag_rewrite_max_tokens: int = 160
+    rag_min_source_score: float = 0.05
+    rag_relative_source_score: float = 0.25
+    rag_source_similarity_threshold: float = 0.78
+    rag_max_sources_per_document: int = 3
+    rag_strong_evidence_score: float = 0.50
+    rag_limited_evidence_score: float = 0.15
     embedding_base_url: str = "http://embedding:8080"
     embedding_model: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
     embedding_dim: int = 1024

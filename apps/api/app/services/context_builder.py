@@ -5,6 +5,8 @@ import uuid
 from dataclasses import dataclass, replace
 from typing import Iterable, Protocol
 
+from app.services.rag_quality import evidence_status, source_quality_score
+
 PAGE_MARKER_RE = re.compile(r"^\s*\d{1,4}\s+из\s+\d{1,4}\s*$", re.IGNORECASE)
 STANDALONE_PAGE_RE = re.compile(r"^\s*\d{1,4}\s*$")
 DOT_LEADER_RE = re.compile(r"\.{4,}")
@@ -50,6 +52,9 @@ class SearchResultLike(Protocol):
     page_start: int | None
     page_end: int | None
     retrieval_rank: int
+    dense_score: float | None
+    lexical_score: float | None
+    rrf_score: float
     rerank_score: float | None
     rerank_fusion_score: float | None
 
@@ -68,6 +73,7 @@ class ContextSource:
     retrieval_rank: int
     rerank_score: float | None
     rerank_fusion_score: float | None
+    quality_score: float
 
     @property
     def citation(self) -> str:
@@ -79,6 +85,12 @@ class BuiltContext:
     text: str
     sources: list[ContextSource]
     char_count: int
+    candidate_count: int
+    evidence_status: str
+    evidence_score: float | None
+    rejected_low_score: int
+    rejected_duplicate: int
+    rejected_document_cap: int
 
 
 def clean_context_text(value: str) -> str:
@@ -170,6 +182,20 @@ def focused_context_excerpt(value: str, query: str, max_chars: int) -> str:
     return excerpt[:max_chars].rstrip()
 
 
+def _content_terms(value: str) -> set[str]:
+    return {
+        token.casefold()
+        for token in WORD_RE.findall(value)
+        if len(token) >= 4 and token.casefold() not in QUERY_STOP_WORDS
+    }
+
+
+def _jaccard(left: set[str], right: set[str]) -> float:
+    if not left or not right:
+        return 0.0
+    return len(left & right) / len(left | right)
+
+
 def _page_label(page_start: int | None, page_end: int | None) -> str | None:
     if page_start is None:
         return None
@@ -195,14 +221,54 @@ def build_context(
     max_context_chars: int,
     max_source_chars: int,
     max_sources: int,
+    min_source_score: float = 0.05,
+    relative_source_score: float = 0.25,
+    source_similarity_threshold: float = 0.78,
+    max_sources_per_document: int = 3,
+    strong_evidence_score: float = 0.50,
+    limited_evidence_score: float = 0.15,
 ) -> BuiltContext:
+    candidates = list(results)
+    candidate_scores = [source_quality_score(result) for result in candidates]
+    best_score = max(candidate_scores, default=None)
+    status = evidence_status(
+        best_score,
+        strong_threshold=strong_evidence_score,
+        limited_threshold=limited_evidence_score,
+    )
+
+    if status == "insufficient":
+        return BuiltContext(
+            text="",
+            sources=[],
+            char_count=0,
+            candidate_count=len(candidates),
+            evidence_status=status,
+            evidence_score=best_score,
+            rejected_low_score=len(candidates),
+            rejected_duplicate=0,
+            rejected_document_cap=0,
+        )
+
     sources: list[ContextSource] = []
     blocks: list[str] = []
+    selected_terms: list[set[str]] = []
+    document_counts: dict[uuid.UUID, int] = {}
     used_chars = 0
+    rejected_low_score = 0
+    rejected_duplicate = 0
+    rejected_document_cap = 0
+    score_floor = max(min_source_score, (best_score or 0.0) * relative_source_score)
 
-    for result in results:
+    for result, quality_score in zip(candidates, candidate_scores, strict=True):
         if len(sources) >= max_sources:
             break
+        if quality_score < score_floor:
+            rejected_low_score += 1
+            continue
+        if document_counts.get(result.document_id, 0) >= max_sources_per_document:
+            rejected_document_cap += 1
+            continue
 
         source_text = result.text
         if len(source_text.strip()) < 240 and result.parent_text:
@@ -210,6 +276,12 @@ def build_context(
 
         excerpt = focused_context_excerpt(source_text, question, max_source_chars)
         if len(excerpt) < 40:
+            rejected_low_score += 1
+            continue
+
+        terms = _content_terms(excerpt)
+        if any(_jaccard(terms, existing) >= source_similarity_threshold for existing in selected_terms):
+            rejected_duplicate += 1
             continue
 
         heading = result.heading_breadcrumb or result.heading
@@ -226,6 +298,7 @@ def build_context(
             retrieval_rank=result.retrieval_rank,
             rerank_score=result.rerank_score,
             rerank_fusion_score=result.rerank_fusion_score,
+            quality_score=quality_score,
         )
         block = f"{_source_header(source)}\n{source.excerpt}"
         separator_chars = 2 if blocks else 0
@@ -240,7 +313,22 @@ def build_context(
 
         sources.append(source)
         blocks.append(block)
+        selected_terms.append(_content_terms(source.excerpt))
+        document_counts[result.document_id] = document_counts.get(result.document_id, 0) + 1
         used_chars += len(block) + separator_chars
 
+    if not sources:
+        status = "insufficient"
+
     context_text = "\n\n".join(blocks)
-    return BuiltContext(text=context_text, sources=sources, char_count=len(context_text))
+    return BuiltContext(
+        text=context_text,
+        sources=sources,
+        char_count=len(context_text),
+        candidate_count=len(candidates),
+        evidence_status=status,
+        evidence_score=best_score,
+        rejected_low_score=rejected_low_score,
+        rejected_duplicate=rejected_duplicate,
+        rejected_document_cap=rejected_document_cap,
+    )

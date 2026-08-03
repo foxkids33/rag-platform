@@ -41,6 +41,14 @@ type StoredMessageMetadata = {
   retrieval_mode?: string;
   rerank_applied?: boolean;
   context_chars?: number;
+  abstained?: boolean;
+  evidence_status?: "strong" | "limited" | "insufficient";
+  evidence_score?: number | null;
+  candidate_count?: number;
+  selected_source_count?: number;
+  citation_valid?: boolean | null;
+  cited_source_indices?: number[];
+  invalid_citations?: number[];
   sources?: AnswerSource[];
 };
 
@@ -83,6 +91,7 @@ type AnswerSource = {
   retrieval_rank: number;
   rerank_score: number | null;
   rerank_fusion_score: number | null;
+  quality_score: number;
 };
 
 type StreamMetadata = {
@@ -94,7 +103,26 @@ type StreamMetadata = {
   retrieval_mode: string;
   rerank_applied: boolean;
   context_chars: number;
+  abstained: boolean;
+  evidence_status: "strong" | "limited" | "insufficient";
+  evidence_score: number | null;
+  candidate_count: number;
+  selected_source_count: number;
+  citation_valid: boolean | null;
+  cited_source_indices: number[];
+  invalid_citations: number[];
   sources: AnswerSource[];
+};
+
+type StreamDone = {
+  citation_valid?: boolean;
+  cited_source_indices?: number[];
+  invalid_citations?: number[];
+  abstained?: boolean;
+  evidence_status?: "strong" | "limited" | "insufficient";
+  evidence_score?: number | null;
+  candidate_count?: number;
+  selected_source_count?: number;
 };
 
 type ChatMessage = {
@@ -194,6 +222,14 @@ function storedMessageToChat(message: StoredMessage): ChatMessage {
         retrieval_mode: message.metadata.retrieval_mode || "hybrid",
         rerank_applied: Boolean(message.metadata.rerank_applied),
         context_chars: message.metadata.context_chars || 0,
+        abstained: Boolean(message.metadata.abstained),
+        evidence_status: message.metadata.evidence_status || "limited",
+        evidence_score: message.metadata.evidence_score ?? null,
+        candidate_count: message.metadata.candidate_count || 0,
+        selected_source_count: message.metadata.selected_source_count || (sources?.length ?? 0),
+        citation_valid: message.metadata.citation_valid ?? null,
+        cited_source_indices: message.metadata.cited_source_indices || [],
+        invalid_citations: message.metadata.invalid_citations || [],
         sources: sources || [],
       } satisfies StreamMetadata
     : undefined;
@@ -658,8 +694,17 @@ export function App() {
         }
 
         if (event.event === "done") {
+          const payload = JSON.parse(event.data) as StreamDone;
           setMessages((current) => current.map((message) => (
-            message.id === assistantId ? { ...message, status: "complete" } : message
+            message.id === assistantId
+              ? {
+                  ...message,
+                  status: "complete",
+                  metadata: message.metadata
+                    ? { ...message.metadata, ...payload }
+                    : message.metadata,
+                }
+              : message
           )));
         }
       }
@@ -923,6 +968,20 @@ export function App() {
                       <span>{message.metadata.retrieval_mode}</span>
                       <span>{message.metadata.rerank_applied ? "reranker применён" : "без reranker"}</span>
                       <span>{message.metadata.context_chars.toLocaleString("ru-RU")} символов контекста</span>
+                      <span>
+                        {message.metadata.evidence_status === "strong"
+                          ? "доказательства: сильные"
+                          : message.metadata.evidence_status === "limited"
+                            ? "доказательства: ограниченные"
+                            : "недостаточно доказательств"}
+                      </span>
+                      {message.metadata.citation_valid != null && (
+                        <span>
+                          {message.metadata.citation_valid
+                            ? "ссылки проверены"
+                            : "есть проблема со ссылками"}
+                        </span>
+                      )}
                     </div>
                   )}
 
