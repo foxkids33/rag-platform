@@ -1,0 +1,146 @@
+name: rag-platform
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-rag}
+      POSTGRES_USER: ${POSTGRES_USER:-rag}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-rag} -d ${POSTGRES_DB:-rag}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  redis:
+    image: redis:8-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  minio:
+    image: quay.io/minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:?MINIO_ACCESS_KEY is required}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:?MINIO_SECRET_KEY is required}
+    volumes:
+      - minio_data:/data
+    restart: unless-stopped
+
+  embedding:
+    build:
+      context: ../apps/embedding
+    environment:
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2}
+      EMBEDDING_NATIVE_DIM: ${EMBEDDING_NATIVE_DIM:-384}
+      EMBEDDING_DIM: ${EMBEDDING_DIM:-1024}
+      EMBEDDING_CACHE_DIR: /models
+    volumes:
+      - embedding_models:/models
+    healthcheck:
+      test: ["CMD", "/app/.venv/bin/python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health/ready', timeout=5)"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 120s
+    restart: unless-stopped
+
+  reranker:
+    build:
+      context: ../apps/reranker
+    environment:
+      RERANK_MODEL: ${RERANK_MODEL:-cross-encoder/mmarco-mMiniLMv2-L12-H384-v1}
+      RERANK_CACHE_DIR: /models
+      RERANK_MAX_LENGTH: ${RERANK_MAX_LENGTH:-512}
+      RERANK_BATCH_SIZE: ${RERANK_BATCH_SIZE:-8}
+      RERANK_THREADS: ${RERANK_THREADS:-4}
+      RERANK_MAX_DOCUMENT_CHARS: ${RERANK_DOCUMENT_CHARS:-1800}
+    volumes:
+      - reranker_models:/models
+    healthcheck:
+      test: ["CMD", "/app/.venv/bin/python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8081/health/ready', timeout=10)"]
+      interval: 15s
+      timeout: 15s
+      retries: 40
+      start_period: 300s
+    restart: unless-stopped
+
+  api:
+    build:
+      context: ../apps/api
+    env_file:
+      - ../.env
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      MINIO_ENDPOINT: ${MINIO_ENDPOINT:-minio:9000}
+      EMBEDDING_BASE_URL: http://embedding:8080
+      RERANK_BASE_URL: http://reranker:8081
+      RERANK_ENABLED: "true"
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_started
+      embedding:
+        condition: service_healthy
+      reranker:
+        condition: service_started
+    command: ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"]
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: ../apps/worker
+    env_file:
+      - ../.env
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      MINIO_ENDPOINT: ${MINIO_ENDPOINT:-minio:9000}
+      EMBEDDING_BASE_URL: http://embedding:8080
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_started
+      embedding:
+        condition: service_healthy
+    restart: unless-stopped
+
+  web:
+    build:
+      context: ../apps/web
+    environment:
+      VITE_API_BASE_URL: http://localhost:8000
+    ports:
+      - "127.0.0.1:5173:5173"
+    depends_on:
+      api:
+        condition: service_started
+    command: ["npm", "run", "dev", "--", "--host", "0.0.0.0"]
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:
+  minio_data:
+  embedding_models:
+  reranker_models:
