@@ -33,6 +33,7 @@ type DocumentRecord = {
   mime_type: string | null;
   sha256: string;
   status: string;
+  search_enabled: boolean;
   created_at: string;
 };
 
@@ -155,6 +156,7 @@ export function App() {
   const [documents, setDocuments] = useState<DocumentRecord[]>([]);
   const [uploading, setUploading] = useState(false);
   const [dragging, setDragging] = useState(false);
+  const [documentActionId, setDocumentActionId] = useState<string | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [question, setQuestion] = useState("");
   const [streamStage, setStreamStage] = useState<StreamStage>("idle");
@@ -165,8 +167,10 @@ export function App() {
     [selectedWorkspaceId, workspaces],
   );
 
-  const readyCount = documents.filter((document) => document.status === "READY").length;
-  const hasSearchableContent = readyCount > 0 || Boolean(selectedWorkspace?.base_knowledge_base_id);
+  const searchableCount = documents.filter((document) => (
+    document.status === "READY" && document.search_enabled
+  )).length;
+  const hasSearchableContent = searchableCount > 0 || Boolean(selectedWorkspace?.base_knowledge_base_id);
   const isStreaming = streamStage !== "idle";
   const canSubmit = Boolean(selectedWorkspaceId && hasSearchableContent && question.trim() && !isStreaming);
 
@@ -313,6 +317,54 @@ export function App() {
     event.preventDefault();
     setDragging(false);
     void uploadFiles(event.dataTransfer.files);
+  };
+
+  const toggleDocumentSearch = async (document: DocumentRecord) => {
+    if (!selectedWorkspaceId || documentActionId) return;
+    const nextEnabled = !document.search_enabled;
+    setDocumentActionId(document.id);
+    setError("");
+
+    try {
+      const response = await fetch(
+        `${API}/api/v1/workspaces/${selectedWorkspaceId}/documents/${document.id}`,
+        {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ search_enabled: nextEnabled }),
+        },
+      );
+      const updated = await readJson<DocumentRecord>(response);
+      setDocuments((current) => current.map((item) => item.id === updated.id ? updated : item));
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Не удалось изменить участие документа в поиске");
+    } finally {
+      setDocumentActionId(null);
+    }
+  };
+
+  const deleteDocument = async (document: DocumentRecord) => {
+    if (!selectedWorkspaceId || documentActionId) return;
+    const confirmed = window.confirm(
+      `Удалить «${document.filename}» навсегда? Исходный файл, чанки и embeddings будут удалены.`,
+    );
+    if (!confirmed) return;
+
+    setDocumentActionId(document.id);
+    setError("");
+
+    try {
+      const response = await fetch(
+        `${API}/api/v1/workspaces/${selectedWorkspaceId}/documents/${document.id}`,
+        { method: "DELETE" },
+      );
+      if (!response.ok) throw new Error(await readError(response));
+      setDocuments((current) => current.filter((item) => item.id !== document.id));
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Не удалось удалить документ");
+    } finally {
+      setDocumentActionId(null);
+    }
   };
 
   const stopGeneration = () => {
@@ -464,7 +516,7 @@ export function App() {
           <section>
             <div className="section-title">
               <h3>Документы</h3>
-              <span className="counter">{readyCount}/{documents.length}</span>
+              <span className="counter">{searchableCount}/{documents.length} в поиске</span>
             </div>
             <input
               ref={fileInput}
@@ -489,18 +541,50 @@ export function App() {
 
             <div className="document-list">
               {documents.length === 0 && <p className="empty-documents">Документов пока нет</p>}
-              {documents.map((document) => (
-                <div className="document-item" key={document.id} title={document.filename}>
-                  <div className="document-icon">▤</div>
-                  <div className="document-info">
-                    <strong>{document.filename}</strong>
-                    <span>{new Date(document.created_at).toLocaleString("ru-RU")}</span>
+              {documents.map((document) => {
+                const busy = document.status === "QUEUED" || document.status === "PROCESSING";
+                const actionPending = documentActionId === document.id;
+                const excluded = document.status === "READY" && !document.search_enabled;
+
+                return (
+                  <div
+                    className={`document-item ${excluded ? "excluded" : ""}`}
+                    key={document.id}
+                    title={document.filename}
+                  >
+                    <div className="document-icon">▤</div>
+                    <div className="document-info">
+                      <strong>{document.filename}</strong>
+                      <span>{new Date(document.created_at).toLocaleString("ru-RU")}</span>
+                    </div>
+                    <span className={`badge ${excluded ? "status-excluded" : `status-${document.status.toLowerCase()}`}`}>
+                      {excluded ? "Не в поиске" : statusLabel(document.status)}
+                    </span>
+                    <div className="document-actions">
+                      <button
+                        className="document-action"
+                        type="button"
+                        disabled={document.status !== "READY" || Boolean(documentActionId)}
+                        onClick={() => void toggleDocumentSearch(document)}
+                        title={document.search_enabled ? "Исключить из поиска" : "Вернуть в поиск"}
+                        aria-label={document.search_enabled ? "Исключить документ из поиска" : "Вернуть документ в поиск"}
+                      >
+                        {actionPending ? "…" : document.search_enabled ? "⊘" : "↻"}
+                      </button>
+                      <button
+                        className="document-action danger"
+                        type="button"
+                        disabled={busy || Boolean(documentActionId)}
+                        onClick={() => void deleteDocument(document)}
+                        title={busy ? "Дождитесь завершения обработки" : "Удалить документ навсегда"}
+                        aria-label="Удалить документ навсегда"
+                      >
+                        {actionPending ? "…" : "×"}
+                      </button>
+                    </div>
                   </div>
-                  <span className={`badge status-${document.status.toLowerCase()}`}>
-                    {statusLabel(document.status)}
-                  </span>
-                </div>
-              ))}
+                );
+              })}
             </div>
           </section>
 
@@ -518,7 +602,7 @@ export function App() {
               <span>{selectedWorkspace?.base_knowledge_base_id ? "Готовая база + документы workspace" : "Только документы workspace"}</span>
             </div>
             <div className="chat-head-stats">
-              <span>{readyCount} готово</span>
+              <span>{searchableCount} в поиске</span>
               <span>Hybrid</span>
             </div>
           </div>
@@ -533,7 +617,7 @@ export function App() {
                 <p>Ответ строится по hybrid retrieval, reranker и выбранным источникам. Проверяйте утверждения по ссылкам под ответом.</p>
                 <div className="summary-card">
                   <span><strong>{documents.length}</strong> документов</span>
-                  <span><strong>{readyCount}</strong> готовы к поиску</span>
+                  <span><strong>{searchableCount}</strong> участвуют в поиске</span>
                 </div>
                 {hasSearchableContent && (
                   <div className="suggestions">

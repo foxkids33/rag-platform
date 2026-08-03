@@ -285,6 +285,7 @@ async def search(
                 JOIN documents AS d ON d.id = c.document_id
                 WHERE d.workspace_id = :workspace_id
                   AND d.status = 'READY'
+                  AND d.search_enabled IS TRUE
             ),
             dense AS (
                 SELECT

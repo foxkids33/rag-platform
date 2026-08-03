@@ -7,7 +7,7 @@ from datetime import datetime
 from pathlib import Path
 
 from anyio import to_thread
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, File, HTTPException, Response, UploadFile, status
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -24,6 +24,10 @@ ALLOWED_EXTENSIONS = {".txt", ".md", ".csv", ".json", ".html", ".htm", ".xml", "
 READ_CHUNK_SIZE = 1024 * 1024
 
 
+class DocumentUpdate(BaseModel):
+    search_enabled: bool
+
+
 class DocumentOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -34,6 +38,7 @@ class DocumentOut(BaseModel):
     mime_type: str | None
     sha256: str
     status: str
+    search_enabled: bool
     created_at: datetime
 
 
@@ -133,6 +138,7 @@ async def upload_workspace_document(
             mime_type=content_type,
             sha256=sha256,
             status="QUEUED",
+            search_enabled=True,
         )
         job = IngestionJob(
             id=job_id,
@@ -215,3 +221,54 @@ async def reindex_workspace_document(
 
     await db.refresh(document)
     return document
+
+@router.patch("/{document_id}", response_model=DocumentOut)
+async def update_workspace_document(
+    workspace_id: uuid.UUID,
+    document_id: uuid.UUID,
+    payload: DocumentUpdate,
+    db: AsyncSession = Depends(get_db),
+):
+    document = await db.get(Document, document_id)
+    if document is None or document.workspace_id != workspace_id:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    if payload.search_enabled and document.status != "READY":
+        raise HTTPException(
+            status_code=409,
+            detail="Only READY documents can be enabled for search",
+        )
+
+    document.search_enabled = payload.search_enabled
+    await db.commit()
+    await db.refresh(document)
+    return document
+
+
+@router.delete("/{document_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_workspace_document(
+    workspace_id: uuid.UUID,
+    document_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    document = await db.get(Document, document_id)
+    if document is None or document.workspace_id != workspace_id:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    if document.status in {"QUEUED", "PROCESSING"}:
+        raise HTTPException(
+            status_code=409,
+            detail="Document cannot be deleted while ingestion is running",
+        )
+
+    try:
+        await to_thread.run_sync(storage.delete, document.object_key)
+    except StorageError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Object storage is unavailable; document was not deleted",
+        ) from exc
+
+    await db.delete(document)
+    await db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
