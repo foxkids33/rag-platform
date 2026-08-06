@@ -155,3 +155,37 @@ Workspace можно создавать, переименовывать и уд�
 и minimap. Списки диалогов, документов workspace и документов версии KB имеют
 собственную прокрутку, поэтому кнопки действий остаются доступными при любом
 числе элементов.
+
+<!-- BEGIN SERVER DEPLOYMENT -->
+## Server deployment
+
+The shared-server deployment uses:
+
+```text
+deploy/docker-compose.server.yml
+.env.server.example
+scripts/deploy/compose-server.sh
+scripts/deploy/check-server.sh
+```
+
+Validate the server configuration:
+
+```bash
+make server-config
+make server-services
+```
+
+On the deployment server:
+
+```bash
+make server-ps
+make server-check
+```
+
+Installation, updates, diagnostics, backup and shared-server safety are
+documented in [docs/deployment.md](docs/deployment.md).
+
+The current web container uses the Vite development server. A static
+production build and reverse proxy are planned before the internal
+pilot.
+<!-- END SERVER DEPLOYMENT -->
