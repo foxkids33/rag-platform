@@ -3,8 +3,9 @@
 Revision ID: 0004_workspace_source_modes
 Revises: 0003_chat_history
 """
-from alembic import op
 import sqlalchemy as sa
+
+from alembic import op
 
 revision = "0004_workspace_source_modes"
 down_revision = "0003_chat_history"

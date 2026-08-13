@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from anyio import to_thread
 from fastapi import APIRouter, Depends, HTTPException, Response, status
@@ -170,7 +170,7 @@ async def update_workspace(
     if "base_knowledge_base_id" in updates:
         workspace.base_knowledge_base_id = next_knowledge_base_id
     workspace.source_mode = next_source_mode.value
-    workspace.updated_at = datetime.now(timezone.utc)
+    workspace.updated_at = datetime.now(UTC)
 
     await db.commit()
     await db.refresh(workspace)

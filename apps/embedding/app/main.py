@@ -22,7 +22,7 @@ class Settings(BaseSettings):
 
     embedding_model: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
     embedding_native_dim: int = 384
-    embedding_dim: int = 1024
+    embedding_dim: int = 384
     embedding_cache_dir: str = "/models"
 
 
@@ -54,15 +54,13 @@ def get_model() -> TextEmbedding:
     return model
 
 
-def resize_vector(vector: np.ndarray, output_dimension: int, normalize: bool = True) -> list[float]:
+def prepare_vector(vector: np.ndarray, output_dimension: int, normalize: bool = True) -> list[float]:
     values = np.asarray(vector, dtype=np.float32).reshape(-1)
-    if values.size > output_dimension:
+    if values.size != output_dimension:
         raise ValueError(
-            f"Embedding dimension {values.size} exceeds configured output dimension {output_dimension}"
+            f"Embedding dimension {values.size} does not match configured output dimension "
+            f"{output_dimension}"
         )
-
-    if values.size < output_dimension:
-        values = np.pad(values, (0, output_dimension - values.size))
 
     if normalize:
         norm = float(np.linalg.norm(values))
@@ -88,12 +86,11 @@ def _embed(
     result: list[list[float]] = []
     for vector in vectors:
         if len(vector) != settings.embedding_native_dim:
-            logger.warning(
-                "Model produced dimension %d; configured native dimension is %d",
-                len(vector),
-                settings.embedding_native_dim,
+            raise RuntimeError(
+                f"Model produced dimension {len(vector)}; configured native dimension is "
+                f"{settings.embedding_native_dim}"
             )
-        result.append(resize_vector(vector, settings.embedding_dim, normalize=normalize))
+        result.append(prepare_vector(vector, settings.embedding_dim, normalize=normalize))
     return result
 
 

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from app.services.context_builder import build_context
 from app.services.rag_quality import audit_citations, source_quality_score
@@ -24,7 +24,7 @@ class Candidate:
     page_start: int | None = 1
     page_end: int | None = 1
     rerank_fusion_score: float | None = 0.02
-    chunk_id: uuid.UUID = uuid.uuid4()
+    chunk_id: uuid.UUID = field(default_factory=uuid.uuid4)
 
 
 def test_context_abstains_when_best_evidence_is_too_weak() -> None:

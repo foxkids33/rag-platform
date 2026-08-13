@@ -5,7 +5,7 @@ services:
     environment:
       EMBEDDING_MODEL: ${EMBEDDING_MODEL:-sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2}
       EMBEDDING_NATIVE_DIM: ${EMBEDDING_NATIVE_DIM:-384}
-      EMBEDDING_DIM: ${EMBEDDING_DIM:-1024}
+      EMBEDDING_DIM: ${EMBEDDING_DIM:-384}
       EMBEDDING_CACHE_DIR: /models
     ports:
       - "8080:8080"

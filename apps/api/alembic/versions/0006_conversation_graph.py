@@ -3,9 +3,10 @@
 Revision ID: 0006_conversation_graph
 Revises: 0005_knowledge_base_lifecycle
 """
-from alembic import op
 import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
+
+from alembic import op
 
 revision = "0006_conversation_graph"
 down_revision = "0005_knowledge_base_lifecycle"

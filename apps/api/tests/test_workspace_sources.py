@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from app.services.context_builder import build_context
 from app.services.workspace_sources import (
@@ -18,8 +18,8 @@ class Candidate:
     source_scope: str
     knowledge_base_name: str | None
     knowledge_base_version: int | None
-    document_id: uuid.UUID = uuid.uuid4()
-    chunk_id: uuid.UUID = uuid.uuid4()
+    document_id: uuid.UUID = field(default_factory=uuid.uuid4)
+    chunk_id: uuid.UUID = field(default_factory=uuid.uuid4)
     filename: str = "manual.pdf"
     chunk_index: int = 1
     parent_text: str | None = None

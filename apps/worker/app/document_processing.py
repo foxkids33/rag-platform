@@ -59,10 +59,16 @@ def _parse_plain_text(filename: str, data: bytes) -> list[ParsedChunk]:
 def _parse_with_docling(filename: str, data: bytes) -> list[ParsedChunk]:
     # Imports are intentionally lazy: the worker can still start and process
     # lightweight text formats even when Docling model initialization fails.
-    from docling.chunking import HybridChunker
-    from docling.datamodel.base_models import DocumentStream
-    from docling.document_converter import DocumentConverter
-    from docling_core.transforms.chunker.tokenizer.huggingface import HuggingFaceTokenizer
+    try:
+        from docling.chunking import HybridChunker
+        from docling.datamodel.base_models import DocumentStream
+        from docling.document_converter import DocumentConverter
+        from docling_core.transforms.chunker.tokenizer.huggingface import HuggingFaceTokenizer
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "PDF/DOCX parsing is not installed in the lightweight worker; "
+            "start the Docling profile with `make dev-docling`"
+        ) from exc
 
     stream = DocumentStream(name=filename, stream=BytesIO(data))
     document = DocumentConverter().convert(source=stream).document

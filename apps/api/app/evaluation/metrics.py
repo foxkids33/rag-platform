@@ -64,17 +64,12 @@ def evaluate_retrieval_case(
     """Calculate deterministic metrics for one evaluation case."""
 
     if observation.case_id != case.id:
-        raise ValueError(
-            "Observation case_id does not match evaluation case id"
-        )
+        raise ValueError("Observation case_id does not match evaluation case id")
 
     abstention_correct: bool | None = None
 
     if observation.actual_abstention is not None:
-        abstention_correct = (
-            observation.actual_abstention
-            == case.expected_abstention
-        )
+        abstention_correct = observation.actual_abstention == case.expected_abstention
 
     return RetrievalCaseMetrics(
         case_id=case.id,
@@ -113,19 +108,13 @@ def aggregate_retrieval_metrics(
     collected = list(results)
 
     recall_at_1_values = [
-        result.recall_at_1
-        for result in collected
-        if result.recall_at_1 is not None
+        result.recall_at_1 for result in collected if result.recall_at_1 is not None
     ]
     recall_at_5_values = [
-        result.recall_at_5
-        for result in collected
-        if result.recall_at_5 is not None
+        result.recall_at_5 for result in collected if result.recall_at_5 is not None
     ]
     reciprocal_rank_values = [
-        result.reciprocal_rank
-        for result in collected
-        if result.reciprocal_rank is not None
+        result.reciprocal_rank for result in collected if result.reciprocal_rank is not None
     ]
     abstention_values = [
         float(result.abstention_correct)

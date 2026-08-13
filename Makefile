@@ -1,37 +1,109 @@
 SHELL := /bin/bash
 
-.PHONY: help dev down logs api-test api-lint web-build smoke
+LOCAL_COMPOSE := docker compose \
+	-f deploy/docker-compose.local.yml \
+	-f deploy/docker-compose.embedding.yml \
+	-f deploy/docker-compose.txt.yml
+DOCLING_COMPOSE := $(LOCAL_COMPOSE) \
+	-f deploy/docker-compose.docling.yml
+FULL_COMPOSE := $(DOCLING_COMPOSE) \
+	-f deploy/docker-compose.reranker.yml
+
+DATASET ?= /evaluation/datasets/example.jsonl
+EVALUATION_OUTPUT ?= /evaluation/results/latest.json
+
+.PHONY: help local-env dev dev-docling dev-full down down-full logs ps
+.PHONY: local-build local-build-docling local-build-full local-test evaluate evaluate-answers
+.PHONY: api-test api-lint web-build smoke
 
 help:
-	@echo "make dev       - start local docker stack"
-	@echo "make down      - stop local docker stack"
-	@echo "make logs      - follow stack logs"
-	@echo "make api-test  - run API tests"
-	@echo "make web-build - build frontend"
-	@echo "make smoke     - run lightweight repository checks"
+	@echo "make dev              - start local stack with embeddings"
+	@echo "make dev-docling      - add PDF/DOCX parsing (large image)"
+	@echo "make dev-full         - add Docling and the reranker"
+	@echo "make local-build      - rebuild the local stack without reranker"
+	@echo "make local-build-docling - rebuild with PDF/DOCX parsing"
+	@echo "make local-build-full - rebuild the complete local stack"
+	@echo "make local-test       - run API, worker and embedding tests in containers"
+	@echo "make evaluate WORKSPACE_ID=<uuid> - run retrieval evaluation"
+	@echo "make evaluate-answers WORKSPACE_ID=<uuid> - include LLM answers"
+	@echo "make down             - stop the local stack"
+	@echo "make logs             - follow local stack logs"
+	@echo "make ps               - show local service status"
+	@echo "make api-test         - run API tests on the host"
+	@echo "make web-build        - build frontend on the host"
+	@echo "make smoke            - run lightweight repository checks"
 
-dev:
-	docker compose -f deploy/docker-compose.local.yml up --build
+local-env:
+	@if [[ ! -f .env ]]; then cp .env.example .env; echo "Created .env from .env.example"; fi
+	@if grep -Eq '^EMBEDDING_DIM=1024([[:space:]]*)$$' .env; then \
+		echo "ERROR: update EMBEDDING_DIM=1024 to EMBEDDING_DIM=384 in .env"; \
+		exit 1; \
+	fi
+
+local-build: local-env
+	$(LOCAL_COMPOSE) build
+
+local-build-docling: local-env
+	$(DOCLING_COMPOSE) build
+
+local-build-full: local-env
+	$(FULL_COMPOSE) build
+
+dev: local-env
+	$(LOCAL_COMPOSE) up -d --build --remove-orphans
+
+dev-docling: local-env
+	$(DOCLING_COMPOSE) up -d --build --remove-orphans
+
+dev-full: local-env
+	$(FULL_COMPOSE) up -d --build --remove-orphans
 
 down:
-	docker compose -f deploy/docker-compose.local.yml down
+	$(LOCAL_COMPOSE) down
+
+down-full:
+	$(FULL_COMPOSE) down
 
 logs:
-	docker compose -f deploy/docker-compose.local.yml logs -f --tail=200
+	$(LOCAL_COMPOSE) logs -f --tail=200
+
+ps:
+	$(LOCAL_COMPOSE) ps
+
+local-test:
+	$(LOCAL_COMPOSE) exec api python -m pytest -q
+	$(LOCAL_COMPOSE) exec worker python -m pytest -q
+	$(LOCAL_COMPOSE) exec embedding python -m pytest -q
+
+evaluate:
+	@test -n "$(WORKSPACE_ID)" || (echo "WORKSPACE_ID is required" && exit 2)
+	$(LOCAL_COMPOSE) exec api python -m app.evaluation.runner \
+		--workspace-id "$(WORKSPACE_ID)" \
+		--dataset "$(DATASET)" \
+		--output "$(EVALUATION_OUTPUT)"
+
+evaluate-answers:
+	@test -n "$(WORKSPACE_ID)" || (echo "WORKSPACE_ID is required" && exit 2)
+	$(LOCAL_COMPOSE) exec api python -m app.evaluation.runner \
+		--workspace-id "$(WORKSPACE_ID)" \
+		--dataset "$(DATASET)" \
+		--output "$(EVALUATION_OUTPUT)" \
+		--answers
 
 api-test:
-	cd apps/api && uv run pytest
+	cd apps/api && uv run --frozen python -m pytest
 
 api-lint:
-	cd apps/api && uv run ruff check .
+	cd apps/api && uv run --frozen ruff check .
 
 web-build:
 	cd apps/web && npm run build
 
 smoke:
-	python3 -m compileall apps/api/app apps/worker/app
+	python3 -m compileall apps/api/app apps/worker/app apps/embedding/app
 	python3 -m json.tool apps/web/package.json >/dev/null
 	python3 -m json.tool apps/web/tsconfig.json >/dev/null
+	git diff --check
 
 # BEGIN SERVER DEPLOYMENT
 .PHONY: server-config server-services server-ps server-check

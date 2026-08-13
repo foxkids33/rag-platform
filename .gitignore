@@ -23,3 +23,4 @@ dist/
 
 # Local data
 .storage/
+evaluation/results/

@@ -12,7 +12,14 @@ class EvaluationCase:
     id: str
     question: str
     expected_document_ids: tuple[str, ...] = ()
+    expected_filenames: tuple[str, ...] = ()
     expected_abstention: bool = False
+    question_type: str | None = None
+    expected_answer: str | None = None
+    required_facts: tuple[str, ...] = ()
+    forbidden_facts: tuple[str, ...] = ()
+    difficulty: str | None = None
+    notes: str | None = None
 
     def __post_init__(self) -> None:
         if not self.id.strip():
@@ -21,17 +28,17 @@ class EvaluationCase:
         if not self.question.strip():
             raise ValueError("Evaluation question must not be empty")
 
-        if len(set(self.expected_document_ids)) != len(
-            self.expected_document_ids
-        ):
-            raise ValueError(
-                "expected_document_ids must not contain duplicates"
-            )
+        if len(set(self.expected_document_ids)) != len(self.expected_document_ids):
+            raise ValueError("expected_document_ids must not contain duplicates")
 
-        if self.expected_abstention and self.expected_document_ids:
-            raise ValueError(
-                "An abstention case must not define expected documents"
-            )
+        if len(set(self.expected_filenames)) != len(self.expected_filenames):
+            raise ValueError("expected_filenames must not contain duplicates")
+
+        if self.expected_document_ids and self.expected_filenames:
+            raise ValueError("Use expected_document_ids or expected_filenames, not both")
+
+        if self.expected_abstention and (self.expected_document_ids or self.expected_filenames):
+            raise ValueError("An abstention case must not define expected documents")
 
 
 @dataclass(frozen=True, slots=True)

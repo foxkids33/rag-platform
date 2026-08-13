@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import re
 import uuid
+from collections.abc import Iterable
 from dataclasses import dataclass, replace
-from typing import Iterable, Protocol
+from typing import Protocol
 
 from app.services.rag_quality import evidence_status, source_quality_score
 

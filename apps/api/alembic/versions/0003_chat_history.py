@@ -3,8 +3,9 @@
 Revision ID: 0003_chat_history
 Revises: 0002_document_search_enabled
 """
-from alembic import op
 import sqlalchemy as sa
+
+from alembic import op
 
 revision = "0003_chat_history"
 down_revision = "0002_document_search_enabled"

@@ -1,6 +1,6 @@
 import asyncio
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 from fastapi import HTTPException
@@ -40,7 +40,7 @@ def _document(*, status: str = "READY", search_enabled: bool = True) -> Document
         sha256="a" * 64,
         status=status,
         search_enabled=search_enabled,
-        created_at=datetime.now(timezone.utc),
+        created_at=datetime.now(UTC),
     )
 
 

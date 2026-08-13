@@ -48,7 +48,7 @@ class Settings(BaseSettings):
     rag_limited_evidence_score: float = 0.15
     embedding_base_url: str = "http://embedding:8080"
     embedding_model: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
-    embedding_dim: int = 1024
+    embedding_dim: int = 384
     embedding_timeout_seconds: float = 120.0
     rerank_base_url: str = "http://reranker:8081"
     rerank_model: str = "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1"

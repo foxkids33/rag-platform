@@ -5,8 +5,8 @@ import pytest
 from app.evaluation.metrics import (
     aggregate_retrieval_metrics,
     evaluate_retrieval_case,
-    reciprocal_rank,
     recall_at_k,
+    reciprocal_rank,
 )
 from app.evaluation.models import (
     EvaluationCase,

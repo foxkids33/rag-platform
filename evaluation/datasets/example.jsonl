@@ -1,0 +1,2 @@
+{"id":"fact-001","question":"Какой срок хранения указан в политике?","expected_filenames":["policy.txt"],"question_type":"exact_value","expected_answer":"30 дней","required_facts":["30 дней"],"difficulty":"easy"}
+{"id":"no-answer-001","question":"Какой офис компании находится на Марсе?","expected_abstention":true,"question_type":"out_of_scope","difficulty":"easy"}

@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import re
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from anyio import to_thread
@@ -452,7 +452,7 @@ async def publish_knowledge_base_version(
     if not any(document.status == "READY" and document.search_enabled for document in documents):
         raise HTTPException(status_code=409, detail="Version has no searchable READY documents")
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     if knowledge_base.active_version_id and knowledge_base.active_version_id != version.id:
         previous = await db.get(KnowledgeBaseVersion, knowledge_base.active_version_id)
         if previous is not None:

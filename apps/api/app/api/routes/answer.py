@@ -4,7 +4,7 @@ import asyncio
 import json
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -25,7 +25,6 @@ from app.services.conversation_context import (
     branch_history,
     derive_conversation_title,
     rewrite_messages,
-    trim_history,
 )
 from app.services.llm import LLMError, LLMOutput, llm
 from app.services.rag_quality import CitationAudit, audit_citations
@@ -353,7 +352,7 @@ def _assistant_metadata(
 def _touch_conversation(conversation: ChatSession, question: str) -> None:
     if not conversation.title or conversation.title == "Новый диалог":
         conversation.title = derive_conversation_title(question)
-    conversation.updated_at = datetime.now(timezone.utc)
+    conversation.updated_at = datetime.now(UTC)
 
 
 async def _persist_exchange(
@@ -444,7 +443,7 @@ async def _persist_stream_assistant(
                 citation_audit=citation_audit,
             ),
         )
-        conversation.updated_at = datetime.now(timezone.utc)
+        conversation.updated_at = datetime.now(UTC)
         db.add(message)
         await db.commit()
         return message.id

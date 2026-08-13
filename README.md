@@ -24,7 +24,40 @@
 
 ```bash
 cp .env.example .env
-docker compose -f deploy/docker-compose.local.yml up --build
+make dev
+```
+
+`make dev` запускает лёгкий TXT/HTML/JSON stack и локальный embedding service.
+Он не устанавливает многогигабайтные Torch/CUDA-зависимости Docling. Для
+PDF/DOCX используйте `make dev-docling`, а полный вариант с Docling и
+cross-encoder reranker запускается командой `make dev-full`.
+
+### Чистый запуск после Docker prune / Clean-Purge data
+
+После удаления Docker images, containers и volumes исходный код не меняется,
+но PostgreSQL, MinIO, Redis, скачанные ML-модели и все документы удалены. Первый
+запуск заново скачает base images и модели, соберёт сервисы и применит Alembic
+migrations:
+
+```bash
+git switch feat/document-ingestion
+git pull --ff-only
+
+# Сохраните прежний .env, если в нём есть реальные LLM endpoint/key.
+# В старом .env обязательно замените EMBEDDING_DIM=1024 на 384.
+make dev
+make ps
+make local-test
+```
+
+`--no-cache` после полного prune не нужен: build cache уже пуст, а следующие
+сборки разумно ускорять сохранёнными слоями.
+
+Первый старт embedding service может занять несколько минут из-за повторной
+загрузки модели. Следить за готовностью можно командой:
+
+```bash
+make logs
 ```
 
 После запуска:
