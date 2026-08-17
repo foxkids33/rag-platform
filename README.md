@@ -110,10 +110,20 @@ Reranker запускается отдельным Compose overlay и перес
 по прямой оценке пары «запрос + фрагмент». Если сервис недоступен, API возвращает
 исходный RRF-порядок и заполняет поле `rerank_error`, не ломая поиск.
 
+Для локального TXT-стека без установки Docling:
+
+```bash
+make dev-rerank
+make ps-rerank
+```
+
+Эквивалентный ручной запуск overlay:
+
 ```bash
 docker compose \
   -f deploy/docker-compose.local.yml \
   -f deploy/docker-compose.embedding.yml \
+  -f deploy/docker-compose.txt.yml \
   -f deploy/docker-compose.reranker.yml \
   up -d --build reranker api
 ```

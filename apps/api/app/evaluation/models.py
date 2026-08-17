@@ -57,7 +57,9 @@ class RetrievalCaseMetrics:
     case_id: str
     recall_at_1: float | None
     recall_at_5: float | None
+    recall_at_10: float | None
     reciprocal_rank: float | None
+    ndcg_at_10: float | None
     abstention_correct: bool | None
 
 
@@ -70,5 +72,52 @@ class RetrievalAggregateMetrics:
     abstention_evaluated_cases: int
     recall_at_1: float | None
     recall_at_5: float | None
+    recall_at_10: float | None
     mrr: float | None
+    ndcg_at_10: float | None
     abstention_accuracy: float | None
+
+
+@dataclass(frozen=True, slots=True)
+class AnswerObservation:
+    """Answer and cited-source text collected from the live API."""
+
+    case_id: str
+    text: str
+    actual_abstention: bool
+    citation_valid: bool | None
+    cited_source_text: str
+    cited_document_ids: tuple[str, ...] = ()
+    cited_filenames: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class AnswerCaseMetrics:
+    """Deterministic answer-quality checks for one evaluation case."""
+
+    case_id: str
+    required_fact_coverage: float | None
+    exact_value_correct: bool | None
+    forbidden_fact_violation: bool | None
+    citation_fact_coverage: float | None
+    citation_source_coverage: float | None
+    citation_valid: bool | None
+
+
+@dataclass(frozen=True, slots=True)
+class AnswerAggregateMetrics:
+    """Aggregate deterministic answer-quality metrics."""
+
+    total_cases: int
+    fact_evaluated_cases: int
+    exact_value_evaluated_cases: int
+    forbidden_fact_evaluated_cases: int
+    citation_fact_evaluated_cases: int
+    citation_source_evaluated_cases: int
+    citation_validity_evaluated_cases: int
+    required_fact_coverage: float | None
+    exact_value_accuracy: float | None
+    forbidden_fact_violation_rate: float | None
+    citation_fact_coverage: float | None
+    citation_source_coverage: float | None
+    citation_validity_rate: float | None

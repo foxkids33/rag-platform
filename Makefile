@@ -8,24 +8,40 @@ DOCLING_COMPOSE := $(LOCAL_COMPOSE) \
 	-f deploy/docker-compose.docling.yml
 FULL_COMPOSE := $(DOCLING_COMPOSE) \
 	-f deploy/docker-compose.reranker.yml
+RERANK_COMPOSE := $(LOCAL_COMPOSE) \
+	-f deploy/docker-compose.reranker.yml
 
-DATASET ?= /evaluation/datasets/example.jsonl
+DATASET ?= /evaluation/datasets/skala-technical-reviews.v1.jsonl
+CORPUS ?= /evaluation/corpora/skala-technical-reviews.v1.json
 EVALUATION_OUTPUT ?= /evaluation/results/latest.json
+RERANK ?= true
+EVALUATION_TOKEN_ENV := $(if $(strip $(RAG_API_TOKEN)),-e RAG_API_TOKEN,)
+EVALUATION_CORPUS_ARG := $(if $(strip $(CORPUS)),--corpus "$(CORPUS)",)
+EVALUATION_RERANK_ARG := $(if $(filter true 1 yes,$(strip $(RERANK))),--rerank,--no-rerank)
+BASELINE ?=
+CANDIDATE ?= /evaluation/results/latest.json
+GATES ?=
+COMPARE_OUTPUT ?= /evaluation/results/comparison.json
+COMPARE_BASELINE_ARG := $(if $(strip $(BASELINE)),--baseline "$(BASELINE)",)
+COMPARE_GATES_ARG := $(if $(strip $(GATES)),--gates "$(GATES)",)
 
-.PHONY: help local-env dev dev-docling dev-full down down-full logs ps
-.PHONY: local-build local-build-docling local-build-full local-test evaluate evaluate-answers
+.PHONY: help local-env dev dev-docling dev-rerank dev-full down down-full logs ps ps-rerank
+.PHONY: local-build local-build-docling local-build-rerank local-build-full local-test evaluate evaluate-answers evaluate-compare
 .PHONY: api-test api-lint web-build smoke
 
 help:
 	@echo "make dev              - start local stack with embeddings"
 	@echo "make dev-docling      - add PDF/DOCX parsing (large image)"
+	@echo "make dev-rerank       - add the reranker without Docling"
 	@echo "make dev-full         - add Docling and the reranker"
 	@echo "make local-build      - rebuild the local stack without reranker"
 	@echo "make local-build-docling - rebuild with PDF/DOCX parsing"
+	@echo "make local-build-rerank - rebuild with reranker, without Docling"
 	@echo "make local-build-full - rebuild the complete local stack"
 	@echo "make local-test       - run API, worker and embedding tests in containers"
 	@echo "make evaluate WORKSPACE_ID=<uuid> - run retrieval evaluation"
 	@echo "make evaluate-answers WORKSPACE_ID=<uuid> - include LLM answers"
+	@echo "make evaluate-compare BASELINE=<json> CANDIDATE=<json> - detect regressions"
 	@echo "make down             - stop the local stack"
 	@echo "make logs             - follow local stack logs"
 	@echo "make ps               - show local service status"
@@ -46,6 +62,9 @@ local-build: local-env
 local-build-docling: local-env
 	$(DOCLING_COMPOSE) build
 
+local-build-rerank: local-env
+	$(RERANK_COMPOSE) build
+
 local-build-full: local-env
 	$(FULL_COMPOSE) build
 
@@ -54,6 +73,9 @@ dev: local-env
 
 dev-docling: local-env
 	$(DOCLING_COMPOSE) up -d --build --remove-orphans
+
+dev-rerank: local-env
+	$(RERANK_COMPOSE) up -d --build --remove-orphans
 
 dev-full: local-env
 	$(FULL_COMPOSE) up -d --build --remove-orphans
@@ -70,6 +92,9 @@ logs:
 ps:
 	$(LOCAL_COMPOSE) ps
 
+ps-rerank:
+	$(RERANK_COMPOSE) ps
+
 local-test:
 	$(LOCAL_COMPOSE) exec api python -m pytest -q
 	$(LOCAL_COMPOSE) exec worker python -m pytest -q
@@ -77,18 +102,30 @@ local-test:
 
 evaluate:
 	@test -n "$(WORKSPACE_ID)" || (echo "WORKSPACE_ID is required" && exit 2)
-	$(LOCAL_COMPOSE) exec api python -m app.evaluation.runner \
+	$(LOCAL_COMPOSE) exec $(EVALUATION_TOKEN_ENV) api python -m app.evaluation.runner \
 		--workspace-id "$(WORKSPACE_ID)" \
 		--dataset "$(DATASET)" \
+		$(EVALUATION_CORPUS_ARG) \
+		$(EVALUATION_RERANK_ARG) \
 		--output "$(EVALUATION_OUTPUT)"
 
 evaluate-answers:
 	@test -n "$(WORKSPACE_ID)" || (echo "WORKSPACE_ID is required" && exit 2)
-	$(LOCAL_COMPOSE) exec api python -m app.evaluation.runner \
+	$(LOCAL_COMPOSE) exec $(EVALUATION_TOKEN_ENV) api python -m app.evaluation.runner \
 		--workspace-id "$(WORKSPACE_ID)" \
 		--dataset "$(DATASET)" \
+		$(EVALUATION_CORPUS_ARG) \
+		$(EVALUATION_RERANK_ARG) \
 		--output "$(EVALUATION_OUTPUT)" \
 		--answers
+
+evaluate-compare:
+	@test -n "$(BASELINE)$(GATES)" || (echo "BASELINE or GATES is required" && exit 2)
+	$(LOCAL_COMPOSE) exec api python -m app.evaluation.compare \
+		--candidate "$(CANDIDATE)" \
+		$(COMPARE_BASELINE_ARG) \
+		$(COMPARE_GATES_ARG) \
+		--output "$(COMPARE_OUTPUT)"
 
 api-test:
 	cd apps/api && uv run --frozen python -m pytest
