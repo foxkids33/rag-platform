@@ -12,8 +12,10 @@ from pydantic import BaseModel, ConfigDict
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.access import workspace_for_principal
 from app.core.config import settings
-from app.db.models import Document, IngestionJob, Workspace
+from app.core.security import Principal, get_current_principal
+from app.db.models import Document, IngestionJob
 from app.db.session import get_db
 from app.services.queue import QueueError, ingestion_queue
 from app.services.storage import StorageError, storage
@@ -69,10 +71,9 @@ async def _hash_and_measure(file: UploadFile) -> tuple[str, int]:
 async def list_workspace_documents(
     workspace_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
+    principal: Principal = Depends(get_current_principal),
 ):
-    workspace = await db.get(Workspace, workspace_id)
-    if workspace is None:
-        raise HTTPException(status_code=404, detail="Workspace not found")
+    await workspace_for_principal(db, workspace_id, principal)
 
     result = await db.execute(
         select(Document)
@@ -87,10 +88,9 @@ async def upload_workspace_document(
     workspace_id: uuid.UUID,
     file: UploadFile = File(...),
     db: AsyncSession = Depends(get_db),
+    principal: Principal = Depends(get_current_principal),
 ):
-    workspace = await db.get(Workspace, workspace_id)
-    if workspace is None:
-        raise HTTPException(status_code=404, detail="Workspace not found")
+    await workspace_for_principal(db, workspace_id, principal)
 
     if not file.filename:
         raise HTTPException(status_code=400, detail="Uploaded file has no filename")
@@ -187,12 +187,16 @@ async def upload_workspace_document(
         await file.close()
 
 
-@router.post("/{document_id}/reindex", response_model=DocumentOut, status_code=status.HTTP_202_ACCEPTED)
+@router.post(
+    "/{document_id}/reindex", response_model=DocumentOut, status_code=status.HTTP_202_ACCEPTED
+)
 async def reindex_workspace_document(
     workspace_id: uuid.UUID,
     document_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
+    principal: Principal = Depends(get_current_principal),
 ):
+    await workspace_for_principal(db, workspace_id, principal)
     document = await db.get(Document, document_id)
     if document is None or document.workspace_id != workspace_id:
         raise HTTPException(status_code=404, detail="Document not found")
@@ -222,13 +226,16 @@ async def reindex_workspace_document(
     await db.refresh(document)
     return document
 
+
 @router.patch("/{document_id}", response_model=DocumentOut)
 async def update_workspace_document(
     workspace_id: uuid.UUID,
     document_id: uuid.UUID,
     payload: DocumentUpdate,
     db: AsyncSession = Depends(get_db),
+    principal: Principal = Depends(get_current_principal),
 ):
+    await workspace_for_principal(db, workspace_id, principal)
     document = await db.get(Document, document_id)
     if document is None or document.workspace_id != workspace_id:
         raise HTTPException(status_code=404, detail="Document not found")
@@ -250,7 +257,9 @@ async def delete_workspace_document(
     workspace_id: uuid.UUID,
     document_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
+    principal: Principal = Depends(get_current_principal),
 ) -> Response:
+    await workspace_for_principal(db, workspace_id, principal)
     document = await db.get(Document, document_id)
     if document is None or document.workspace_id != workspace_id:
         raise HTTPException(status_code=404, detail="Document not found")

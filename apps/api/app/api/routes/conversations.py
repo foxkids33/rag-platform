@@ -8,6 +8,8 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.access import workspace_for_principal
+from app.core.security import Principal, get_current_principal
 from app.db.models import ChatMessage, ChatSession, Workspace
 from app.db.session import get_db
 from app.services.conversation_context import derive_conversation_title
@@ -73,18 +75,21 @@ def _message_out(message: ChatMessage) -> ChatMessageOut:
     )
 
 
-async def _workspace_or_404(db: AsyncSession, workspace_id: uuid.UUID) -> Workspace:
-    workspace = await db.get(Workspace, workspace_id)
-    if workspace is None:
-        raise HTTPException(status_code=404, detail="Workspace not found")
-    return workspace
+async def _workspace_or_404(
+    db: AsyncSession,
+    workspace_id: uuid.UUID,
+    principal: Principal,
+) -> Workspace:
+    return await workspace_for_principal(db, workspace_id, principal)
 
 
 async def _conversation_or_404(
     db: AsyncSession,
     workspace_id: uuid.UUID,
     conversation_id: uuid.UUID,
+    principal: Principal,
 ) -> ChatSession:
+    await _workspace_or_404(db, workspace_id, principal)
     conversation = await db.get(ChatSession, conversation_id)
     if conversation is None or conversation.workspace_id != workspace_id:
         raise HTTPException(status_code=404, detail="Conversation not found")
@@ -95,8 +100,9 @@ async def _conversation_or_404(
 async def list_conversations(
     workspace_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
+    principal: Principal = Depends(get_current_principal),
 ) -> list[ConversationOut]:
-    await _workspace_or_404(db, workspace_id)
+    await _workspace_or_404(db, workspace_id, principal)
     count_subquery = (
         select(func.count(ChatMessage.id))
         .where(ChatMessage.session_id == ChatSession.id)
@@ -116,8 +122,9 @@ async def create_conversation(
     workspace_id: uuid.UUID,
     payload: ConversationCreate,
     db: AsyncSession = Depends(get_db),
+    principal: Principal = Depends(get_current_principal),
 ) -> ConversationOut:
-    await _workspace_or_404(db, workspace_id)
+    await _workspace_or_404(db, workspace_id, principal)
     title = derive_conversation_title(payload.title or "")
     conversation = ChatSession(workspace_id=workspace_id, title=title)
     db.add(conversation)
@@ -131,8 +138,9 @@ async def get_conversation(
     workspace_id: uuid.UUID,
     conversation_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
+    principal: Principal = Depends(get_current_principal),
 ) -> ConversationDetail:
-    conversation = await _conversation_or_404(db, workspace_id, conversation_id)
+    conversation = await _conversation_or_404(db, workspace_id, conversation_id, principal)
     result = await db.execute(
         select(ChatMessage)
         .where(ChatMessage.session_id == conversation.id)
@@ -151,8 +159,9 @@ async def update_conversation(
     conversation_id: uuid.UUID,
     payload: ConversationUpdate,
     db: AsyncSession = Depends(get_db),
+    principal: Principal = Depends(get_current_principal),
 ) -> ConversationOut:
-    conversation = await _conversation_or_404(db, workspace_id, conversation_id)
+    conversation = await _conversation_or_404(db, workspace_id, conversation_id, principal)
     conversation.title = derive_conversation_title(payload.title, max_chars=500)
     await db.commit()
     await db.refresh(conversation)
@@ -167,8 +176,9 @@ async def delete_conversation(
     workspace_id: uuid.UUID,
     conversation_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
+    principal: Principal = Depends(get_current_principal),
 ) -> Response:
-    conversation = await _conversation_or_404(db, workspace_id, conversation_id)
+    conversation = await _conversation_or_404(db, workspace_id, conversation_id, principal)
     await db.delete(conversation)
     await db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)

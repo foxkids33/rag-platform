@@ -65,7 +65,12 @@ make logs
 - UI: `http://localhost:5173`
 - API: `http://localhost:8000`
 - API health: `http://localhost:8000/api/v1/health`
+- Current principal: `http://localhost:8000/api/v1/auth/me`
 - MinIO console: `http://localhost:9001`
+
+Локально аутентификация отключена и используется фиксированный admin principal.
+Перед публикацией API настройте корпоративный OIDC согласно
+[`docs/authentication.md`](docs/authentication.md).
 
 ## Разработка без Docker
 
@@ -81,9 +86,12 @@ UI:
 
 ```bash
 cd apps/web
-npm install
+nvm use
+npm ci
 npm run dev
 ```
+
+Host-side UI development requires Node.js 20.19+; `.nvmrc` selects Node 24.
 
 ## Ближайшие этапы
 
@@ -102,7 +110,9 @@ npm run dev
 13. Добавить управление workspace и режимами источников: user-only, KB-only и hybrid.
 14. Добавить версии и публикацию готовых баз знаний.
 15. Добавить ветвящийся граф диалогов и устойчивые прокручиваемые списки UI.
-16. Добавить Neo4j и семантический knowledge graph.
+16. Добавить OIDC authentication и tenant/workspace isolation.
+17. Добавить frontend OIDC login, document/group ACL и PostgreSQL RLS.
+18. Добавить Neo4j и семантический knowledge graph.
 
 ## Локальный reranker
 

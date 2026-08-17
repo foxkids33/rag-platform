@@ -7,17 +7,35 @@ from fastapi import HTTPException
 
 from app.api.routes import documents
 from app.api.routes.documents import DocumentUpdate
-from app.db.models import Document
+from app.core.security import Principal
+from app.db.models import Document, Workspace
 
 
 class FakeSession:
     def __init__(self, document: Document | None) -> None:
         self.document = document
+        self.workspace = (
+            Workspace(
+                id=document.workspace_id,
+                tenant_id="tenant-a",
+                user_id="user-a",
+                name="Test",
+                base_knowledge_base_id=None,
+                source_mode="USER_DOCUMENTS",
+            )
+            if document is not None
+            else None
+        )
         self.committed = False
         self.deleted: Document | None = None
 
-    async def get(self, _model, _document_id):
+    async def get(self, model, _document_id):
+        if model is Workspace:
+            return self.workspace
         return self.document
+
+    async def scalar(self, _query):
+        return self.workspace
 
     async def commit(self) -> None:
         self.committed = True
@@ -44,6 +62,15 @@ def _document(*, status: str = "READY", search_enabled: bool = True) -> Document
     )
 
 
+def _principal() -> Principal:
+    return Principal(
+        subject="user-a",
+        tenant_id="tenant-a",
+        roles=frozenset(),
+        claims={},
+    )
+
+
 def test_document_can_be_excluded_and_returned_to_search() -> None:
     document = _document()
     db = FakeSession(document)
@@ -54,6 +81,7 @@ def test_document_can_be_excluded_and_returned_to_search() -> None:
             document.id,
             DocumentUpdate(search_enabled=False),
             db,
+            _principal(),
         )
     )
 
@@ -67,6 +95,7 @@ def test_document_can_be_excluded_and_returned_to_search() -> None:
             document.id,
             DocumentUpdate(search_enabled=True),
             db,
+            _principal(),
         )
     )
 
@@ -85,6 +114,7 @@ def test_non_ready_document_cannot_be_enabled_for_search() -> None:
                 document.id,
                 DocumentUpdate(search_enabled=True),
                 db,
+                _principal(),
             )
         )
 
@@ -103,6 +133,7 @@ def test_delete_removes_object_before_database_row(monkeypatch: pytest.MonkeyPat
             document.workspace_id,
             document.id,
             db,
+            _principal(),
         )
     )
 
@@ -124,6 +155,7 @@ def test_processing_document_cannot_be_deleted(monkeypatch: pytest.MonkeyPatch) 
                 document.workspace_id,
                 document.id,
                 db,
+                _principal(),
             )
         )
 

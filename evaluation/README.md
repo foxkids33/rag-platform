@@ -120,5 +120,12 @@ make evaluate-compare \
 
 Exit code `3` means that at least one comparison or quality gate failed.
 
+When OIDC authentication is enabled, pass a short-lived access token through
+the environment so it is not written to the report or command line:
+
+```bash
+RAG_API_TOKEN='<access-token>' make evaluate WORKSPACE_ID=<uuid>
+```
+
 Reports are written to `evaluation/results/` and should not be committed when
 they contain internal questions or answers.

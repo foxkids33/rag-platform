@@ -5,10 +5,13 @@ from datetime import UTC, datetime
 
 from anyio import to_thread
 from fastapi import APIRouter, Depends, HTTPException, Response, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.access import knowledge_base_for_principal, workspace_for_principal
+from app.core.config import settings
+from app.core.security import Principal, get_current_principal
 from app.db.models import ChatSession, Document, KnowledgeBase, KnowledgeBaseVersion, Workspace
 from app.db.session import get_db
 from app.services.storage import StorageError, storage
@@ -22,10 +25,11 @@ router = APIRouter(prefix="/workspaces", tags=["workspaces"])
 
 
 class WorkspaceCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     name: str = Field(min_length=1, max_length=255)
     base_knowledge_base_id: uuid.UUID | None = None
     source_mode: WorkspaceSourceMode | None = None
-    user_id: str | None = None
 
 
 class WorkspaceUpdate(BaseModel):
@@ -36,13 +40,14 @@ class WorkspaceUpdate(BaseModel):
 
 class WorkspaceOut(BaseModel):
     id: uuid.UUID
+    tenant_id: str
     name: str
     base_knowledge_base_id: uuid.UUID | None
     base_knowledge_base_name: str | None
     active_knowledge_base_version_id: uuid.UUID | None
     active_knowledge_base_version: int | None
     source_mode: WorkspaceSourceMode
-    user_id: str | None
+    user_id: str
     document_count: int
     searchable_document_count: int
     conversation_count: int
@@ -53,13 +58,11 @@ class WorkspaceOut(BaseModel):
 async def _knowledge_base(
     db: AsyncSession,
     knowledge_base_id: uuid.UUID | None,
+    principal: Principal,
 ) -> KnowledgeBase | None:
     if knowledge_base_id is None:
         return None
-    knowledge_base = await db.get(KnowledgeBase, knowledge_base_id)
-    if knowledge_base is None:
-        raise HTTPException(status_code=404, detail="Knowledge base not found")
-    return knowledge_base
+    return await knowledge_base_for_principal(db, knowledge_base_id, principal)
 
 
 async def _workspace_out(db: AsyncSession, workspace: Workspace) -> WorkspaceOut:
@@ -81,11 +84,14 @@ async def _workspace_out(db: AsyncSession, workspace: Workspace) -> WorkspaceOut
     active_version: KnowledgeBaseVersion | None = None
     if workspace.base_knowledge_base_id is not None:
         knowledge_base = await db.get(KnowledgeBase, workspace.base_knowledge_base_id)
+        if knowledge_base is not None and knowledge_base.tenant_id != workspace.tenant_id:
+            knowledge_base = None
         if knowledge_base is not None and knowledge_base.active_version_id is not None:
             active_version = await db.get(KnowledgeBaseVersion, knowledge_base.active_version_id)
 
     return WorkspaceOut(
         id=workspace.id,
+        tenant_id=workspace.tenant_id,
         name=workspace.name,
         base_knowledge_base_id=workspace.base_knowledge_base_id,
         base_knowledge_base_name=knowledge_base.name if knowledge_base else None,
@@ -113,8 +119,14 @@ def _validate_source_configuration(
 
 
 @router.get("", response_model=list[WorkspaceOut])
-async def list_workspaces(db: AsyncSession = Depends(get_db)) -> list[WorkspaceOut]:
-    result = await db.execute(select(Workspace).order_by(Workspace.updated_at.desc()))
+async def list_workspaces(
+    db: AsyncSession = Depends(get_db),
+    principal: Principal = Depends(get_current_principal),
+) -> list[WorkspaceOut]:
+    query = select(Workspace).where(Workspace.tenant_id == principal.tenant_id)
+    if not principal.has_role(settings.auth_admin_role):
+        query = query.where(Workspace.user_id == principal.subject)
+    result = await db.execute(query.order_by(Workspace.updated_at.desc()))
     return [await _workspace_out(db, workspace) for workspace in result.scalars()]
 
 
@@ -122,16 +134,18 @@ async def list_workspaces(db: AsyncSession = Depends(get_db)) -> list[WorkspaceO
 async def create_workspace(
     payload: WorkspaceCreate,
     db: AsyncSession = Depends(get_db),
+    principal: Principal = Depends(get_current_principal),
 ) -> WorkspaceOut:
-    knowledge_base = await _knowledge_base(db, payload.base_knowledge_base_id)
+    knowledge_base = await _knowledge_base(db, payload.base_knowledge_base_id, principal)
     source_mode = payload.source_mode or default_source_mode(knowledge_base is not None)
     _validate_source_configuration(source_mode, payload.base_knowledge_base_id)
 
     workspace = Workspace(
+        tenant_id=principal.tenant_id,
         name=payload.name.strip(),
         base_knowledge_base_id=payload.base_knowledge_base_id,
         source_mode=source_mode.value,
-        user_id=payload.user_id,
+        user_id=principal.subject,
     )
     db.add(workspace)
     await db.commit()
@@ -144,17 +158,16 @@ async def update_workspace(
     workspace_id: uuid.UUID,
     payload: WorkspaceUpdate,
     db: AsyncSession = Depends(get_db),
+    principal: Principal = Depends(get_current_principal),
 ) -> WorkspaceOut:
-    workspace = await db.get(Workspace, workspace_id)
-    if workspace is None:
-        raise HTTPException(status_code=404, detail="Workspace not found")
+    workspace = await workspace_for_principal(db, workspace_id, principal)
 
     updates = payload.model_dump(exclude_unset=True)
     next_knowledge_base_id = updates.get(
         "base_knowledge_base_id",
         workspace.base_knowledge_base_id,
     )
-    await _knowledge_base(db, next_knowledge_base_id)
+    await _knowledge_base(db, next_knowledge_base_id, principal)
 
     if "source_mode" in updates and updates["source_mode"] is not None:
         next_source_mode = WorkspaceSourceMode(updates["source_mode"])
@@ -181,10 +194,9 @@ async def update_workspace(
 async def delete_workspace(
     workspace_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
+    principal: Principal = Depends(get_current_principal),
 ) -> Response:
-    workspace = await db.get(Workspace, workspace_id)
-    if workspace is None:
-        raise HTTPException(status_code=404, detail="Workspace not found")
+    workspace = await workspace_for_principal(db, workspace_id, principal)
 
     result = await db.execute(select(Document).where(Document.workspace_id == workspace_id))
     documents = list(result.scalars())

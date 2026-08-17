@@ -1,6 +1,7 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 
 from app.core.config import settings
+from app.core.security import Principal, get_current_principal
 
 router = APIRouter(tags=["system"])
 
@@ -11,10 +12,16 @@ async def health() -> dict:
 
 
 @router.get("/system/info")
-async def system_info() -> dict:
+async def system_info(
+    _principal: Principal = Depends(get_current_principal),
+) -> dict:
     return {
         "service": settings.app_name,
         "environment": settings.app_env,
+        "authentication": {
+            "enabled": settings.auth_enabled,
+            "mode": "oidc" if settings.auth_enabled else "local",
+        },
         "embedding_model": settings.embedding_model,
         "embedding_dimension": settings.embedding_dim,
         "rerank_model": settings.rerank_model,

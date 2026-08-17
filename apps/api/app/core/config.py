@@ -1,6 +1,20 @@
 from functools import lru_cache
 
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+OIDC_ASYMMETRIC_ALGORITHMS = {
+    "RS256",
+    "RS384",
+    "RS512",
+    "PS256",
+    "PS384",
+    "PS512",
+    "ES256",
+    "ES384",
+    "ES512",
+    "EdDSA",
+}
 
 
 class Settings(BaseSettings):
@@ -11,6 +25,20 @@ class Settings(BaseSettings):
     api_host: str = "0.0.0.0"
     api_port: int = 8000
     web_origin: str = "http://localhost:5173"
+
+    auth_enabled: bool = False
+    auth_local_subject: str = "local-user"
+    auth_local_tenant: str = "local"
+    auth_admin_role: str = "rag-admin"
+    oidc_issuer: str = ""
+    oidc_audience: str = ""
+    oidc_jwks_url: str = ""
+    oidc_algorithm: str = "RS256"
+    oidc_tenant_claim: str = "tenant_id"
+    oidc_roles_claim: str = "roles"
+    oidc_jwks_cache_seconds: int = Field(default=300, gt=0, le=86_400)
+    oidc_jwks_timeout_seconds: float = Field(default=5.0, gt=0, le=30)
+    oidc_token_leeway_seconds: int = Field(default=30, ge=0, le=300)
 
     database_url: str = "postgresql+asyncpg://rag:rag@localhost:5432/rag"
     redis_url: str = "redis://localhost:6379/0"
@@ -58,6 +86,34 @@ class Settings(BaseSettings):
     rerank_document_chars: int = 1800
     rerank_rank_weight: float = 0.7
     rerank_retrieval_weight: float = 0.3
+
+    @model_validator(mode="after")
+    def validate_authentication(self) -> "Settings":
+        if self.auth_enabled:
+            required = {
+                "OIDC_ISSUER": self.oidc_issuer,
+                "OIDC_AUDIENCE": self.oidc_audience,
+                "OIDC_JWKS_URL": self.oidc_jwks_url,
+            }
+            missing = [name for name, value in required.items() if not value.strip()]
+            if missing:
+                raise ValueError(
+                    "Authentication is enabled but required settings are missing: "
+                    + ", ".join(missing)
+                )
+        required_names = {
+            "AUTH_LOCAL_SUBJECT": self.auth_local_subject,
+            "AUTH_LOCAL_TENANT": self.auth_local_tenant,
+            "AUTH_ADMIN_ROLE": self.auth_admin_role,
+            "OIDC_TENANT_CLAIM": self.oidc_tenant_claim,
+            "OIDC_ROLES_CLAIM": self.oidc_roles_claim,
+        }
+        empty = [name for name, value in required_names.items() if not value.strip()]
+        if empty:
+            raise ValueError("Authentication settings must not be empty: " + ", ".join(empty))
+        if self.oidc_algorithm not in OIDC_ASYMMETRIC_ALGORITHMS:
+            raise ValueError("OIDC_ALGORITHM must be an approved asymmetric algorithm")
+        return self
 
 
 @lru_cache

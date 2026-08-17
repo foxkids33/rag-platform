@@ -12,7 +12,9 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.access import knowledge_base_for_principal
 from app.core.config import settings
+from app.core.security import Principal, get_current_principal, require_tenant_admin
 from app.db.models import Document, IngestionJob, KnowledgeBase, KnowledgeBaseVersion, Workspace
 from app.db.session import get_db
 from app.services.knowledge_base_lifecycle import (
@@ -86,6 +88,7 @@ class KnowledgeBaseVersionOut(BaseModel):
 
 class KnowledgeBaseOut(BaseModel):
     id: uuid.UUID
+    tenant_id: str
     slug: str
     name: str
     description: str | None
@@ -105,7 +108,7 @@ def _safe_filename(filename: str) -> str:
 def _normalise_slug(value: str | None, name: str) -> str:
     source = (value or name).strip().lower()
     slug = re.sub(r"[^a-z0-9]+", "-", source).strip("-")
-    return (slug[:110] or f"kb-{uuid.uuid4().hex[:10]}")
+    return slug[:110] or f"kb-{uuid.uuid4().hex[:10]}"
 
 
 async def _hash_and_measure(file: UploadFile) -> tuple[str, int]:
@@ -123,18 +126,21 @@ async def _hash_and_measure(file: UploadFile) -> tuple[str, int]:
     return digest.hexdigest(), total_size
 
 
-async def _get_knowledge_base(db: AsyncSession, knowledge_base_id: uuid.UUID) -> KnowledgeBase:
-    knowledge_base = await db.get(KnowledgeBase, knowledge_base_id)
-    if knowledge_base is None:
-        raise HTTPException(status_code=404, detail="Knowledge base not found")
-    return knowledge_base
+async def _get_knowledge_base(
+    db: AsyncSession,
+    knowledge_base_id: uuid.UUID,
+    principal: Principal,
+) -> KnowledgeBase:
+    return await knowledge_base_for_principal(db, knowledge_base_id, principal)
 
 
 async def _get_version(
     db: AsyncSession,
     knowledge_base_id: uuid.UUID,
     version_id: uuid.UUID,
+    principal: Principal,
 ) -> KnowledgeBaseVersion:
+    await _get_knowledge_base(db, knowledge_base_id, principal)
     version = await db.get(KnowledgeBaseVersion, version_id)
     if version is None or version.knowledge_base_id != knowledge_base_id:
         raise HTTPException(status_code=404, detail="Knowledge base version not found")
@@ -216,6 +222,7 @@ async def _knowledge_base_out(
 
     return KnowledgeBaseOut(
         id=knowledge_base.id,
+        tenant_id=knowledge_base.tenant_id,
         slug=knowledge_base.slug,
         name=knowledge_base.name,
         description=knowledge_base.description,
@@ -249,8 +256,13 @@ async def _delete_objects(documents: list[Document]) -> None:
 @router.get("", response_model=list[KnowledgeBaseOut])
 async def list_knowledge_bases(
     db: AsyncSession = Depends(get_db),
+    principal: Principal = Depends(get_current_principal),
 ) -> list[KnowledgeBaseOut]:
-    result = await db.execute(select(KnowledgeBase).order_by(KnowledgeBase.name))
+    result = await db.execute(
+        select(KnowledgeBase)
+        .where(KnowledgeBase.tenant_id == principal.tenant_id)
+        .order_by(KnowledgeBase.name)
+    )
     return [await _knowledge_base_out(db, knowledge_base) for knowledge_base in result.scalars()]
 
 
@@ -258,15 +270,23 @@ async def list_knowledge_bases(
 async def create_knowledge_base(
     payload: KnowledgeBaseCreate,
     db: AsyncSession = Depends(get_db),
+    principal: Principal = Depends(get_current_principal),
 ) -> KnowledgeBaseOut:
+    require_tenant_admin(principal)
     name = payload.name.strip()
     slug = _normalise_slug(payload.slug, name)
-    existing = await db.scalar(select(KnowledgeBase.id).where(KnowledgeBase.slug == slug))
+    existing = await db.scalar(
+        select(KnowledgeBase.id).where(
+            KnowledgeBase.tenant_id == principal.tenant_id,
+            KnowledgeBase.slug == slug,
+        )
+    )
     if existing is not None:
         raise HTTPException(status_code=409, detail="Knowledge base slug already exists")
 
     knowledge_base = KnowledgeBase(
         id=uuid.uuid4(),
+        tenant_id=principal.tenant_id,
         slug=slug,
         name=name,
         description=payload.description,
@@ -284,8 +304,10 @@ async def update_knowledge_base(
     knowledge_base_id: uuid.UUID,
     payload: KnowledgeBaseUpdate,
     db: AsyncSession = Depends(get_db),
+    principal: Principal = Depends(get_current_principal),
 ) -> KnowledgeBaseOut:
-    knowledge_base = await _get_knowledge_base(db, knowledge_base_id)
+    require_tenant_admin(principal)
+    knowledge_base = await _get_knowledge_base(db, knowledge_base_id, principal)
     updates = payload.model_dump(exclude_unset=True)
     if "name" in updates and updates["name"] is not None:
         knowledge_base.name = updates["name"].strip()
@@ -302,8 +324,10 @@ async def update_knowledge_base(
 async def delete_knowledge_base(
     knowledge_base_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
+    principal: Principal = Depends(get_current_principal),
 ) -> Response:
-    knowledge_base = await _get_knowledge_base(db, knowledge_base_id)
+    require_tenant_admin(principal)
+    knowledge_base = await _get_knowledge_base(db, knowledge_base_id, principal)
     workspace_count = int(
         await db.scalar(
             select(func.count(Workspace.id)).where(
@@ -343,8 +367,9 @@ async def delete_knowledge_base(
 async def list_knowledge_base_versions(
     knowledge_base_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
+    principal: Principal = Depends(get_current_principal),
 ) -> list[KnowledgeBaseVersionOut]:
-    await _get_knowledge_base(db, knowledge_base_id)
+    await _get_knowledge_base(db, knowledge_base_id, principal)
     result = await db.execute(
         select(KnowledgeBaseVersion)
         .where(KnowledgeBaseVersion.knowledge_base_id == knowledge_base_id)
@@ -368,8 +393,10 @@ async def create_knowledge_base_version(
     knowledge_base_id: uuid.UUID,
     payload: KnowledgeBaseVersionCreate,
     db: AsyncSession = Depends(get_db),
+    principal: Principal = Depends(get_current_principal),
 ) -> KnowledgeBaseVersionOut:
-    await _get_knowledge_base(db, knowledge_base_id)
+    require_tenant_admin(principal)
+    await _get_knowledge_base(db, knowledge_base_id, principal)
     embedding_model = payload.embedding_model or settings.embedding_model
     embedding_dimension = payload.embedding_dimension or settings.embedding_dim
     chunker_version = payload.chunker_version or DEFAULT_CHUNKER_VERSION
@@ -408,9 +435,11 @@ async def delete_knowledge_base_version(
     knowledge_base_id: uuid.UUID,
     version_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
+    principal: Principal = Depends(get_current_principal),
 ) -> Response:
-    knowledge_base = await _get_knowledge_base(db, knowledge_base_id)
-    version = await _get_version(db, knowledge_base_id, version_id)
+    require_tenant_admin(principal)
+    knowledge_base = await _get_knowledge_base(db, knowledge_base_id, principal)
+    version = await _get_version(db, knowledge_base_id, version_id, principal)
     if knowledge_base.active_version_id == version.id or version.status == "ACTIVE":
         raise HTTPException(status_code=409, detail="The active version cannot be deleted")
 
@@ -434,9 +463,11 @@ async def publish_knowledge_base_version(
     knowledge_base_id: uuid.UUID,
     version_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
+    principal: Principal = Depends(get_current_principal),
 ) -> KnowledgeBaseOut:
-    knowledge_base = await _get_knowledge_base(db, knowledge_base_id)
-    version = await _get_version(db, knowledge_base_id, version_id)
+    require_tenant_admin(principal)
+    knowledge_base = await _get_knowledge_base(db, knowledge_base_id, principal)
+    version = await _get_version(db, knowledge_base_id, version_id, principal)
     await _synchronize_version_status(db, version)
 
     documents = await _version_documents(db, version.id)
@@ -474,8 +505,9 @@ async def list_knowledge_base_documents(
     knowledge_base_id: uuid.UUID,
     version_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
+    principal: Principal = Depends(get_current_principal),
 ) -> list[KnowledgeBaseDocumentOut]:
-    version = await _get_version(db, knowledge_base_id, version_id)
+    version = await _get_version(db, knowledge_base_id, version_id, principal)
     if await _synchronize_version_status(db, version):
         await db.commit()
     return await _version_documents(db, version.id)
@@ -491,8 +523,10 @@ async def upload_knowledge_base_document(
     version_id: uuid.UUID,
     file: UploadFile = File(...),
     db: AsyncSession = Depends(get_db),
+    principal: Principal = Depends(get_current_principal),
 ) -> KnowledgeBaseDocumentOut:
-    version = await _get_version(db, knowledge_base_id, version_id)
+    require_tenant_admin(principal)
+    version = await _get_version(db, knowledge_base_id, version_id, principal)
     await _ensure_editable_version(version)
 
     if not file.filename:
@@ -610,8 +644,10 @@ async def reindex_knowledge_base_document(
     version_id: uuid.UUID,
     document_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
+    principal: Principal = Depends(get_current_principal),
 ) -> KnowledgeBaseDocumentOut:
-    version = await _get_version(db, knowledge_base_id, version_id)
+    require_tenant_admin(principal)
+    version = await _get_version(db, knowledge_base_id, version_id, principal)
     await _ensure_editable_version(version)
     document = await db.get(Document, document_id)
     if document is None or document.knowledge_base_version_id != version.id:
@@ -654,8 +690,10 @@ async def update_knowledge_base_document(
     document_id: uuid.UUID,
     payload: KnowledgeBaseDocumentUpdate,
     db: AsyncSession = Depends(get_db),
+    principal: Principal = Depends(get_current_principal),
 ) -> KnowledgeBaseDocumentOut:
-    version = await _get_version(db, knowledge_base_id, version_id)
+    require_tenant_admin(principal)
+    version = await _get_version(db, knowledge_base_id, version_id, principal)
     await _ensure_editable_version(version)
     document = await db.get(Document, document_id)
     if document is None or document.knowledge_base_version_id != version.id:
@@ -677,8 +715,10 @@ async def delete_knowledge_base_document(
     version_id: uuid.UUID,
     document_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
+    principal: Principal = Depends(get_current_principal),
 ) -> Response:
-    version = await _get_version(db, knowledge_base_id, version_id)
+    require_tenant_admin(principal)
+    version = await _get_version(db, knowledge_base_id, version_id, principal)
     await _ensure_editable_version(version)
     document = await db.get(Document, document_id)
     if document is None or document.knowledge_base_version_id != version.id:

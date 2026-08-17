@@ -17,6 +17,7 @@ type WorkspaceSourceMode = "USER_DOCUMENTS" | "KNOWLEDGE_BASE" | "HYBRID";
 
 type KnowledgeBase = {
   id: string;
+  tenant_id: string;
   slug: string;
   name: string;
   description?: string | null;
@@ -28,13 +29,14 @@ type KnowledgeBase = {
 
 type Workspace = {
   id: string;
+  tenant_id: string;
   name: string;
   base_knowledge_base_id: string | null;
   base_knowledge_base_name: string | null;
   active_knowledge_base_version_id: string | null;
   active_knowledge_base_version: number | null;
   source_mode: WorkspaceSourceMode;
-  user_id: string | null;
+  user_id: string;
   document_count: number;
   searchable_document_count: number;
   conversation_count: number;
@@ -465,7 +467,6 @@ export function App() {
               name: "Мои документы",
               base_knowledge_base_id: null,
               source_mode: "USER_DOCUMENTS",
-              user_id: "local-user",
             }),
           });
           workspaceItems = [await readJson<Workspace>(createResponse)];
@@ -612,7 +613,6 @@ export function App() {
         name,
         base_knowledge_base_id: null,
         source_mode: "USER_DOCUMENTS",
-        user_id: "local-user",
       }),
     });
     return readJson<Workspace>(response);

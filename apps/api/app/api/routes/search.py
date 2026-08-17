@@ -9,8 +9,10 @@ from pydantic import BaseModel, Field
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.access import workspace_for_principal
 from app.core.config import settings
-from app.db.models import KnowledgeBase, KnowledgeBaseVersion, Workspace
+from app.core.security import Principal, get_current_principal
+from app.db.models import KnowledgeBase, KnowledgeBaseVersion
 from app.db.session import get_db
 from app.services.embeddings import EmbeddingError, embeddings
 from app.services.reranker import RerankError, reranker
@@ -37,8 +39,27 @@ DOCUMENT_TITLE_RE = re.compile(
 URL_OR_EMAIL_RE = re.compile(r"(?:https?://|www\.|\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,})", re.IGNORECASE)
 WORD_RE = re.compile(r"[0-9A-Za-zА-Яа-яЁё]+(?:[.\-][0-9A-Za-zА-Яа-яЁё]+)*")
 QUERY_STOP_WORDS = {
-    "что", "такое", "какой", "какая", "какие", "как", "для", "чего", "это", "есть",
-    "или", "его", "ее", "её", "про", "при", "под", "над", "где", "когда", "зачем",
+    "что",
+    "такое",
+    "какой",
+    "какая",
+    "какие",
+    "как",
+    "для",
+    "чего",
+    "это",
+    "есть",
+    "или",
+    "его",
+    "ее",
+    "её",
+    "про",
+    "при",
+    "под",
+    "над",
+    "где",
+    "когда",
+    "зачем",
 }
 
 
@@ -160,8 +181,7 @@ def _focused_excerpt(value: str, query: str, max_chars: int) -> str:
         score = float(overlap)
         lowered = paragraph.casefold()
         if query.casefold().startswith("что такое") and any(
-            marker in lowered
-            for marker in (" — это ", " это ", "предназначен", "предназначена")
+            marker in lowered for marker in (" — это ", " это ", "предназначен", "предназначена")
         ):
             score += 1.5
         return score, -len(paragraph)
@@ -238,10 +258,9 @@ async def search(
     workspace_id: uuid.UUID,
     payload: SearchRequest,
     db: AsyncSession = Depends(get_db),
+    principal: Principal = Depends(get_current_principal),
 ) -> SearchResponse:
-    workspace = await db.get(Workspace, workspace_id)
-    if workspace is None:
-        raise HTTPException(status_code=404, detail="Workspace not found")
+    workspace = await workspace_for_principal(db, workspace_id, principal)
 
     source_mode = WorkspaceSourceMode(workspace.source_mode)
     include_workspace = includes_workspace_documents(source_mode)
@@ -250,6 +269,8 @@ async def search(
     active_version: KnowledgeBaseVersion | None = None
     if workspace.base_knowledge_base_id is not None:
         knowledge_base = await db.get(KnowledgeBase, workspace.base_knowledge_base_id)
+        if knowledge_base is not None and knowledge_base.tenant_id != principal.tenant_id:
+            knowledge_base = None
         if knowledge_base is not None and knowledge_base.active_version_id is not None:
             active_version = await db.get(KnowledgeBaseVersion, knowledge_base.active_version_id)
 
@@ -322,6 +343,7 @@ async def search(
                       (
                           :include_knowledge_base
                           AND d.knowledge_base_version_id = :knowledge_base_version_id
+                          AND kb.tenant_id = :tenant_id
                       )
                   )
             ),
@@ -440,6 +462,7 @@ async def search(
         ),
         {
             "workspace_id": workspace_id,
+            "tenant_id": principal.tenant_id,
             "include_workspace": include_workspace,
             "include_knowledge_base": include_knowledge_base and active_version is not None,
             "knowledge_base_version_id": (

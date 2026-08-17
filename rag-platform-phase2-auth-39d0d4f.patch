@@ -1,0 +1,1892 @@
+diff --git a/.env.example b/.env.example
+index 1442ee8..3f9ef67 100644
+--- a/.env.example
++++ b/.env.example
+@@ -5,6 +5,22 @@ API_HOST=0.0.0.0
+ API_PORT=8000
+ WEB_ORIGIN=http://localhost:5173
+ 
++# Authentication. Keep disabled only for isolated local development.
++AUTH_ENABLED=false
++AUTH_LOCAL_SUBJECT=local-user
++AUTH_LOCAL_TENANT=local
++AUTH_ADMIN_ROLE=rag-admin
++# Required when AUTH_ENABLED=true.
++OIDC_ISSUER=
++OIDC_AUDIENCE=
++OIDC_JWKS_URL=
++OIDC_ALGORITHM=RS256
++OIDC_TENANT_CLAIM=tenant_id
++OIDC_ROLES_CLAIM=roles
++OIDC_JWKS_CACHE_SECONDS=300
++OIDC_JWKS_TIMEOUT_SECONDS=5
++OIDC_TOKEN_LEEWAY_SECONDS=30
++
+ # PostgreSQL / pgvector
+ POSTGRES_DB=rag
+ POSTGRES_USER=rag
+diff --git a/.env.server.example b/.env.server.example
+index 83431ea..0fead24 100644
+--- a/.env.server.example
++++ b/.env.server.example
+@@ -10,6 +10,21 @@ APP_NAME=RAG Platform
+ API_HOST=0.0.0.0
+ API_PORT=8000
+ 
++# Set true and configure the corporate OIDC provider before exposing the API.
++AUTH_ENABLED=false
++AUTH_LOCAL_SUBJECT=local-user
++AUTH_LOCAL_TENANT=local
++AUTH_ADMIN_ROLE=rag-admin
++OIDC_ISSUER=
++OIDC_AUDIENCE=
++OIDC_JWKS_URL=
++OIDC_ALGORITHM=RS256
++OIDC_TENANT_CLAIM=tenant_id
++OIDC_ROLES_CLAIM=roles
++OIDC_JWKS_CACHE_SECONDS=300
++OIDC_JWKS_TIMEOUT_SECONDS=5
++OIDC_TOKEN_LEEWAY_SECONDS=30
++
+ # PostgreSQL / pgvector
+ POSTGRES_DB=rag
+ POSTGRES_USER=rag
+diff --git a/README.md b/README.md
+index 137e9a0..a9d4190 100644
+--- a/README.md
++++ b/README.md
+@@ -65,8 +65,13 @@ make logs
+ - UI: `http://localhost:5173`
+ - API: `http://localhost:8000`
+ - API health: `http://localhost:8000/api/v1/health`
++- Current principal: `http://localhost:8000/api/v1/auth/me`
+ - MinIO console: `http://localhost:9001`
+ 
++Локально аутентификация отключена и используется фиксированный admin principal.
++Перед публикацией API настройте корпоративный OIDC согласно
++[`docs/authentication.md`](docs/authentication.md).
++
+ ## Разработка без Docker
+ 
+ API:
+@@ -81,10 +86,13 @@ UI:
+ 
+ ```bash
+ cd apps/web
+-npm install
++nvm use
++npm ci
+ npm run dev
+ ```
+ 
++Host-side UI development requires Node.js 20.19+; `.nvmrc` selects Node 24.
++
+ ## Ближайшие этапы
+ 
+ 1. Поднять инфраструктуру и применить миграции.
+@@ -102,7 +110,9 @@ npm run dev
+ 13. Добавить управление workspace и режимами источников: user-only, KB-only и hybrid.
+ 14. Добавить версии и публикацию готовых баз знаний.
+ 15. Добавить ветвящийся граф диалогов и устойчивые прокручиваемые списки UI.
+-16. Добавить Neo4j и семантический knowledge graph.
++16. Добавить OIDC authentication и tenant/workspace isolation.
++17. Добавить frontend OIDC login, document/group ACL и PostgreSQL RLS.
++18. Добавить Neo4j и семантический knowledge graph.
+ 
+ ## Локальный reranker
+ 
+diff --git a/apps/api/alembic/versions/0008_tenant_isolation.py b/apps/api/alembic/versions/0008_tenant_isolation.py
+new file mode 100644
+index 0000000..08b2ce8
+--- /dev/null
++++ b/apps/api/alembic/versions/0008_tenant_isolation.py
+@@ -0,0 +1,48 @@
++"""Add tenant ownership boundaries to knowledge bases and workspaces.
++
++Revision ID: 0008_tenant_isolation
++Revises: 0007_embedding_dimension_384
++"""
++
++import sqlalchemy as sa
++
++from alembic import op
++
++revision = "0008_tenant_isolation"
++down_revision = "0007_embedding_dimension_384"
++branch_labels = None
++depends_on = None
++
++
++def upgrade() -> None:
++    op.add_column("knowledge_bases", sa.Column("tenant_id", sa.String(255), nullable=True))
++    op.add_column("workspaces", sa.Column("tenant_id", sa.String(255), nullable=True))
++    op.execute("UPDATE knowledge_bases SET tenant_id = 'local' WHERE tenant_id IS NULL")
++    op.execute("UPDATE workspaces SET tenant_id = 'local' WHERE tenant_id IS NULL")
++    # Pre-auth user_id came from an untrusted request body. Normalize every
++    # legacy workspace to the local principal so existing local data stays visible.
++    op.execute("UPDATE workspaces SET user_id = 'local-user'")
++    op.alter_column("knowledge_bases", "tenant_id", nullable=False)
++    op.alter_column("workspaces", "tenant_id", nullable=False)
++    op.alter_column("workspaces", "user_id", existing_type=sa.String(255), nullable=False)
++
++    op.drop_constraint("knowledge_bases_slug_key", "knowledge_bases", type_="unique")
++    op.create_unique_constraint(
++        "uq_kb_tenant_slug",
++        "knowledge_bases",
++        ["tenant_id", "slug"],
++    )
++    op.create_index("ix_knowledge_bases_tenant_id", "knowledge_bases", ["tenant_id"])
++    op.create_index("ix_workspaces_tenant_id", "workspaces", ["tenant_id"])
++    op.create_index("ix_workspaces_user_id", "workspaces", ["user_id"])
++
++
++def downgrade() -> None:
++    op.drop_index("ix_workspaces_user_id", table_name="workspaces")
++    op.drop_index("ix_workspaces_tenant_id", table_name="workspaces")
++    op.drop_index("ix_knowledge_bases_tenant_id", table_name="knowledge_bases")
++    op.drop_constraint("uq_kb_tenant_slug", "knowledge_bases", type_="unique")
++    op.create_unique_constraint("knowledge_bases_slug_key", "knowledge_bases", ["slug"])
++    op.alter_column("workspaces", "user_id", existing_type=sa.String(255), nullable=True)
++    op.drop_column("workspaces", "tenant_id")
++    op.drop_column("knowledge_bases", "tenant_id")
+diff --git a/apps/api/app/api/router.py b/apps/api/app/api/router.py
+index 7aaa51e..d300e9d 100644
+--- a/apps/api/app/api/router.py
++++ b/apps/api/app/api/router.py
+@@ -2,6 +2,7 @@ from fastapi import APIRouter
+ 
+ from app.api.routes import (
+     answer,
++    auth,
+     conversations,
+     documents,
+     health,
+@@ -12,6 +13,7 @@ from app.api.routes import (
+ 
+ api_router = APIRouter(prefix="/api/v1")
+ api_router.include_router(health.router)
++api_router.include_router(auth.router)
+ api_router.include_router(knowledge_bases.router)
+ api_router.include_router(workspaces.router)
+ api_router.include_router(documents.router)
+diff --git a/apps/api/app/api/routes/answer.py b/apps/api/app/api/routes/answer.py
+index 596e966..34d158c 100644
+--- a/apps/api/app/api/routes/answer.py
++++ b/apps/api/app/api/routes/answer.py
+@@ -14,7 +14,9 @@ from sqlalchemy import select
+ from sqlalchemy.ext.asyncio import AsyncSession
+ 
+ from app.api.routes.search import SearchRequest, SearchResponse, search
++from app.core.access import workspace_for_principal
+ from app.core.config import settings
++from app.core.security import Principal, get_current_principal
+ from app.db.models import ChatMessage, ChatSession
+ from app.db.session import SessionLocal, get_db
+ from app.services.context_builder import BuiltContext, ContextSource, build_context
+@@ -177,7 +179,9 @@ async def _load_conversation_history(
+ ) -> tuple[ChatSession | None, list[HistoryMessage], uuid.UUID | None]:
+     if conversation_id is None:
+         if parent_message_id is not None:
+-            raise HTTPException(status_code=400, detail="parent_message_id requires conversation_id")
++            raise HTTPException(
++                status_code=400, detail="parent_message_id requires conversation_id"
++            )
+         return None, [], None
+ 
+     conversation = await db.get(ChatSession, conversation_id)
+@@ -204,7 +208,9 @@ async def _load_conversation_history(
+         if parent is None:
+             raise HTTPException(status_code=404, detail="Parent message not found in conversation")
+         if parent.role != "assistant":
+-            raise HTTPException(status_code=400, detail="Branches must continue from an assistant message")
++            raise HTTPException(
++                status_code=400, detail="Branches must continue from an assistant message"
++            )
+ 
+     history = branch_history(
+         [
+@@ -248,7 +254,9 @@ async def _prepare_answer(
+     workspace_id: uuid.UUID,
+     payload: AnswerRequest,
+     db: AsyncSession,
++    principal: Principal,
+ ) -> PreparedAnswer:
++    await workspace_for_principal(db, workspace_id, principal)
+     question = payload.question.strip()
+     conversation, history, parent_message_id = await _load_conversation_history(
+         db,
+@@ -269,6 +277,7 @@ async def _prepare_answer(
+             rerank=payload.rerank,
+         ),
+         db=db,
++        principal=principal,
+     )
+     context = build_context(
+         retrieval_query,
+@@ -342,13 +351,12 @@ def _assistant_metadata(
+         "context_chars": prepared.context.char_count,
+         **_quality_payload(prepared),
+         "citation_valid": citation_audit.valid if citation_audit else None,
+-        "cited_source_indices": (
+-            citation_audit.cited_source_indices if citation_audit else []
+-        ),
++        "cited_source_indices": (citation_audit.cited_source_indices if citation_audit else []),
+         "invalid_citations": citation_audit.invalid_citations if citation_audit else [],
+         "sources": [source.model_dump(mode="json") for source in sources],
+     }
+ 
++
+ def _touch_conversation(conversation: ChatSession, question: str) -> None:
+     if not conversation.title or conversation.title == "Новый диалог":
+         conversation.title = derive_conversation_title(question)
+@@ -454,8 +462,9 @@ async def answer(
+     workspace_id: uuid.UUID,
+     payload: AnswerRequest,
+     db: AsyncSession = Depends(get_db),
++    principal: Principal = Depends(get_current_principal),
+ ) -> AnswerResponse:
+-    prepared = await _prepare_answer(workspace_id, payload, db)
++    prepared = await _prepare_answer(workspace_id, payload, db, principal)
+     sources = _answer_sources(prepared.context.sources)
+ 
+     if prepared.abstained:
+@@ -516,7 +525,6 @@ async def answer(
+     )
+ 
+ 
+-
+ def _sse(event: str, payload: dict) -> str:
+     return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+ 
+@@ -526,8 +534,9 @@ async def answer_stream(
+     workspace_id: uuid.UUID,
+     payload: AnswerRequest,
+     db: AsyncSession = Depends(get_db),
++    principal: Principal = Depends(get_current_principal),
+ ) -> StreamingResponse:
+-    prepared = await _prepare_answer(workspace_id, payload, db)
++    prepared = await _prepare_answer(workspace_id, payload, db, principal)
+     sources = _answer_sources(prepared.context.sources)
+     user_message_id = await _persist_stream_user(db, prepared)
+     serialized_sources = [source.model_dump(mode="json") for source in sources]
+@@ -546,11 +555,7 @@ async def answer_stream(
+                 "parent_message_id": (
+                     str(prepared.parent_message_id) if prepared.parent_message_id else None
+                 ),
+-                "model": (
+-                    "retrieval-quality-gate"
+-                    if prepared.abstained
+-                    else settings.vllm_model
+-                ),
++                "model": ("retrieval-quality-gate" if prepared.abstained else settings.vllm_model),
+                 "retrieval_mode": prepared.search_response.mode,
+                 "workspace_source_mode": prepared.search_response.workspace_source_mode.value,
+                 "knowledge_base_id": (
+diff --git a/apps/api/app/api/routes/auth.py b/apps/api/app/api/routes/auth.py
+new file mode 100644
+index 0000000..67fa597
+--- /dev/null
++++ b/apps/api/app/api/routes/auth.py
+@@ -0,0 +1,26 @@
++from fastapi import APIRouter, Depends
++from pydantic import BaseModel
++
++from app.core.config import settings
++from app.core.security import Principal, get_current_principal
++
++router = APIRouter(prefix="/auth", tags=["authentication"])
++
++
++class PrincipalOut(BaseModel):
++    subject: str
++    tenant_id: str
++    roles: list[str]
++    auth_enabled: bool
++
++
++@router.get("/me", response_model=PrincipalOut)
++async def current_user(
++    principal: Principal = Depends(get_current_principal),
++) -> PrincipalOut:
++    return PrincipalOut(
++        subject=principal.subject,
++        tenant_id=principal.tenant_id,
++        roles=sorted(principal.roles),
++        auth_enabled=settings.auth_enabled,
++    )
+diff --git a/apps/api/app/api/routes/conversations.py b/apps/api/app/api/routes/conversations.py
+index 4fd1932..2f20b48 100644
+--- a/apps/api/app/api/routes/conversations.py
++++ b/apps/api/app/api/routes/conversations.py
+@@ -8,6 +8,8 @@ from pydantic import BaseModel, ConfigDict, Field
+ from sqlalchemy import func, select
+ from sqlalchemy.ext.asyncio import AsyncSession
+ 
++from app.core.access import workspace_for_principal
++from app.core.security import Principal, get_current_principal
+ from app.db.models import ChatMessage, ChatSession, Workspace
+ from app.db.session import get_db
+ from app.services.conversation_context import derive_conversation_title
+@@ -73,18 +75,21 @@ def _message_out(message: ChatMessage) -> ChatMessageOut:
+     )
+ 
+ 
+-async def _workspace_or_404(db: AsyncSession, workspace_id: uuid.UUID) -> Workspace:
+-    workspace = await db.get(Workspace, workspace_id)
+-    if workspace is None:
+-        raise HTTPException(status_code=404, detail="Workspace not found")
+-    return workspace
++async def _workspace_or_404(
++    db: AsyncSession,
++    workspace_id: uuid.UUID,
++    principal: Principal,
++) -> Workspace:
++    return await workspace_for_principal(db, workspace_id, principal)
+ 
+ 
+ async def _conversation_or_404(
+     db: AsyncSession,
+     workspace_id: uuid.UUID,
+     conversation_id: uuid.UUID,
++    principal: Principal,
+ ) -> ChatSession:
++    await _workspace_or_404(db, workspace_id, principal)
+     conversation = await db.get(ChatSession, conversation_id)
+     if conversation is None or conversation.workspace_id != workspace_id:
+         raise HTTPException(status_code=404, detail="Conversation not found")
+@@ -95,8 +100,9 @@ async def _conversation_or_404(
+ async def list_conversations(
+     workspace_id: uuid.UUID,
+     db: AsyncSession = Depends(get_db),
++    principal: Principal = Depends(get_current_principal),
+ ) -> list[ConversationOut]:
+-    await _workspace_or_404(db, workspace_id)
++    await _workspace_or_404(db, workspace_id, principal)
+     count_subquery = (
+         select(func.count(ChatMessage.id))
+         .where(ChatMessage.session_id == ChatSession.id)
+@@ -116,8 +122,9 @@ async def create_conversation(
+     workspace_id: uuid.UUID,
+     payload: ConversationCreate,
+     db: AsyncSession = Depends(get_db),
++    principal: Principal = Depends(get_current_principal),
+ ) -> ConversationOut:
+-    await _workspace_or_404(db, workspace_id)
++    await _workspace_or_404(db, workspace_id, principal)
+     title = derive_conversation_title(payload.title or "")
+     conversation = ChatSession(workspace_id=workspace_id, title=title)
+     db.add(conversation)
+@@ -131,8 +138,9 @@ async def get_conversation(
+     workspace_id: uuid.UUID,
+     conversation_id: uuid.UUID,
+     db: AsyncSession = Depends(get_db),
++    principal: Principal = Depends(get_current_principal),
+ ) -> ConversationDetail:
+-    conversation = await _conversation_or_404(db, workspace_id, conversation_id)
++    conversation = await _conversation_or_404(db, workspace_id, conversation_id, principal)
+     result = await db.execute(
+         select(ChatMessage)
+         .where(ChatMessage.session_id == conversation.id)
+@@ -151,8 +159,9 @@ async def update_conversation(
+     conversation_id: uuid.UUID,
+     payload: ConversationUpdate,
+     db: AsyncSession = Depends(get_db),
++    principal: Principal = Depends(get_current_principal),
+ ) -> ConversationOut:
+-    conversation = await _conversation_or_404(db, workspace_id, conversation_id)
++    conversation = await _conversation_or_404(db, workspace_id, conversation_id, principal)
+     conversation.title = derive_conversation_title(payload.title, max_chars=500)
+     await db.commit()
+     await db.refresh(conversation)
+@@ -167,8 +176,9 @@ async def delete_conversation(
+     workspace_id: uuid.UUID,
+     conversation_id: uuid.UUID,
+     db: AsyncSession = Depends(get_db),
++    principal: Principal = Depends(get_current_principal),
+ ) -> Response:
+-    conversation = await _conversation_or_404(db, workspace_id, conversation_id)
++    conversation = await _conversation_or_404(db, workspace_id, conversation_id, principal)
+     await db.delete(conversation)
+     await db.commit()
+     return Response(status_code=status.HTTP_204_NO_CONTENT)
+diff --git a/apps/api/app/api/routes/documents.py b/apps/api/app/api/routes/documents.py
+index 75c0f4e..356c1de 100644
+--- a/apps/api/app/api/routes/documents.py
++++ b/apps/api/app/api/routes/documents.py
+@@ -12,8 +12,10 @@ from pydantic import BaseModel, ConfigDict
+ from sqlalchemy import select
+ from sqlalchemy.ext.asyncio import AsyncSession
+ 
++from app.core.access import workspace_for_principal
+ from app.core.config import settings
+-from app.db.models import Document, IngestionJob, Workspace
++from app.core.security import Principal, get_current_principal
++from app.db.models import Document, IngestionJob
+ from app.db.session import get_db
+ from app.services.queue import QueueError, ingestion_queue
+ from app.services.storage import StorageError, storage
+@@ -69,10 +71,9 @@ async def _hash_and_measure(file: UploadFile) -> tuple[str, int]:
+ async def list_workspace_documents(
+     workspace_id: uuid.UUID,
+     db: AsyncSession = Depends(get_db),
++    principal: Principal = Depends(get_current_principal),
+ ):
+-    workspace = await db.get(Workspace, workspace_id)
+-    if workspace is None:
+-        raise HTTPException(status_code=404, detail="Workspace not found")
++    await workspace_for_principal(db, workspace_id, principal)
+ 
+     result = await db.execute(
+         select(Document)
+@@ -87,10 +88,9 @@ async def upload_workspace_document(
+     workspace_id: uuid.UUID,
+     file: UploadFile = File(...),
+     db: AsyncSession = Depends(get_db),
++    principal: Principal = Depends(get_current_principal),
+ ):
+-    workspace = await db.get(Workspace, workspace_id)
+-    if workspace is None:
+-        raise HTTPException(status_code=404, detail="Workspace not found")
++    await workspace_for_principal(db, workspace_id, principal)
+ 
+     if not file.filename:
+         raise HTTPException(status_code=400, detail="Uploaded file has no filename")
+@@ -187,12 +187,16 @@ async def upload_workspace_document(
+         await file.close()
+ 
+ 
+-@router.post("/{document_id}/reindex", response_model=DocumentOut, status_code=status.HTTP_202_ACCEPTED)
++@router.post(
++    "/{document_id}/reindex", response_model=DocumentOut, status_code=status.HTTP_202_ACCEPTED
++)
+ async def reindex_workspace_document(
+     workspace_id: uuid.UUID,
+     document_id: uuid.UUID,
+     db: AsyncSession = Depends(get_db),
++    principal: Principal = Depends(get_current_principal),
+ ):
++    await workspace_for_principal(db, workspace_id, principal)
+     document = await db.get(Document, document_id)
+     if document is None or document.workspace_id != workspace_id:
+         raise HTTPException(status_code=404, detail="Document not found")
+@@ -222,13 +226,16 @@ async def reindex_workspace_document(
+     await db.refresh(document)
+     return document
+ 
++
+ @router.patch("/{document_id}", response_model=DocumentOut)
+ async def update_workspace_document(
+     workspace_id: uuid.UUID,
+     document_id: uuid.UUID,
+     payload: DocumentUpdate,
+     db: AsyncSession = Depends(get_db),
++    principal: Principal = Depends(get_current_principal),
+ ):
++    await workspace_for_principal(db, workspace_id, principal)
+     document = await db.get(Document, document_id)
+     if document is None or document.workspace_id != workspace_id:
+         raise HTTPException(status_code=404, detail="Document not found")
+@@ -250,7 +257,9 @@ async def delete_workspace_document(
+     workspace_id: uuid.UUID,
+     document_id: uuid.UUID,
+     db: AsyncSession = Depends(get_db),
++    principal: Principal = Depends(get_current_principal),
+ ) -> Response:
++    await workspace_for_principal(db, workspace_id, principal)
+     document = await db.get(Document, document_id)
+     if document is None or document.workspace_id != workspace_id:
+         raise HTTPException(status_code=404, detail="Document not found")
+diff --git a/apps/api/app/api/routes/health.py b/apps/api/app/api/routes/health.py
+index dd88489..727c71d 100644
+--- a/apps/api/app/api/routes/health.py
++++ b/apps/api/app/api/routes/health.py
+@@ -1,6 +1,7 @@
+-from fastapi import APIRouter
++from fastapi import APIRouter, Depends
+ 
+ from app.core.config import settings
++from app.core.security import Principal, get_current_principal
+ 
+ router = APIRouter(tags=["system"])
+ 
+@@ -11,10 +12,16 @@ async def health() -> dict:
+ 
+ 
+ @router.get("/system/info")
+-async def system_info() -> dict:
++async def system_info(
++    _principal: Principal = Depends(get_current_principal),
++) -> dict:
+     return {
+         "service": settings.app_name,
+         "environment": settings.app_env,
++        "authentication": {
++            "enabled": settings.auth_enabled,
++            "mode": "oidc" if settings.auth_enabled else "local",
++        },
+         "embedding_model": settings.embedding_model,
+         "embedding_dimension": settings.embedding_dim,
+         "rerank_model": settings.rerank_model,
+diff --git a/apps/api/app/api/routes/knowledge_bases.py b/apps/api/app/api/routes/knowledge_bases.py
+index 6a0ff64..c0c7b6b 100644
+--- a/apps/api/app/api/routes/knowledge_bases.py
++++ b/apps/api/app/api/routes/knowledge_bases.py
+@@ -12,7 +12,9 @@ from pydantic import BaseModel, ConfigDict, Field
+ from sqlalchemy import func, select
+ from sqlalchemy.ext.asyncio import AsyncSession
+ 
++from app.core.access import knowledge_base_for_principal
+ from app.core.config import settings
++from app.core.security import Principal, get_current_principal, require_tenant_admin
+ from app.db.models import Document, IngestionJob, KnowledgeBase, KnowledgeBaseVersion, Workspace
+ from app.db.session import get_db
+ from app.services.knowledge_base_lifecycle import (
+@@ -86,6 +88,7 @@ class KnowledgeBaseVersionOut(BaseModel):
+ 
+ class KnowledgeBaseOut(BaseModel):
+     id: uuid.UUID
++    tenant_id: str
+     slug: str
+     name: str
+     description: str | None
+@@ -105,7 +108,7 @@ def _safe_filename(filename: str) -> str:
+ def _normalise_slug(value: str | None, name: str) -> str:
+     source = (value or name).strip().lower()
+     slug = re.sub(r"[^a-z0-9]+", "-", source).strip("-")
+-    return (slug[:110] or f"kb-{uuid.uuid4().hex[:10]}")
++    return slug[:110] or f"kb-{uuid.uuid4().hex[:10]}"
+ 
+ 
+ async def _hash_and_measure(file: UploadFile) -> tuple[str, int]:
+@@ -123,18 +126,21 @@ async def _hash_and_measure(file: UploadFile) -> tuple[str, int]:
+     return digest.hexdigest(), total_size
+ 
+ 
+-async def _get_knowledge_base(db: AsyncSession, knowledge_base_id: uuid.UUID) -> KnowledgeBase:
+-    knowledge_base = await db.get(KnowledgeBase, knowledge_base_id)
+-    if knowledge_base is None:
+-        raise HTTPException(status_code=404, detail="Knowledge base not found")
+-    return knowledge_base
++async def _get_knowledge_base(
++    db: AsyncSession,
++    knowledge_base_id: uuid.UUID,
++    principal: Principal,
++) -> KnowledgeBase:
++    return await knowledge_base_for_principal(db, knowledge_base_id, principal)
+ 
+ 
+ async def _get_version(
+     db: AsyncSession,
+     knowledge_base_id: uuid.UUID,
+     version_id: uuid.UUID,
++    principal: Principal,
+ ) -> KnowledgeBaseVersion:
++    await _get_knowledge_base(db, knowledge_base_id, principal)
+     version = await db.get(KnowledgeBaseVersion, version_id)
+     if version is None or version.knowledge_base_id != knowledge_base_id:
+         raise HTTPException(status_code=404, detail="Knowledge base version not found")
+@@ -216,6 +222,7 @@ async def _knowledge_base_out(
+ 
+     return KnowledgeBaseOut(
+         id=knowledge_base.id,
++        tenant_id=knowledge_base.tenant_id,
+         slug=knowledge_base.slug,
+         name=knowledge_base.name,
+         description=knowledge_base.description,
+@@ -249,8 +256,13 @@ async def _delete_objects(documents: list[Document]) -> None:
+ @router.get("", response_model=list[KnowledgeBaseOut])
+ async def list_knowledge_bases(
+     db: AsyncSession = Depends(get_db),
++    principal: Principal = Depends(get_current_principal),
+ ) -> list[KnowledgeBaseOut]:
+-    result = await db.execute(select(KnowledgeBase).order_by(KnowledgeBase.name))
++    result = await db.execute(
++        select(KnowledgeBase)
++        .where(KnowledgeBase.tenant_id == principal.tenant_id)
++        .order_by(KnowledgeBase.name)
++    )
+     return [await _knowledge_base_out(db, knowledge_base) for knowledge_base in result.scalars()]
+ 
+ 
+@@ -258,15 +270,23 @@ async def list_knowledge_bases(
+ async def create_knowledge_base(
+     payload: KnowledgeBaseCreate,
+     db: AsyncSession = Depends(get_db),
++    principal: Principal = Depends(get_current_principal),
+ ) -> KnowledgeBaseOut:
++    require_tenant_admin(principal)
+     name = payload.name.strip()
+     slug = _normalise_slug(payload.slug, name)
+-    existing = await db.scalar(select(KnowledgeBase.id).where(KnowledgeBase.slug == slug))
++    existing = await db.scalar(
++        select(KnowledgeBase.id).where(
++            KnowledgeBase.tenant_id == principal.tenant_id,
++            KnowledgeBase.slug == slug,
++        )
++    )
+     if existing is not None:
+         raise HTTPException(status_code=409, detail="Knowledge base slug already exists")
+ 
+     knowledge_base = KnowledgeBase(
+         id=uuid.uuid4(),
++        tenant_id=principal.tenant_id,
+         slug=slug,
+         name=name,
+         description=payload.description,
+@@ -284,8 +304,10 @@ async def update_knowledge_base(
+     knowledge_base_id: uuid.UUID,
+     payload: KnowledgeBaseUpdate,
+     db: AsyncSession = Depends(get_db),
++    principal: Principal = Depends(get_current_principal),
+ ) -> KnowledgeBaseOut:
+-    knowledge_base = await _get_knowledge_base(db, knowledge_base_id)
++    require_tenant_admin(principal)
++    knowledge_base = await _get_knowledge_base(db, knowledge_base_id, principal)
+     updates = payload.model_dump(exclude_unset=True)
+     if "name" in updates and updates["name"] is not None:
+         knowledge_base.name = updates["name"].strip()
+@@ -302,8 +324,10 @@ async def update_knowledge_base(
+ async def delete_knowledge_base(
+     knowledge_base_id: uuid.UUID,
+     db: AsyncSession = Depends(get_db),
++    principal: Principal = Depends(get_current_principal),
+ ) -> Response:
+-    knowledge_base = await _get_knowledge_base(db, knowledge_base_id)
++    require_tenant_admin(principal)
++    knowledge_base = await _get_knowledge_base(db, knowledge_base_id, principal)
+     workspace_count = int(
+         await db.scalar(
+             select(func.count(Workspace.id)).where(
+@@ -343,8 +367,9 @@ async def delete_knowledge_base(
+ async def list_knowledge_base_versions(
+     knowledge_base_id: uuid.UUID,
+     db: AsyncSession = Depends(get_db),
++    principal: Principal = Depends(get_current_principal),
+ ) -> list[KnowledgeBaseVersionOut]:
+-    await _get_knowledge_base(db, knowledge_base_id)
++    await _get_knowledge_base(db, knowledge_base_id, principal)
+     result = await db.execute(
+         select(KnowledgeBaseVersion)
+         .where(KnowledgeBaseVersion.knowledge_base_id == knowledge_base_id)
+@@ -368,8 +393,10 @@ async def create_knowledge_base_version(
+     knowledge_base_id: uuid.UUID,
+     payload: KnowledgeBaseVersionCreate,
+     db: AsyncSession = Depends(get_db),
++    principal: Principal = Depends(get_current_principal),
+ ) -> KnowledgeBaseVersionOut:
+-    await _get_knowledge_base(db, knowledge_base_id)
++    require_tenant_admin(principal)
++    await _get_knowledge_base(db, knowledge_base_id, principal)
+     embedding_model = payload.embedding_model or settings.embedding_model
+     embedding_dimension = payload.embedding_dimension or settings.embedding_dim
+     chunker_version = payload.chunker_version or DEFAULT_CHUNKER_VERSION
+@@ -408,9 +435,11 @@ async def delete_knowledge_base_version(
+     knowledge_base_id: uuid.UUID,
+     version_id: uuid.UUID,
+     db: AsyncSession = Depends(get_db),
++    principal: Principal = Depends(get_current_principal),
+ ) -> Response:
+-    knowledge_base = await _get_knowledge_base(db, knowledge_base_id)
+-    version = await _get_version(db, knowledge_base_id, version_id)
++    require_tenant_admin(principal)
++    knowledge_base = await _get_knowledge_base(db, knowledge_base_id, principal)
++    version = await _get_version(db, knowledge_base_id, version_id, principal)
+     if knowledge_base.active_version_id == version.id or version.status == "ACTIVE":
+         raise HTTPException(status_code=409, detail="The active version cannot be deleted")
+ 
+@@ -434,9 +463,11 @@ async def publish_knowledge_base_version(
+     knowledge_base_id: uuid.UUID,
+     version_id: uuid.UUID,
+     db: AsyncSession = Depends(get_db),
++    principal: Principal = Depends(get_current_principal),
+ ) -> KnowledgeBaseOut:
+-    knowledge_base = await _get_knowledge_base(db, knowledge_base_id)
+-    version = await _get_version(db, knowledge_base_id, version_id)
++    require_tenant_admin(principal)
++    knowledge_base = await _get_knowledge_base(db, knowledge_base_id, principal)
++    version = await _get_version(db, knowledge_base_id, version_id, principal)
+     await _synchronize_version_status(db, version)
+ 
+     documents = await _version_documents(db, version.id)
+@@ -474,8 +505,9 @@ async def list_knowledge_base_documents(
+     knowledge_base_id: uuid.UUID,
+     version_id: uuid.UUID,
+     db: AsyncSession = Depends(get_db),
++    principal: Principal = Depends(get_current_principal),
+ ) -> list[KnowledgeBaseDocumentOut]:
+-    version = await _get_version(db, knowledge_base_id, version_id)
++    version = await _get_version(db, knowledge_base_id, version_id, principal)
+     if await _synchronize_version_status(db, version):
+         await db.commit()
+     return await _version_documents(db, version.id)
+@@ -491,8 +523,10 @@ async def upload_knowledge_base_document(
+     version_id: uuid.UUID,
+     file: UploadFile = File(...),
+     db: AsyncSession = Depends(get_db),
++    principal: Principal = Depends(get_current_principal),
+ ) -> KnowledgeBaseDocumentOut:
+-    version = await _get_version(db, knowledge_base_id, version_id)
++    require_tenant_admin(principal)
++    version = await _get_version(db, knowledge_base_id, version_id, principal)
+     await _ensure_editable_version(version)
+ 
+     if not file.filename:
+@@ -610,8 +644,10 @@ async def reindex_knowledge_base_document(
+     version_id: uuid.UUID,
+     document_id: uuid.UUID,
+     db: AsyncSession = Depends(get_db),
++    principal: Principal = Depends(get_current_principal),
+ ) -> KnowledgeBaseDocumentOut:
+-    version = await _get_version(db, knowledge_base_id, version_id)
++    require_tenant_admin(principal)
++    version = await _get_version(db, knowledge_base_id, version_id, principal)
+     await _ensure_editable_version(version)
+     document = await db.get(Document, document_id)
+     if document is None or document.knowledge_base_version_id != version.id:
+@@ -654,8 +690,10 @@ async def update_knowledge_base_document(
+     document_id: uuid.UUID,
+     payload: KnowledgeBaseDocumentUpdate,
+     db: AsyncSession = Depends(get_db),
++    principal: Principal = Depends(get_current_principal),
+ ) -> KnowledgeBaseDocumentOut:
+-    version = await _get_version(db, knowledge_base_id, version_id)
++    require_tenant_admin(principal)
++    version = await _get_version(db, knowledge_base_id, version_id, principal)
+     await _ensure_editable_version(version)
+     document = await db.get(Document, document_id)
+     if document is None or document.knowledge_base_version_id != version.id:
+@@ -677,8 +715,10 @@ async def delete_knowledge_base_document(
+     version_id: uuid.UUID,
+     document_id: uuid.UUID,
+     db: AsyncSession = Depends(get_db),
++    principal: Principal = Depends(get_current_principal),
+ ) -> Response:
+-    version = await _get_version(db, knowledge_base_id, version_id)
++    require_tenant_admin(principal)
++    version = await _get_version(db, knowledge_base_id, version_id, principal)
+     await _ensure_editable_version(version)
+     document = await db.get(Document, document_id)
+     if document is None or document.knowledge_base_version_id != version.id:
+diff --git a/apps/api/app/api/routes/search.py b/apps/api/app/api/routes/search.py
+index d902239..31d9772 100644
+--- a/apps/api/app/api/routes/search.py
++++ b/apps/api/app/api/routes/search.py
+@@ -9,8 +9,10 @@ from pydantic import BaseModel, Field
+ from sqlalchemy import text
+ from sqlalchemy.ext.asyncio import AsyncSession
+ 
++from app.core.access import workspace_for_principal
+ from app.core.config import settings
+-from app.db.models import KnowledgeBase, KnowledgeBaseVersion, Workspace
++from app.core.security import Principal, get_current_principal
++from app.db.models import KnowledgeBase, KnowledgeBaseVersion
+ from app.db.session import get_db
+ from app.services.embeddings import EmbeddingError, embeddings
+ from app.services.reranker import RerankError, reranker
+@@ -37,8 +39,27 @@ DOCUMENT_TITLE_RE = re.compile(
+ URL_OR_EMAIL_RE = re.compile(r"(?:https?://|www\.|\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,})", re.IGNORECASE)
+ WORD_RE = re.compile(r"[0-9A-Za-zА-Яа-яЁё]+(?:[.\-][0-9A-Za-zА-Яа-яЁё]+)*")
+ QUERY_STOP_WORDS = {
+-    "что", "такое", "какой", "какая", "какие", "как", "для", "чего", "это", "есть",
+-    "или", "его", "ее", "её", "про", "при", "под", "над", "где", "когда", "зачем",
++    "что",
++    "такое",
++    "какой",
++    "какая",
++    "какие",
++    "как",
++    "для",
++    "чего",
++    "это",
++    "есть",
++    "или",
++    "его",
++    "ее",
++    "её",
++    "про",
++    "при",
++    "под",
++    "над",
++    "где",
++    "когда",
++    "зачем",
+ }
+ 
+ 
+@@ -160,8 +181,7 @@ def _focused_excerpt(value: str, query: str, max_chars: int) -> str:
+         score = float(overlap)
+         lowered = paragraph.casefold()
+         if query.casefold().startswith("что такое") and any(
+-            marker in lowered
+-            for marker in (" — это ", " это ", "предназначен", "предназначена")
++            marker in lowered for marker in (" — это ", " это ", "предназначен", "предназначена")
+         ):
+             score += 1.5
+         return score, -len(paragraph)
+@@ -238,10 +258,9 @@ async def search(
+     workspace_id: uuid.UUID,
+     payload: SearchRequest,
+     db: AsyncSession = Depends(get_db),
++    principal: Principal = Depends(get_current_principal),
+ ) -> SearchResponse:
+-    workspace = await db.get(Workspace, workspace_id)
+-    if workspace is None:
+-        raise HTTPException(status_code=404, detail="Workspace not found")
++    workspace = await workspace_for_principal(db, workspace_id, principal)
+ 
+     source_mode = WorkspaceSourceMode(workspace.source_mode)
+     include_workspace = includes_workspace_documents(source_mode)
+@@ -250,6 +269,8 @@ async def search(
+     active_version: KnowledgeBaseVersion | None = None
+     if workspace.base_knowledge_base_id is not None:
+         knowledge_base = await db.get(KnowledgeBase, workspace.base_knowledge_base_id)
++        if knowledge_base is not None and knowledge_base.tenant_id != principal.tenant_id:
++            knowledge_base = None
+         if knowledge_base is not None and knowledge_base.active_version_id is not None:
+             active_version = await db.get(KnowledgeBaseVersion, knowledge_base.active_version_id)
+ 
+@@ -322,6 +343,7 @@ async def search(
+                       (
+                           :include_knowledge_base
+                           AND d.knowledge_base_version_id = :knowledge_base_version_id
++                          AND kb.tenant_id = :tenant_id
+                       )
+                   )
+             ),
+@@ -440,6 +462,7 @@ async def search(
+         ),
+         {
+             "workspace_id": workspace_id,
++            "tenant_id": principal.tenant_id,
+             "include_workspace": include_workspace,
+             "include_knowledge_base": include_knowledge_base and active_version is not None,
+             "knowledge_base_version_id": (
+diff --git a/apps/api/app/api/routes/workspaces.py b/apps/api/app/api/routes/workspaces.py
+index 90ef67b..79f69ee 100644
+--- a/apps/api/app/api/routes/workspaces.py
++++ b/apps/api/app/api/routes/workspaces.py
+@@ -5,10 +5,13 @@ from datetime import UTC, datetime
+ 
+ from anyio import to_thread
+ from fastapi import APIRouter, Depends, HTTPException, Response, status
+-from pydantic import BaseModel, Field
++from pydantic import BaseModel, ConfigDict, Field
+ from sqlalchemy import func, select
+ from sqlalchemy.ext.asyncio import AsyncSession
+ 
++from app.core.access import knowledge_base_for_principal, workspace_for_principal
++from app.core.config import settings
++from app.core.security import Principal, get_current_principal
+ from app.db.models import ChatSession, Document, KnowledgeBase, KnowledgeBaseVersion, Workspace
+ from app.db.session import get_db
+ from app.services.storage import StorageError, storage
+@@ -22,10 +25,11 @@ router = APIRouter(prefix="/workspaces", tags=["workspaces"])
+ 
+ 
+ class WorkspaceCreate(BaseModel):
++    model_config = ConfigDict(extra="forbid")
++
+     name: str = Field(min_length=1, max_length=255)
+     base_knowledge_base_id: uuid.UUID | None = None
+     source_mode: WorkspaceSourceMode | None = None
+-    user_id: str | None = None
+ 
+ 
+ class WorkspaceUpdate(BaseModel):
+@@ -36,13 +40,14 @@ class WorkspaceUpdate(BaseModel):
+ 
+ class WorkspaceOut(BaseModel):
+     id: uuid.UUID
++    tenant_id: str
+     name: str
+     base_knowledge_base_id: uuid.UUID | None
+     base_knowledge_base_name: str | None
+     active_knowledge_base_version_id: uuid.UUID | None
+     active_knowledge_base_version: int | None
+     source_mode: WorkspaceSourceMode
+-    user_id: str | None
++    user_id: str
+     document_count: int
+     searchable_document_count: int
+     conversation_count: int
+@@ -53,13 +58,11 @@ class WorkspaceOut(BaseModel):
+ async def _knowledge_base(
+     db: AsyncSession,
+     knowledge_base_id: uuid.UUID | None,
++    principal: Principal,
+ ) -> KnowledgeBase | None:
+     if knowledge_base_id is None:
+         return None
+-    knowledge_base = await db.get(KnowledgeBase, knowledge_base_id)
+-    if knowledge_base is None:
+-        raise HTTPException(status_code=404, detail="Knowledge base not found")
+-    return knowledge_base
++    return await knowledge_base_for_principal(db, knowledge_base_id, principal)
+ 
+ 
+ async def _workspace_out(db: AsyncSession, workspace: Workspace) -> WorkspaceOut:
+@@ -81,11 +84,14 @@ async def _workspace_out(db: AsyncSession, workspace: Workspace) -> WorkspaceOut
+     active_version: KnowledgeBaseVersion | None = None
+     if workspace.base_knowledge_base_id is not None:
+         knowledge_base = await db.get(KnowledgeBase, workspace.base_knowledge_base_id)
++        if knowledge_base is not None and knowledge_base.tenant_id != workspace.tenant_id:
++            knowledge_base = None
+         if knowledge_base is not None and knowledge_base.active_version_id is not None:
+             active_version = await db.get(KnowledgeBaseVersion, knowledge_base.active_version_id)
+ 
+     return WorkspaceOut(
+         id=workspace.id,
++        tenant_id=workspace.tenant_id,
+         name=workspace.name,
+         base_knowledge_base_id=workspace.base_knowledge_base_id,
+         base_knowledge_base_name=knowledge_base.name if knowledge_base else None,
+@@ -113,8 +119,14 @@ def _validate_source_configuration(
+ 
+ 
+ @router.get("", response_model=list[WorkspaceOut])
+-async def list_workspaces(db: AsyncSession = Depends(get_db)) -> list[WorkspaceOut]:
+-    result = await db.execute(select(Workspace).order_by(Workspace.updated_at.desc()))
++async def list_workspaces(
++    db: AsyncSession = Depends(get_db),
++    principal: Principal = Depends(get_current_principal),
++) -> list[WorkspaceOut]:
++    query = select(Workspace).where(Workspace.tenant_id == principal.tenant_id)
++    if not principal.has_role(settings.auth_admin_role):
++        query = query.where(Workspace.user_id == principal.subject)
++    result = await db.execute(query.order_by(Workspace.updated_at.desc()))
+     return [await _workspace_out(db, workspace) for workspace in result.scalars()]
+ 
+ 
+@@ -122,16 +134,18 @@ async def list_workspaces(db: AsyncSession = Depends(get_db)) -> list[WorkspaceO
+ async def create_workspace(
+     payload: WorkspaceCreate,
+     db: AsyncSession = Depends(get_db),
++    principal: Principal = Depends(get_current_principal),
+ ) -> WorkspaceOut:
+-    knowledge_base = await _knowledge_base(db, payload.base_knowledge_base_id)
++    knowledge_base = await _knowledge_base(db, payload.base_knowledge_base_id, principal)
+     source_mode = payload.source_mode or default_source_mode(knowledge_base is not None)
+     _validate_source_configuration(source_mode, payload.base_knowledge_base_id)
+ 
+     workspace = Workspace(
++        tenant_id=principal.tenant_id,
+         name=payload.name.strip(),
+         base_knowledge_base_id=payload.base_knowledge_base_id,
+         source_mode=source_mode.value,
+-        user_id=payload.user_id,
++        user_id=principal.subject,
+     )
+     db.add(workspace)
+     await db.commit()
+@@ -144,17 +158,16 @@ async def update_workspace(
+     workspace_id: uuid.UUID,
+     payload: WorkspaceUpdate,
+     db: AsyncSession = Depends(get_db),
++    principal: Principal = Depends(get_current_principal),
+ ) -> WorkspaceOut:
+-    workspace = await db.get(Workspace, workspace_id)
+-    if workspace is None:
+-        raise HTTPException(status_code=404, detail="Workspace not found")
++    workspace = await workspace_for_principal(db, workspace_id, principal)
+ 
+     updates = payload.model_dump(exclude_unset=True)
+     next_knowledge_base_id = updates.get(
+         "base_knowledge_base_id",
+         workspace.base_knowledge_base_id,
+     )
+-    await _knowledge_base(db, next_knowledge_base_id)
++    await _knowledge_base(db, next_knowledge_base_id, principal)
+ 
+     if "source_mode" in updates and updates["source_mode"] is not None:
+         next_source_mode = WorkspaceSourceMode(updates["source_mode"])
+@@ -181,10 +194,9 @@ async def update_workspace(
+ async def delete_workspace(
+     workspace_id: uuid.UUID,
+     db: AsyncSession = Depends(get_db),
++    principal: Principal = Depends(get_current_principal),
+ ) -> Response:
+-    workspace = await db.get(Workspace, workspace_id)
+-    if workspace is None:
+-        raise HTTPException(status_code=404, detail="Workspace not found")
++    workspace = await workspace_for_principal(db, workspace_id, principal)
+ 
+     result = await db.execute(select(Document).where(Document.workspace_id == workspace_id))
+     documents = list(result.scalars())
+diff --git a/apps/api/app/core/access.py b/apps/api/app/core/access.py
+new file mode 100644
+index 0000000..97bc6f9
+--- /dev/null
++++ b/apps/api/app/core/access.py
+@@ -0,0 +1,52 @@
++"""Tenant-aware resource lookups that avoid cross-tenant existence leaks."""
++
++from __future__ import annotations
++
++import uuid
++
++from fastapi import HTTPException
++from sqlalchemy import select
++from sqlalchemy.ext.asyncio import AsyncSession
++
++from app.core.config import settings
++from app.core.security import Principal
++from app.db.models import KnowledgeBase, Workspace
++
++
++def principal_can_access_workspace(principal: Principal, workspace: Workspace) -> bool:
++    return workspace.tenant_id == principal.tenant_id and (
++        workspace.user_id == principal.subject or principal.has_role(settings.auth_admin_role)
++    )
++
++
++async def workspace_for_principal(
++    db: AsyncSession,
++    workspace_id: uuid.UUID,
++    principal: Principal,
++) -> Workspace:
++    query = select(Workspace).where(
++        Workspace.id == workspace_id,
++        Workspace.tenant_id == principal.tenant_id,
++    )
++    if not principal.has_role(settings.auth_admin_role):
++        query = query.where(Workspace.user_id == principal.subject)
++    workspace = await db.scalar(query)
++    if workspace is None or not principal_can_access_workspace(principal, workspace):
++        raise HTTPException(status_code=404, detail="Workspace not found")
++    return workspace
++
++
++async def knowledge_base_for_principal(
++    db: AsyncSession,
++    knowledge_base_id: uuid.UUID,
++    principal: Principal,
++) -> KnowledgeBase:
++    knowledge_base = await db.scalar(
++        select(KnowledgeBase).where(
++            KnowledgeBase.id == knowledge_base_id,
++            KnowledgeBase.tenant_id == principal.tenant_id,
++        )
++    )
++    if knowledge_base is None or knowledge_base.tenant_id != principal.tenant_id:
++        raise HTTPException(status_code=404, detail="Knowledge base not found")
++    return knowledge_base
+diff --git a/apps/api/app/core/config.py b/apps/api/app/core/config.py
+index 3b43361..abc9fd7 100644
+--- a/apps/api/app/core/config.py
++++ b/apps/api/app/core/config.py
+@@ -1,7 +1,21 @@
+ from functools import lru_cache
+ 
++from pydantic import Field, model_validator
+ from pydantic_settings import BaseSettings, SettingsConfigDict
+ 
++OIDC_ASYMMETRIC_ALGORITHMS = {
++    "RS256",
++    "RS384",
++    "RS512",
++    "PS256",
++    "PS384",
++    "PS512",
++    "ES256",
++    "ES384",
++    "ES512",
++    "EdDSA",
++}
++
+ 
+ class Settings(BaseSettings):
+     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+@@ -12,6 +26,20 @@ class Settings(BaseSettings):
+     api_port: int = 8000
+     web_origin: str = "http://localhost:5173"
+ 
++    auth_enabled: bool = False
++    auth_local_subject: str = "local-user"
++    auth_local_tenant: str = "local"
++    auth_admin_role: str = "rag-admin"
++    oidc_issuer: str = ""
++    oidc_audience: str = ""
++    oidc_jwks_url: str = ""
++    oidc_algorithm: str = "RS256"
++    oidc_tenant_claim: str = "tenant_id"
++    oidc_roles_claim: str = "roles"
++    oidc_jwks_cache_seconds: int = Field(default=300, gt=0, le=86_400)
++    oidc_jwks_timeout_seconds: float = Field(default=5.0, gt=0, le=30)
++    oidc_token_leeway_seconds: int = Field(default=30, ge=0, le=300)
++
+     database_url: str = "postgresql+asyncpg://rag:rag@localhost:5432/rag"
+     redis_url: str = "redis://localhost:6379/0"
+     ingestion_queue: str = "rag:ingestion"
+@@ -59,6 +87,34 @@ class Settings(BaseSettings):
+     rerank_rank_weight: float = 0.7
+     rerank_retrieval_weight: float = 0.3
+ 
++    @model_validator(mode="after")
++    def validate_authentication(self) -> "Settings":
++        if self.auth_enabled:
++            required = {
++                "OIDC_ISSUER": self.oidc_issuer,
++                "OIDC_AUDIENCE": self.oidc_audience,
++                "OIDC_JWKS_URL": self.oidc_jwks_url,
++            }
++            missing = [name for name, value in required.items() if not value.strip()]
++            if missing:
++                raise ValueError(
++                    "Authentication is enabled but required settings are missing: "
++                    + ", ".join(missing)
++                )
++        required_names = {
++            "AUTH_LOCAL_SUBJECT": self.auth_local_subject,
++            "AUTH_LOCAL_TENANT": self.auth_local_tenant,
++            "AUTH_ADMIN_ROLE": self.auth_admin_role,
++            "OIDC_TENANT_CLAIM": self.oidc_tenant_claim,
++            "OIDC_ROLES_CLAIM": self.oidc_roles_claim,
++        }
++        empty = [name for name, value in required_names.items() if not value.strip()]
++        if empty:
++            raise ValueError("Authentication settings must not be empty: " + ", ".join(empty))
++        if self.oidc_algorithm not in OIDC_ASYMMETRIC_ALGORITHMS:
++            raise ValueError("OIDC_ALGORITHM must be an approved asymmetric algorithm")
++        return self
++
+ 
+ @lru_cache
+ def get_settings() -> Settings:
+diff --git a/apps/api/app/core/security.py b/apps/api/app/core/security.py
+new file mode 100644
+index 0000000..6ee2030
+--- /dev/null
++++ b/apps/api/app/core/security.py
+@@ -0,0 +1,138 @@
++"""Authentication primitives for local development and OIDC deployments."""
++
++from __future__ import annotations
++
++from collections.abc import Mapping
++from dataclasses import dataclass
++from functools import lru_cache
++from typing import Any
++
++import jwt
++from anyio import to_thread
++from fastapi import Depends, HTTPException, status
++from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
++
++from app.core.config import Settings, settings
++
++bearer = HTTPBearer(auto_error=False)
++
++
++@dataclass(frozen=True, slots=True)
++class Principal:
++    subject: str
++    tenant_id: str
++    roles: frozenset[str]
++    claims: Mapping[str, Any]
++
++    def has_role(self, role: str) -> bool:
++        return role in self.roles
++
++
++def _unauthorized(detail: str = "Invalid or missing bearer token") -> HTTPException:
++    return HTTPException(
++        status_code=status.HTTP_401_UNAUTHORIZED,
++        detail=detail,
++        headers={"WWW-Authenticate": "Bearer"},
++    )
++
++
++def _claim_at_path(claims: Mapping[str, Any], path: str) -> Any:
++    value: Any = claims
++    for part in path.split("."):
++        if not isinstance(value, Mapping) or part not in value:
++            return None
++        value = value[part]
++    return value
++
++
++def _roles_from_claim(value: Any) -> frozenset[str]:
++    if value is None:
++        return frozenset()
++    if isinstance(value, str):
++        return frozenset(role for role in value.split() if role)
++    if isinstance(value, list) and all(isinstance(role, str) for role in value):
++        return frozenset(role.strip() for role in value if role.strip())
++    raise ValueError("OIDC roles claim must be a string or a list of strings")
++
++
++class OIDCVerifier:
++    def __init__(self, config: Settings, jwks_client: jwt.PyJWKClient | None = None) -> None:
++        self.config = config
++        self.jwks_client = jwks_client or jwt.PyJWKClient(
++            config.oidc_jwks_url,
++            cache_keys=True,
++            max_cached_keys=16,
++            cache_jwk_set=True,
++            lifespan=config.oidc_jwks_cache_seconds,
++            timeout=config.oidc_jwks_timeout_seconds,
++        )
++
++    def verify(self, token: str) -> Principal:
++        signing_key = self.jwks_client.get_signing_key_from_jwt(token)
++        claims = jwt.decode(
++            token,
++            signing_key.key,
++            algorithms=[self.config.oidc_algorithm],
++            audience=self.config.oidc_audience,
++            issuer=self.config.oidc_issuer,
++            leeway=self.config.oidc_token_leeway_seconds,
++            options={"require": ["exp", "iat", "sub"]},
++        )
++        subject = claims.get("sub")
++        tenant_id = _claim_at_path(claims, self.config.oidc_tenant_claim)
++        if not isinstance(subject, str) or not subject.strip() or len(subject) > 255:
++            raise ValueError("OIDC subject claim is missing or invalid")
++        if not isinstance(tenant_id, str) or not tenant_id.strip() or len(tenant_id) > 255:
++            raise ValueError("OIDC tenant claim is missing or invalid")
++        roles = _roles_from_claim(_claim_at_path(claims, self.config.oidc_roles_claim))
++        return Principal(
++            subject=subject.strip(),
++            tenant_id=tenant_id.strip(),
++            roles=roles,
++            claims=claims,
++        )
++
++
++@lru_cache
++def get_oidc_verifier() -> OIDCVerifier:
++    return OIDCVerifier(settings)
++
++
++def local_principal() -> Principal:
++    return Principal(
++        subject=settings.auth_local_subject.strip(),
++        tenant_id=settings.auth_local_tenant.strip(),
++        roles=frozenset({settings.auth_admin_role}),
++        claims={"auth_mode": "local"},
++    )
++
++
++async def get_current_principal(
++    credentials: HTTPAuthorizationCredentials | None = Depends(bearer),
++) -> Principal:
++    if not settings.auth_enabled:
++        return local_principal()
++    if credentials is None or credentials.scheme.casefold() != "bearer":
++        raise _unauthorized()
++    if len(credentials.credentials) > 16_384:
++        raise _unauthorized()
++    try:
++        return await to_thread.run_sync(
++            get_oidc_verifier().verify,
++            credentials.credentials,
++        )
++    except jwt.PyJWKClientConnectionError as exc:
++        raise HTTPException(
++            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
++            detail="Identity provider signing keys are unavailable",
++        ) from exc
++    except (jwt.PyJWTError, ValueError) as exc:
++        raise _unauthorized() from exc
++
++
++def require_tenant_admin(principal: Principal) -> None:
++    if not principal.has_role(settings.auth_admin_role):
++        raise HTTPException(
++            status_code=status.HTTP_403_FORBIDDEN,
++            detail="Tenant administrator role is required",
++        )
+diff --git a/apps/api/app/db/models.py b/apps/api/app/db/models.py
+index 84ec8a4..c0fddbd 100644
+--- a/apps/api/app/db/models.py
++++ b/apps/api/app/db/models.py
+@@ -4,7 +4,17 @@ import uuid
+ from datetime import datetime
+ 
+ from pgvector.sqlalchemy import Vector
+-from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Integer, String, Text, func
++from sqlalchemy import (
++    JSON,
++    Boolean,
++    DateTime,
++    ForeignKey,
++    Integer,
++    String,
++    Text,
++    UniqueConstraint,
++    func,
++)
+ from sqlalchemy.dialects.postgresql import TSVECTOR, UUID
+ from sqlalchemy.orm import Mapped, mapped_column
+ 
+@@ -13,9 +23,11 @@ from app.db.base import Base
+ 
+ class KnowledgeBase(Base):
+     __tablename__ = "knowledge_bases"
++    __table_args__ = (UniqueConstraint("tenant_id", "slug", name="uq_kb_tenant_slug"),)
+ 
+     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+-    slug: Mapped[str] = mapped_column(String(120), unique=True, nullable=False)
++    tenant_id: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
++    slug: Mapped[str] = mapped_column(String(120), nullable=False)
+     name: Mapped[str] = mapped_column(String(255), nullable=False)
+     description: Mapped[str | None] = mapped_column(Text)
+     active_version_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+@@ -41,8 +53,9 @@ class Workspace(Base):
+     __tablename__ = "workspaces"
+ 
+     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
++    tenant_id: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+     name: Mapped[str] = mapped_column(String(255), nullable=False)
+-    user_id: Mapped[str | None] = mapped_column(String(255))
++    user_id: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+     base_knowledge_base_id: Mapped[uuid.UUID | None] = mapped_column(
+         ForeignKey("knowledge_bases.id", ondelete="SET NULL")
+     )
+diff --git a/apps/api/pyproject.toml b/apps/api/pyproject.toml
+index ed655f4..bbec9bc 100644
+--- a/apps/api/pyproject.toml
++++ b/apps/api/pyproject.toml
+@@ -10,6 +10,7 @@ dependencies = [
+   "httpx>=0.28,<1",
+   "minio>=7.2,<8",
+   "pgvector>=0.4,<1",
++  "pyjwt[crypto]>=2.10,<3",
+   "pydantic-settings>=2.7,<3",
+   "python-multipart>=0.0.20,<1",
+   "redis>=5.2,<7",
+diff --git a/apps/api/tests/test_document_management.py b/apps/api/tests/test_document_management.py
+index c11f774..aca85bf 100644
+--- a/apps/api/tests/test_document_management.py
++++ b/apps/api/tests/test_document_management.py
+@@ -7,18 +7,36 @@ from fastapi import HTTPException
+ 
+ from app.api.routes import documents
+ from app.api.routes.documents import DocumentUpdate
+-from app.db.models import Document
++from app.core.security import Principal
++from app.db.models import Document, Workspace
+ 
+ 
+ class FakeSession:
+     def __init__(self, document: Document | None) -> None:
+         self.document = document
++        self.workspace = (
++            Workspace(
++                id=document.workspace_id,
++                tenant_id="tenant-a",
++                user_id="user-a",
++                name="Test",
++                base_knowledge_base_id=None,
++                source_mode="USER_DOCUMENTS",
++            )
++            if document is not None
++            else None
++        )
+         self.committed = False
+         self.deleted: Document | None = None
+ 
+-    async def get(self, _model, _document_id):
++    async def get(self, model, _document_id):
++        if model is Workspace:
++            return self.workspace
+         return self.document
+ 
++    async def scalar(self, _query):
++        return self.workspace
++
+     async def commit(self) -> None:
+         self.committed = True
+ 
+@@ -44,6 +62,15 @@ def _document(*, status: str = "READY", search_enabled: bool = True) -> Document
+     )
+ 
+ 
++def _principal() -> Principal:
++    return Principal(
++        subject="user-a",
++        tenant_id="tenant-a",
++        roles=frozenset(),
++        claims={},
++    )
++
++
+ def test_document_can_be_excluded_and_returned_to_search() -> None:
+     document = _document()
+     db = FakeSession(document)
+@@ -54,6 +81,7 @@ def test_document_can_be_excluded_and_returned_to_search() -> None:
+             document.id,
+             DocumentUpdate(search_enabled=False),
+             db,
++            _principal(),
+         )
+     )
+ 
+@@ -67,6 +95,7 @@ def test_document_can_be_excluded_and_returned_to_search() -> None:
+             document.id,
+             DocumentUpdate(search_enabled=True),
+             db,
++            _principal(),
+         )
+     )
+ 
+@@ -85,6 +114,7 @@ def test_non_ready_document_cannot_be_enabled_for_search() -> None:
+                 document.id,
+                 DocumentUpdate(search_enabled=True),
+                 db,
++                _principal(),
+             )
+         )
+ 
+@@ -103,6 +133,7 @@ def test_delete_removes_object_before_database_row(monkeypatch: pytest.MonkeyPat
+             document.workspace_id,
+             document.id,
+             db,
++            _principal(),
+         )
+     )
+ 
+@@ -124,6 +155,7 @@ def test_processing_document_cannot_be_deleted(monkeypatch: pytest.MonkeyPatch)
+                 document.workspace_id,
+                 document.id,
+                 db,
++                _principal(),
+             )
+         )
+ 
+diff --git a/apps/api/tests/test_security.py b/apps/api/tests/test_security.py
+new file mode 100644
+index 0000000..8fb75bc
+--- /dev/null
++++ b/apps/api/tests/test_security.py
+@@ -0,0 +1,172 @@
++from __future__ import annotations
++
++import asyncio
++from datetime import UTC, datetime, timedelta
++from types import SimpleNamespace
++
++import jwt
++import pytest
++from cryptography.hazmat.primitives.asymmetric import rsa
++from fastapi import HTTPException
++from fastapi.testclient import TestClient
++from pydantic import ValidationError
++
++from app.api.routes.workspaces import WorkspaceCreate
++from app.core.access import principal_can_access_workspace, workspace_for_principal
++from app.core.config import Settings, settings
++from app.core.security import OIDCVerifier, Principal
++from app.db.models import Workspace
++from app.main import app
++
++
++class FakeJWKClient:
++    def __init__(self, key) -> None:
++        self.key = key
++
++    def get_signing_key_from_jwt(self, _token: str):
++        return SimpleNamespace(key=self.key)
++
++
++class FakeSession:
++    def __init__(self, workspace: Workspace | None) -> None:
++        self.workspace = workspace
++
++    async def scalar(self, _query):
++        return self.workspace
++
++
++def _principal(subject: str, tenant: str, *roles: str) -> Principal:
++    return Principal(
++        subject=subject,
++        tenant_id=tenant,
++        roles=frozenset(roles),
++        claims={},
++    )
++
++
++def _workspace(subject: str = "user-a", tenant: str = "tenant-a") -> Workspace:
++    return Workspace(
++        tenant_id=tenant,
++        user_id=subject,
++        name="Workspace",
++        base_knowledge_base_id=None,
++        source_mode="USER_DOCUMENTS",
++        created_at=datetime.now(UTC),
++        updated_at=datetime.now(UTC),
++    )
++
++
++def _auth_settings() -> Settings:
++    return Settings(
++        _env_file=None,
++        auth_enabled=True,
++        oidc_issuer="https://identity.example.com",
++        oidc_audience="rag-api",
++        oidc_jwks_url="https://identity.example.com/jwks",
++        oidc_algorithm="RS256",
++        oidc_tenant_claim="organization.id",
++        oidc_roles_claim="realm_access.roles",
++    )
++
++
++def test_symmetric_oidc_algorithm_is_rejected() -> None:
++    with pytest.raises(ValueError, match="asymmetric"):
++        Settings(_env_file=None, oidc_algorithm="HS256")
++
++
++def test_oidc_verifier_validates_identity_tenant_and_roles() -> None:
++    config = _auth_settings()
++    now = datetime.now(UTC)
++    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
++    token = jwt.encode(
++        {
++            "sub": "user-a",
++            "organization": {"id": "tenant-a"},
++            "realm_access": {"roles": ["rag-admin", "employee"]},
++            "iss": config.oidc_issuer,
++            "aud": config.oidc_audience,
++            "iat": now,
++            "exp": now + timedelta(minutes=5),
++        },
++        private_key,
++        algorithm="RS256",
++    )
++
++    principal = OIDCVerifier(config, FakeJWKClient(private_key.public_key())).verify(token)
++
++    assert principal.subject == "user-a"
++    assert principal.tenant_id == "tenant-a"
++    assert principal.roles == frozenset({"rag-admin", "employee"})
++
++
++def test_oidc_verifier_rejects_missing_tenant_claim() -> None:
++    config = _auth_settings()
++    now = datetime.now(UTC)
++    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
++    token = jwt.encode(
++        {
++            "sub": "user-a",
++            "iss": config.oidc_issuer,
++            "aud": config.oidc_audience,
++            "iat": now,
++            "exp": now + timedelta(minutes=5),
++        },
++        private_key,
++        algorithm="RS256",
++    )
++
++    with pytest.raises(ValueError, match="tenant claim"):
++        OIDCVerifier(config, FakeJWKClient(private_key.public_key())).verify(token)
++
++
++def test_workspace_access_is_scoped_to_owner_and_tenant() -> None:
++    workspace = _workspace()
++
++    assert principal_can_access_workspace(_principal("user-a", "tenant-a"), workspace)
++    assert not principal_can_access_workspace(_principal("user-b", "tenant-a"), workspace)
++    assert not principal_can_access_workspace(
++        _principal("admin", "tenant-b", settings.auth_admin_role),
++        workspace,
++    )
++    assert principal_can_access_workspace(
++        _principal("admin", "tenant-a", settings.auth_admin_role),
++        workspace,
++    )
++
++
++def test_workspace_owner_cannot_be_supplied_by_client() -> None:
++    with pytest.raises(ValidationError, match="user_id"):
++        WorkspaceCreate.model_validate({"name": "Workspace", "user_id": "attacker"})
++
++
++def test_cross_tenant_workspace_lookup_returns_not_found() -> None:
++    db = FakeSession(_workspace())
++    with pytest.raises(HTTPException) as exc_info:
++        asyncio.run(
++            workspace_for_principal(
++                db,
++                db.workspace.id,
++                _principal("admin", "tenant-b", settings.auth_admin_role),
++            )
++        )
++    assert exc_info.value.status_code == 404
++
++
++def test_local_auth_me_preserves_development_workflow() -> None:
++    client = TestClient(app)
++    response = client.get("/api/v1/auth/me")
++    assert response.status_code == 200
++    assert response.json() == {
++        "subject": settings.auth_local_subject,
++        "tenant_id": settings.auth_local_tenant,
++        "roles": [settings.auth_admin_role],
++        "auth_enabled": False,
++    }
++
++
++def test_enabled_auth_requires_bearer_token(monkeypatch: pytest.MonkeyPatch) -> None:
++    monkeypatch.setattr(settings, "auth_enabled", True)
++    client = TestClient(app)
++    response = client.get("/api/v1/auth/me")
++    assert response.status_code == 401
++    assert response.headers["www-authenticate"] == "Bearer"
+diff --git a/apps/api/uv.lock b/apps/api/uv.lock
+index 89bbdf6..65de5a5 100644
+--- a/apps/api/uv.lock
++++ b/apps/api/uv.lock
+@@ -249,6 +249,56 @@ wheels = [
+     { url = "https://files.pythonhosted.org/packages/d1/d6/3965ed04c63042e047cb6a3e6ed1a63a35087b6a609aa3a15ed8ac56c221/colorama-0.4.6-py2.py3-none-any.whl", hash = "sha256:4f1d9991f5acc0ca119f9d443620b77f9d6b33703e51011c16baf57afb285fc6", size = 25335, upload-time = "2022-10-25T02:36:20.889Z" },
+ ]
+ 
++[[package]]
++name = "cryptography"
++version = "50.0.0"
++source = { registry = "https://pypi.org/simple" }
++dependencies = [
++    { name = "cffi", marker = "platform_python_implementation != 'PyPy'" },
++]
++sdist = { url = "https://files.pythonhosted.org/packages/de/41/6cbdcf9142d00fe82836fbb51e503e58088575cf7a0fe1dbff6695bf0840/cryptography-50.0.0.tar.gz", hash = "sha256:eeac2acb5a20ed25e0ad6d1df9891a520b78b404266b6d11778f25d5d691a6c9", size = 880201, upload-time = "2026-07-31T14:25:10.11Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/c5/5c/59086b4aac5e879d38ddbcf74e4be7ade89cebc3eb199a55da998c3bb46a/cryptography-50.0.0-cp311-abi3-macosx_11_0_arm64.whl", hash = "sha256:031e2d5dd4bb9caa3ca9c82e5a197fd8ae680232cee62603d1a813f3f07e3d03", size = 4001252, upload-time = "2026-07-31T14:23:33.331Z" },
++    { url = "https://files.pythonhosted.org/packages/57/ef/8f2df13c7216bcad3e1c74e07f6e193d93e998e114f524a53877c9af27ad/cryptography-50.0.0-cp311-abi3-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:fd9192b7b70c573d7f214eb1ae35e00d359f6f5e4b27c7e21e30de1fc6204645", size = 4719554, upload-time = "2026-07-31T14:23:35.611Z" },
++    { url = "https://files.pythonhosted.org/packages/d9/41/029086c34d91052fc3b88bcc8056f709a7c915c7a23b235a54eb800b1c97/cryptography-50.0.0-cp311-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:06a32a980526a6ab9a4b9bf8f7385800791e2bb960903cb6b530e4817509a3b7", size = 4702130, upload-time = "2026-07-31T14:23:37.635Z" },
++    { url = "https://files.pythonhosted.org/packages/7d/ff/b6ce0954962e7f7b969f850a883744197bb3910bdfd7b6da162eab7d9f68/cryptography-50.0.0-cp311-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:a1b30560f2acc95aa8b2e06e716a13dbfc97314747b80d9707e307f77b40d6b3", size = 4725244, upload-time = "2026-07-31T14:23:39.471Z" },
++    { url = "https://files.pythonhosted.org/packages/06/1e/63a1027cb7fec360a182208e1b7767d5aa1fe57be3d6aa856e69a321edc0/cryptography-50.0.0-cp311-abi3-manylinux_2_28_ppc64le.whl", hash = "sha256:8d89f3976b10b4ce31118de72329025f70d2c6ead14a8217c5514dd2c6d5a78f", size = 5342265, upload-time = "2026-07-31T14:23:41.286Z" },
++    { url = "https://files.pythonhosted.org/packages/6b/72/a1116d683a6d7ece94590013882515de087edf9ef0e6292aae615a44df73/cryptography-50.0.0-cp311-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:b42a28c1844fd9de8f3f7d540e36b66f3a9c83fceac7170ebc7a6a19edd9dcae", size = 4734609, upload-time = "2026-07-31T14:23:43.139Z" },
++    { url = "https://files.pythonhosted.org/packages/15/37/36a9c479bbe49acea2636c7fd3360d20f7b7e079c300352011c44850b181/cryptography-50.0.0-cp311-abi3-manylinux_2_31_armv7l.whl", hash = "sha256:900131fafd8aead39ac7dd3a7e833be754c17a95cfd91221636949fe4eb0aa8a", size = 4356517, upload-time = "2026-07-31T14:23:44.939Z" },
++    { url = "https://files.pythonhosted.org/packages/32/98/8a151d64367204cbc63ec65d37502f1d9c53cf4bfc6ec3c532614dbec60d/cryptography-50.0.0-cp311-abi3-manylinux_2_34_aarch64.whl", hash = "sha256:07949c449a1abcf60d1ee6e88956d89404c7df3c8258f46589e912988e551987", size = 4724529, upload-time = "2026-07-31T14:23:46.93Z" },
++    { url = "https://files.pythonhosted.org/packages/22/f6/ec13b470172126464a86bf54d2294a46d29837fc51ba3e45d4047946fb5e/cryptography-50.0.0-cp311-abi3-manylinux_2_34_ppc64le.whl", hash = "sha256:f89831ef99dd7dd169ab06d63a831adb9e20a87aac6d380266bbda5823349169", size = 5299852, upload-time = "2026-07-31T14:23:48.851Z" },
++    { url = "https://files.pythonhosted.org/packages/da/3a/f05e32c99d440c9bb891ea0e36c9091891e36be5a9a87ab2ee6ea20729f6/cryptography-50.0.0-cp311-abi3-manylinux_2_34_x86_64.whl", hash = "sha256:82148ec5bddac30b51a5b3c1945075f896fa022cb93f8e4a01e9f6ee95292c5f", size = 4734462, upload-time = "2026-07-31T14:23:50.861Z" },
++    { url = "https://files.pythonhosted.org/packages/ca/dc/bd72b26be8953f80625f63151efd38eee71c76ca6cf591c08ff34615a79e/cryptography-50.0.0-cp311-abi3-musllinux_1_2_aarch64.whl", hash = "sha256:1489e263a8048bb8b6a8bac662eb2d402ea5d2b7b4699b72f385f1e2772db105", size = 4852708, upload-time = "2026-07-31T14:23:52.715Z" },
++    { url = "https://files.pythonhosted.org/packages/27/20/c930314a2ab476d15dec966ec87e2e9637bb02b06106b12c0396c57bb603/cryptography-50.0.0-cp311-abi3-musllinux_1_2_x86_64.whl", hash = "sha256:7cec5b856506da6defb290f30c9ee687d5f5e8cb0bd3f6459dde43b0b4fa40ef", size = 5004179, upload-time = "2026-07-31T14:23:54.887Z" },
++    { url = "https://files.pythonhosted.org/packages/32/2e/c9db68a0c4bfa28e310707527c0ee3a2bd254104d2e02e68f368e197aa4c/cryptography-50.0.0-cp311-abi3-win_amd64.whl", hash = "sha256:bd1c592e4d5974f0d08d4888e432157adba757c66da0246918e43677fafa2d30", size = 3840395, upload-time = "2026-07-31T14:23:56.677Z" },
++    { url = "https://files.pythonhosted.org/packages/c3/fb/951032a3bf22a5697c83183fb6294a4843772947a70e616c57b3ff5f522e/cryptography-50.0.0-cp314-cp314t-macosx_11_0_arm64.whl", hash = "sha256:49e7d93abdbd2990caced757e5fade25302f719c3c8fb6e6fff2dde98999fc41", size = 3989258, upload-time = "2026-07-31T14:23:58.881Z" },
++    { url = "https://files.pythonhosted.org/packages/d4/67/91eb047e69c5e845f2f14b8a2e4a1aab0f283cb885531e9e22c8adb176bc/cryptography-50.0.0-cp314-cp314t-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:19736989797678c6af1e55cd49055cdbcb55d8f6b5583ac5335f933aba9101dc", size = 4700648, upload-time = "2026-07-31T14:24:00.702Z" },
++    { url = "https://files.pythonhosted.org/packages/30/82/85f0f7425c856b9f96459411eb12e74ef72df9caf6f8f15bf23a33ff131f/cryptography-50.0.0-cp314-cp314t-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:80b63928fa35083b33966ce1efb70e5b9607181e49dcd1c22c8c005e319f667f", size = 4682442, upload-time = "2026-07-31T14:24:02.538Z" },
++    { url = "https://files.pythonhosted.org/packages/1a/28/b555a365adff1cca2fbe7b9e487d68a40de6bc67ff2cb587473eb43de0e7/cryptography-50.0.0-cp314-cp314t-manylinux_2_28_aarch64.whl", hash = "sha256:d58c3db7cd6eed54e6c06744db55456b65ebd7492ddeae9c1e93cfca7aa857d3", size = 4707596, upload-time = "2026-07-31T14:24:04.394Z" },
++    { url = "https://files.pythonhosted.org/packages/72/d8/f52538140cc719df62a01cf87d1c7142318d235817109d6f4054d7c352d6/cryptography-50.0.0-cp314-cp314t-manylinux_2_28_ppc64le.whl", hash = "sha256:df2a58a472f332225671c35b0a830208b86d004f82baa8530fa3782c85646533", size = 5314552, upload-time = "2026-07-31T14:24:06.31Z" },
++    { url = "https://files.pythonhosted.org/packages/38/14/6120e5bd7c5aa022ad15424ba4d5c5269d0d9448ed4d55e492ea91e3c1c4/cryptography-50.0.0-cp314-cp314t-manylinux_2_28_x86_64.whl", hash = "sha256:11b74db56cdbe3cdee6e3f6982ecb70334fa10dce99ed58bf7894aaaa3b2a037", size = 4717113, upload-time = "2026-07-31T14:24:08.349Z" },
++    { url = "https://files.pythonhosted.org/packages/fa/71/190bf38c3ee2e0f8efc9860ae100c9df4169742eef274b91e7aa1cb133b9/cryptography-50.0.0-cp314-cp314t-manylinux_2_31_armv7l.whl", hash = "sha256:f59e38625469987d7ef6d495323c55e7db6c212eaf6112267e0d3b565a2e9c9f", size = 4338580, upload-time = "2026-07-31T14:24:10.227Z" },
++    { url = "https://files.pythonhosted.org/packages/3a/63/504ccfbbe61fd8aa983f7f146399cdf034c72c2fc55f5b2dfdcdcdb20c99/cryptography-50.0.0-cp314-cp314t-manylinux_2_34_aarch64.whl", hash = "sha256:ecfed7367f965a0328cfbdd70da860f15441f002f613185668c6e6ebf5a0ac11", size = 4707038, upload-time = "2026-07-31T14:24:12.169Z" },
++    { url = "https://files.pythonhosted.org/packages/01/77/2cf79bbfc4d12ca106437a6e170d6aaa01a373e93093118aaaef0e801bd4/cryptography-50.0.0-cp314-cp314t-manylinux_2_34_ppc64le.whl", hash = "sha256:9aa87839c383bdbab6ef865787a1fb877af8dd03464c4400322726feaaadfc6d", size = 5273110, upload-time = "2026-07-31T14:24:14.38Z" },
++    { url = "https://files.pythonhosted.org/packages/e5/45/8aae2972c520145377ea3559a605a899bebe227bf070b33cdb445929a9b9/cryptography-50.0.0-cp314-cp314t-manylinux_2_34_x86_64.whl", hash = "sha256:6ba6a53445bd3cfa809ef3ef5f1589aa6ba08784a1d962bf47d0940e871dab1c", size = 4716439, upload-time = "2026-07-31T14:24:16.415Z" },
++    { url = "https://files.pythonhosted.org/packages/7b/20/4fe50b619a48c2525cc46e2dbc1ac490708d704be5d467bdaac6dc955682/cryptography-50.0.0-cp314-cp314t-musllinux_1_2_aarch64.whl", hash = "sha256:3f5735ffe4996d28b809371756219f5354864902a3b9e7c0b9ee87041209fc9c", size = 4837383, upload-time = "2026-07-31T14:24:18.553Z" },
++    { url = "https://files.pythonhosted.org/packages/92/91/3a31366e183343d3703f8995c095f5734676bd6938118047e50fcf279eb4/cryptography-50.0.0-cp314-cp314t-musllinux_1_2_x86_64.whl", hash = "sha256:1b4a266766514614f8aa60416e71f2fc6e575d36e7bdc90f644fadb2f4b75b95", size = 4985772, upload-time = "2026-07-31T14:24:20.385Z" },
++    { url = "https://files.pythonhosted.org/packages/74/9a/02ffe35b2853d121689871eb5dce862092562b3a1ed5cc98f1aaed441506/cryptography-50.0.0-cp314-cp314t-win_amd64.whl", hash = "sha256:12b9c6996425c76ea6c457ace4f3073e715b8c545add07cd1a8f3a4f90691269", size = 3816291, upload-time = "2026-07-31T14:24:22.125Z" },
++    { url = "https://files.pythonhosted.org/packages/03/37/73d005be173aff344af30e9fd2a576575cb2391a7101d9cd3842e1fa8cce/cryptography-50.0.0-cp39-abi3-macosx_11_0_arm64.whl", hash = "sha256:ccdc4a71a4dabae05de219404f9f4abc38e3b58422177ff93d0da05967dafa07", size = 4036009, upload-time = "2026-07-31T14:24:24.122Z" },
++    { url = "https://files.pythonhosted.org/packages/ff/c6/7a6202a534e32103a285b7834a120869557fe198d51d7cfe59754c8bda9c/cryptography-50.0.0-cp39-abi3-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:910e1d2668e7de9648f2bcee30e180db2a6b15c30f887d7c4c93ddf96e3992e3", size = 4745252, upload-time = "2026-07-31T14:24:26.118Z" },
++    { url = "https://files.pythonhosted.org/packages/85/4f/0fa8c2f4428198f15d9ff8d63400e27afbf94ce833f6108da1eb3753f945/cryptography-50.0.0-cp39-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:a91296cb61e8df6f86d0c19cc4068228da256bf59bf86049fbd821084565327f", size = 4728939, upload-time = "2026-07-31T14:24:27.994Z" },
++    { url = "https://files.pythonhosted.org/packages/d1/63/54dd723490ba2dc09b299682c10b38db38f159728bcaae8c591b8af2f22d/cryptography-50.0.0-cp39-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:e722f16708d854fe924790e051061f6704a472c3bac347b6fd88033ea8dd0dc5", size = 4748483, upload-time = "2026-07-31T14:24:30.254Z" },
++    { url = "https://files.pythonhosted.org/packages/1d/dd/7c77d26285cc7f6991efce64a0f5b4f9383bfa5dd8c5033003eaf7db4cdb/cryptography-50.0.0-cp39-abi3-manylinux_2_28_ppc64le.whl", hash = "sha256:d764dcf130c428ef66786f866dd750f53182bc608813489915e9fc106bb0c82f", size = 5367599, upload-time = "2026-07-31T14:24:32.457Z" },
++    { url = "https://files.pythonhosted.org/packages/46/c9/f60aed34c013f317f92817b6c171c2d22a78270fa41109bd4b08af26b194/cryptography-50.0.0-cp39-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:105110f43a471dbd0060b9c9516cb8a6a79233631a04cc2ba16f28323ac6e025", size = 4762647, upload-time = "2026-07-31T14:24:34.599Z" },
++    { url = "https://files.pythonhosted.org/packages/be/f3/f9a0173b139372c3a48ed98154b45cc6b9de17c789d5ab552e621c293609/cryptography-50.0.0-cp39-abi3-manylinux_2_31_armv7l.whl", hash = "sha256:828743d939e9629bc267b8e2d08d8bb67cd4319c771a33d4b18b22dd8fb7440a", size = 4385197, upload-time = "2026-07-31T14:24:36.647Z" },
++    { url = "https://files.pythonhosted.org/packages/d8/36/83bb81f6e569bc38e1e4a7bc80f29b46bb9601920bc455fc8e888f5d5742/cryptography-50.0.0-cp39-abi3-manylinux_2_34_aarch64.whl", hash = "sha256:2a8183b489dc1f7f80f135780fadc1108f14b31b8a40411c7a5b17425f65f28b", size = 4748095, upload-time = "2026-07-31T14:24:39.493Z" },
++    { url = "https://files.pythonhosted.org/packages/6b/16/d3008eff98c764979865834c3d386d4fd041b5f52e7f34fc29ac1a5eb515/cryptography-50.0.0-cp39-abi3-manylinux_2_34_ppc64le.whl", hash = "sha256:6e7d61120573a7f2cd94cc095f9e81f6967c61ccdf194285aa143ecec8e0b708", size = 5325948, upload-time = "2026-07-31T14:24:41.556Z" },
++    { url = "https://files.pythonhosted.org/packages/9c/f8/d97f9603efda3888187bfdb893f26c41be4735c10631d05d284ee6b047c4/cryptography-50.0.0-cp39-abi3-manylinux_2_34_x86_64.whl", hash = "sha256:37fdb0d0111f1e2ff07139dfb79f1b49531f8e213c46f1163dd7642979b58c47", size = 4762400, upload-time = "2026-07-31T14:24:43.636Z" },
++    { url = "https://files.pythonhosted.org/packages/64/a2/4615c8f7d81a00b1d6e6afe19f694e1543582349fb5f4076f6cb5dc36485/cryptography-50.0.0-cp39-abi3-musllinux_1_2_aarch64.whl", hash = "sha256:c87f62a3d3b9888ed0fdde100ec06aa61ca9cd44bad9057d1dff9a516b5f5bb9", size = 4878208, upload-time = "2026-07-31T14:24:45.522Z" },
++    { url = "https://files.pythonhosted.org/packages/d2/1a/efcfb02f91407149a0dacffffab791f7e19bf6385f63b3666dc8b5e5c9c8/cryptography-50.0.0-cp39-abi3-musllinux_1_2_x86_64.whl", hash = "sha256:65c2c3add92b45fd0709db8594536aea39c2a67af0e27ffcf049c498501140b7", size = 5037050, upload-time = "2026-07-31T14:24:47.697Z" },
++    { url = "https://files.pythonhosted.org/packages/57/30/4a22984d4f1bdfb8c054f07a92bc176b97a3134cc1d6c4b3bffb1f3688b4/cryptography-50.0.0-cp39-abi3-win_amd64.whl", hash = "sha256:d24fead1d4d076e1bfb006dcec392074a3cd8d7b4fc8a595aa64073b2b7a96ba", size = 3874135, upload-time = "2026-07-31T14:24:50.085Z" },
++]
++
+ [[package]]
+ name = "fastapi"
+ version = "0.141.1"
+@@ -693,6 +743,20 @@ wheels = [
+     { url = "https://files.pythonhosted.org/packages/f4/7e/a72dd26f3b0f4f2bf1dd8923c85f7ceb43172af56d63c7383eb62b332364/pygments-2.20.0-py3-none-any.whl", hash = "sha256:81a9e26dd42fd28a23a2d169d86d7ac03b46e2f8b59ed4698fb4785f946d0176", size = 1231151, upload-time = "2026-03-29T13:29:30.038Z" },
+ ]
+ 
++[[package]]
++name = "pyjwt"
++version = "2.13.0"
++source = { registry = "https://pypi.org/simple" }
++sdist = { url = "https://files.pythonhosted.org/packages/3b/81/58d0ac84e1ef3a3843791d6954d94c0b33d526c75eeb1efbce9d0a4c4077/pyjwt-2.13.0.tar.gz", hash = "sha256:41571c89ca91598c79e8ef18a2d07367d4810fbbd6f637794879baf1b7703423", size = 107515, upload-time = "2026-05-21T19:54:36.618Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/a3/5e/ecf12fdb62546d64385c158514e9b2b671f7832108ef2ecd2020ce0af2d1/pyjwt-2.13.0-py3-none-any.whl", hash = "sha256:66adcc2aff09b3f1bbd95fc1e1577df8ac8723c978552fd43304c8a290ac5728", size = 31274, upload-time = "2026-05-21T19:54:35.362Z" },
++]
++
++[package.optional-dependencies]
++crypto = [
++    { name = "cryptography" },
++]
++
+ [[package]]
+ name = "pytest"
+ version = "8.4.2"
+@@ -797,6 +861,7 @@ dependencies = [
+     { name = "minio" },
+     { name = "pgvector" },
+     { name = "pydantic-settings" },
++    { name = "pyjwt", extra = ["crypto"] },
+     { name = "python-multipart" },
+     { name = "redis" },
+     { name = "sqlalchemy", extra = ["asyncio"] },
+@@ -819,6 +884,7 @@ requires-dist = [
+     { name = "minio", specifier = ">=7.2,<8" },
+     { name = "pgvector", specifier = ">=0.4,<1" },
+     { name = "pydantic-settings", specifier = ">=2.7,<3" },
++    { name = "pyjwt", extras = ["crypto"], specifier = ">=2.10,<3" },
+     { name = "python-multipart", specifier = ">=0.0.20,<1" },
+     { name = "redis", specifier = ">=5.2,<7" },
+     { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0.36,<3" },
+diff --git a/apps/web/.nvmrc b/apps/web/.nvmrc
+new file mode 100644
+index 0000000..a45fd52
+--- /dev/null
++++ b/apps/web/.nvmrc
+@@ -0,0 +1 @@
++24
+diff --git a/apps/web/package-lock.json b/apps/web/package-lock.json
+index 3a5222e..a0c238b 100644
+--- a/apps/web/package-lock.json
++++ b/apps/web/package-lock.json
+@@ -17,6 +17,9 @@
+       "devDependencies": {
+         "@types/react": "latest",
+         "@types/react-dom": "latest"
++      },
++      "engines": {
++        "node": "^20.19.0 || >=22.12.0"
+       }
+     },
+     "node_modules/@oxc-project/types": {
+diff --git a/apps/web/package.json b/apps/web/package.json
+index 978648b..5751d2e 100644
+--- a/apps/web/package.json
++++ b/apps/web/package.json
+@@ -3,6 +3,9 @@
+   "private": true,
+   "version": "0.1.0",
+   "type": "module",
++  "engines": {
++    "node": "^20.19.0 || >=22.12.0"
++  },
+   "scripts": {
+     "dev": "vite",
+     "build": "tsc --noEmit && vite build",
+diff --git a/apps/web/src/App.tsx b/apps/web/src/App.tsx
+index 7828688..62bac34 100644
+--- a/apps/web/src/App.tsx
++++ b/apps/web/src/App.tsx
+@@ -17,6 +17,7 @@ type WorkspaceSourceMode = "USER_DOCUMENTS" | "KNOWLEDGE_BASE" | "HYBRID";
+ 
+ type KnowledgeBase = {
+   id: string;
++  tenant_id: string;
+   slug: string;
+   name: string;
+   description?: string | null;
+@@ -28,13 +29,14 @@ type KnowledgeBase = {
+ 
+ type Workspace = {
+   id: string;
++  tenant_id: string;
+   name: string;
+   base_knowledge_base_id: string | null;
+   base_knowledge_base_name: string | null;
+   active_knowledge_base_version_id: string | null;
+   active_knowledge_base_version: number | null;
+   source_mode: WorkspaceSourceMode;
+-  user_id: string | null;
++  user_id: string;
+   document_count: number;
+   searchable_document_count: number;
+   conversation_count: number;
+@@ -465,7 +467,6 @@ export function App() {
+               name: "Мои документы",
+               base_knowledge_base_id: null,
+               source_mode: "USER_DOCUMENTS",
+-              user_id: "local-user",
+             }),
+           });
+           workspaceItems = [await readJson<Workspace>(createResponse)];
+@@ -612,7 +613,6 @@ export function App() {
+         name,
+         base_knowledge_base_id: null,
+         source_mode: "USER_DOCUMENTS",
+-        user_id: "local-user",
+       }),
+     });
+     return readJson<Workspace>(response);
+diff --git a/docs/authentication.md b/docs/authentication.md
+new file mode 100644
+index 0000000..824d754
+--- /dev/null
++++ b/docs/authentication.md
+@@ -0,0 +1,58 @@
++# Authentication and tenant isolation
++
++The API supports two modes:
++
++- `AUTH_ENABLED=false`: isolated local development. Every request runs as
++  `AUTH_LOCAL_SUBJECT` in `AUTH_LOCAL_TENANT` with the tenant-admin role.
++- `AUTH_ENABLED=true`: every business endpoint requires a signed OIDC bearer
++  token. Health endpoints remain public.
++
++Do not expose an environment with local authentication to an untrusted network.
++
++## OIDC configuration
++
++Set at least:
++
++```env
++AUTH_ENABLED=true
++OIDC_ISSUER=https://identity.example.com/realms/company
++OIDC_AUDIENCE=rag-api
++OIDC_JWKS_URL=https://identity.example.com/realms/company/protocol/openid-connect/certs
++OIDC_ALGORITHM=RS256
++OIDC_TENANT_CLAIM=tenant_id
++OIDC_ROLES_CLAIM=roles
++AUTH_ADMIN_ROLE=rag-admin
++```
++
++Claim paths support dotted nested fields. For example, Keycloak-style roles
++can use `OIDC_ROLES_CLAIM=realm_access.roles`. The subject (`sub`), expiration
++(`exp`), issue time (`iat`), issuer, audience, signature, and configured tenant
++claim are validated. Algorithms are fixed by configuration and never selected
++from an untrusted token. Symmetric HMAC algorithms are rejected; use the
++corporate provider's asymmetric signing keys.
++
++Check the active identity:
++
++```bash
++curl -H "Authorization: Bearer $RAG_API_TOKEN" \
++  http://localhost:8000/api/v1/auth/me
++```
++
++## Authorization model
++
++- A normal user can create and access only workspaces owned by their token
++  subject and only inside their tenant.
++- A tenant administrator can access all workspaces in the same tenant and
++  manage tenant-wide knowledge bases and their versions.
++- Cross-tenant or foreign-workspace lookups return `404` to avoid exposing
++  whether a resource exists.
++- Workspace ownership is derived from the verified token. Clients cannot set
++  `user_id` when creating a workspace.
++
++Migration `0008_tenant_isolation` assigns pre-existing local data to tenant
++`local` and owner `local-user`. Reassign legacy data explicitly before enabling
++OIDC in an already shared deployment.
++
++This layer is the application authorization boundary. PostgreSQL row-level
++security, group/document ACL propagation, and frontend OIDC login are separate
++hardening steps required before a multi-tenant enterprise rollout.
+diff --git a/evaluation/README.md b/evaluation/README.md
+index 7cede80..b38bafe 100644
+--- a/evaluation/README.md
++++ b/evaluation/README.md
+@@ -120,5 +120,12 @@ make evaluate-compare \
+ 
+ Exit code `3` means that at least one comparison or quality gate failed.
+ 
++When OIDC authentication is enabled, pass a short-lived access token through
++the environment so it is not written to the report or command line:
++
++```bash
++RAG_API_TOKEN='<access-token>' make evaluate WORKSPACE_ID=<uuid>
++```
++
+ Reports are written to `evaluation/results/` and should not be committed when
+ they contain internal questions or answers.

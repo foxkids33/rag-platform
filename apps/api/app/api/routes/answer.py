@@ -14,7 +14,9 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.routes.search import SearchRequest, SearchResponse, search
+from app.core.access import workspace_for_principal
 from app.core.config import settings
+from app.core.security import Principal, get_current_principal
 from app.db.models import ChatMessage, ChatSession
 from app.db.session import SessionLocal, get_db
 from app.services.context_builder import BuiltContext, ContextSource, build_context
@@ -177,7 +179,9 @@ async def _load_conversation_history(
 ) -> tuple[ChatSession | None, list[HistoryMessage], uuid.UUID | None]:
     if conversation_id is None:
         if parent_message_id is not None:
-            raise HTTPException(status_code=400, detail="parent_message_id requires conversation_id")
+            raise HTTPException(
+                status_code=400, detail="parent_message_id requires conversation_id"
+            )
         return None, [], None
 
     conversation = await db.get(ChatSession, conversation_id)
@@ -204,7 +208,9 @@ async def _load_conversation_history(
         if parent is None:
             raise HTTPException(status_code=404, detail="Parent message not found in conversation")
         if parent.role != "assistant":
-            raise HTTPException(status_code=400, detail="Branches must continue from an assistant message")
+            raise HTTPException(
+                status_code=400, detail="Branches must continue from an assistant message"
+            )
 
     history = branch_history(
         [
@@ -248,7 +254,9 @@ async def _prepare_answer(
     workspace_id: uuid.UUID,
     payload: AnswerRequest,
     db: AsyncSession,
+    principal: Principal,
 ) -> PreparedAnswer:
+    await workspace_for_principal(db, workspace_id, principal)
     question = payload.question.strip()
     conversation, history, parent_message_id = await _load_conversation_history(
         db,
@@ -269,6 +277,7 @@ async def _prepare_answer(
             rerank=payload.rerank,
         ),
         db=db,
+        principal=principal,
     )
     context = build_context(
         retrieval_query,
@@ -342,12 +351,11 @@ def _assistant_metadata(
         "context_chars": prepared.context.char_count,
         **_quality_payload(prepared),
         "citation_valid": citation_audit.valid if citation_audit else None,
-        "cited_source_indices": (
-            citation_audit.cited_source_indices if citation_audit else []
-        ),
+        "cited_source_indices": (citation_audit.cited_source_indices if citation_audit else []),
         "invalid_citations": citation_audit.invalid_citations if citation_audit else [],
         "sources": [source.model_dump(mode="json") for source in sources],
     }
+
 
 def _touch_conversation(conversation: ChatSession, question: str) -> None:
     if not conversation.title or conversation.title == "Новый диалог":
@@ -454,8 +462,9 @@ async def answer(
     workspace_id: uuid.UUID,
     payload: AnswerRequest,
     db: AsyncSession = Depends(get_db),
+    principal: Principal = Depends(get_current_principal),
 ) -> AnswerResponse:
-    prepared = await _prepare_answer(workspace_id, payload, db)
+    prepared = await _prepare_answer(workspace_id, payload, db, principal)
     sources = _answer_sources(prepared.context.sources)
 
     if prepared.abstained:
@@ -516,7 +525,6 @@ async def answer(
     )
 
 
-
 def _sse(event: str, payload: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
@@ -526,8 +534,9 @@ async def answer_stream(
     workspace_id: uuid.UUID,
     payload: AnswerRequest,
     db: AsyncSession = Depends(get_db),
+    principal: Principal = Depends(get_current_principal),
 ) -> StreamingResponse:
-    prepared = await _prepare_answer(workspace_id, payload, db)
+    prepared = await _prepare_answer(workspace_id, payload, db, principal)
     sources = _answer_sources(prepared.context.sources)
     user_message_id = await _persist_stream_user(db, prepared)
     serialized_sources = [source.model_dump(mode="json") for source in sources]
@@ -546,11 +555,7 @@ async def answer_stream(
                 "parent_message_id": (
                     str(prepared.parent_message_id) if prepared.parent_message_id else None
                 ),
-                "model": (
-                    "retrieval-quality-gate"
-                    if prepared.abstained
-                    else settings.vllm_model
-                ),
+                "model": ("retrieval-quality-gate" if prepared.abstained else settings.vllm_model),
                 "retrieval_mode": prepared.search_response.mode,
                 "workspace_source_mode": prepared.search_response.workspace_source_mode.value,
                 "knowledge_base_id": (
