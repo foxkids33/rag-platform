@@ -78,3 +78,47 @@ def load_cases(path: str | Path) -> list[EvaluationCase]:
     if not cases:
         raise DatasetError("Dataset contains no evaluation cases")
     return cases
+
+
+def load_case_ids(path: str | Path) -> tuple[str, ...]:
+    """Read a versioned list of case ids, ignoring blank lines and comments."""
+
+    source = Path(path)
+    try:
+        lines = source.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise DatasetError(f"Cannot read case-id split {source}: {exc}") from exc
+
+    case_ids: list[str] = []
+    seen: set[str] = set()
+    for line_number, raw_line in enumerate(lines, start=1):
+        case_id = raw_line.strip()
+        if not case_id or case_id.startswith("#"):
+            continue
+        if case_id in seen:
+            raise DatasetError(
+                f"Line {line_number}: duplicate case id {case_id!r} in {source}"
+            )
+        seen.add(case_id)
+        case_ids.append(case_id)
+
+    if not case_ids:
+        raise DatasetError(f"Case-id split {source} contains no case ids")
+    return tuple(case_ids)
+
+
+def select_cases(
+    cases: list[EvaluationCase],
+    case_ids: tuple[str, ...],
+) -> list[EvaluationCase]:
+    """Select a split while preserving the canonical dataset order."""
+
+    requested = set(case_ids)
+    available = {case.id for case in cases}
+    unknown = sorted(requested - available)
+    if unknown:
+        raise DatasetError("Unknown case ids in split: " + ", ".join(unknown))
+    selected = [case for case in cases if case.id in requested]
+    if not selected:
+        raise DatasetError("Case-id split selected no evaluation cases")
+    return selected

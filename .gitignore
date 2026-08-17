@@ -24,3 +24,6 @@ dist/
 # Local data
 .storage/
 evaluation/results/
+
+# Patch hand-off artifacts
+/*.patch

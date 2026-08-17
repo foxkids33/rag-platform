@@ -8,6 +8,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+MISSING = object()
+
 HIGHER_IS_BETTER = (
     "aggregate.retrieval.recall_at_1",
     "aggregate.retrieval.recall_at_5",
@@ -50,12 +52,19 @@ def _load_json(path: Path) -> dict[str, Any]:
     return payload
 
 
-def _value(payload: dict[str, Any], path: str) -> float | None:
+def _raw_value(payload: dict[str, Any], path: str) -> Any:
     current: Any = payload
     for part in path.split("."):
         if not isinstance(current, dict) or part not in current:
-            return None
+            return MISSING
         current = current[part]
+    return current
+
+
+def _value(payload: dict[str, Any], path: str) -> float | None:
+    current = _raw_value(payload, path)
+    if current is MISSING:
+        return None
     if current is None:
         return None
     if not isinstance(current, int | float) or isinstance(current, bool):
@@ -134,6 +143,23 @@ def _gate_checks(gates: dict[str, Any], candidate: dict[str, Any]) -> list[dict[
                     "passed": passed,
                 }
             )
+    equals = gates.get("equals", {})
+    if not isinstance(equals, dict):
+        raise ComparisonError("gates.equals must be an object")
+    for path, expected in equals.items():
+        if not isinstance(path, str) or isinstance(expected, dict | list):
+            raise ComparisonError("gates.equals entries must use scalar values")
+        actual = _raw_value(candidate, path)
+        passed = actual is not MISSING and actual == expected
+        checks.append(
+            {
+                "kind": "equals",
+                "path": path,
+                "expected": expected,
+                "candidate": None if actual is MISSING else actual,
+                "passed": passed,
+            }
+        )
     return checks
 
 

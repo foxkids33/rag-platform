@@ -16,7 +16,7 @@ from uuid import UUID
 
 import httpx
 
-from app.evaluation.dataset import DatasetError, load_cases
+from app.evaluation.dataset import DatasetError, load_case_ids, load_cases, select_cases
 from app.evaluation.metrics import (
     aggregate_answer_metrics,
     aggregate_retrieval_metrics,
@@ -352,6 +352,8 @@ async def evaluate_case(
 
 async def run(args: argparse.Namespace) -> dict[str, Any]:
     cases = load_cases(args.dataset)
+    if args.case_ids is not None:
+        cases = select_cases(cases, load_case_ids(args.case_ids))
     started_at = datetime.now(UTC)
     case_results: list[dict[str, Any]] = []
     errors: list[dict[str, str]] = []
@@ -408,11 +410,13 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
             "base_url": args.base_url,
             "workspace_id": str(args.workspace_id),
             "dataset": str(args.dataset),
+            "case_ids": str(args.case_ids) if args.case_ids else None,
             "corpus": str(args.corpus) if args.corpus else None,
             "limit": args.limit,
             "mode": args.mode,
             "rerank": args.rerank,
             "answers": args.answers,
+            "case_details_included": not args.omit_case_details,
         },
         "requested_case_count": len(cases),
         "successful_case_count": len(case_results),
@@ -423,13 +427,18 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
         "breakdown": _breakdowns(case_results),
         "errors": errors,
         "warnings": warnings,
-        "cases": case_results,
+        "cases": [] if args.omit_case_details else case_results,
     }
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", type=Path, required=True)
+    parser.add_argument(
+        "--case-ids",
+        type=Path,
+        help="Optional file containing the case ids for a dev or acceptance split",
+    )
     parser.add_argument("--corpus", type=Path)
     parser.add_argument("--workspace-id", type=UUID, required=True)
     parser.add_argument("--base-url", default="http://localhost:8000")
@@ -442,7 +451,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="OIDC access token; prefer the RAG_API_TOKEN environment variable",
     )
     parser.add_argument("--answers", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--rerank", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--rerank", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument(
+        "--omit-case-details",
+        action="store_true",
+        help="Keep aggregate metrics but omit questions and per-case results",
+    )
     parser.add_argument("--fail-fast", action="store_true")
     return parser
 

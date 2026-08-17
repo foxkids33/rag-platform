@@ -1,0 +1,29 @@
+{
+  "minimum": {
+    "aggregate.retrieval.recall_at_5": 0.85,
+    "aggregate.retrieval.recall_at_10": 0.9,
+    "aggregate.retrieval.mrr": 0.53,
+    "aggregate.retrieval.ndcg_at_10": 0.62,
+    "aggregate.retrieval.balanced_abstention_accuracy": 0.5,
+    "aggregate.answer.required_fact_coverage": 0.3,
+    "aggregate.answer.exact_value_accuracy": 0.25,
+    "aggregate.answer.citation_fact_coverage": 0.28,
+    "aggregate.answer.citation_source_coverage": 0.45,
+    "aggregate.answer.citation_validity_rate": 0.4
+  },
+  "maximum": {
+    "aggregate.answer.forbidden_fact_violation_rate": 0.0,
+    "execution.rerank.application_rate": 0.0,
+    "latency.search.p95_ms": 150.0,
+    "latency.answer.p95_ms": 6000.0
+  },
+  "equals": {
+    "requested_case_count": 24,
+    "successful_case_count": 24,
+    "failed_case_count": 0,
+    "aggregate.case_count": 24,
+    "configuration.rerank": false,
+    "configuration.answers": true,
+    "configuration.case_details_included": false
+  }
+}

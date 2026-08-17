@@ -13,20 +13,33 @@ RERANK_COMPOSE := $(LOCAL_COMPOSE) \
 
 DATASET ?= /evaluation/datasets/skala-technical-reviews.v1.jsonl
 CORPUS ?= /evaluation/corpora/skala-technical-reviews.v1.json
+CASE_IDS ?=
+DEV_CASE_IDS ?= /evaluation/splits/skala-technical-reviews.v1.dev.txt
+ACCEPTANCE_CASE_IDS ?= /evaluation/splits/skala-technical-reviews.v1.acceptance.txt
 EVALUATION_OUTPUT ?= /evaluation/results/latest.json
-RERANK ?= true
+RERANK ?= false
+OMIT_CASE_DETAILS ?= false
 EVALUATION_TOKEN_ENV := $(if $(strip $(RAG_API_TOKEN)),-e RAG_API_TOKEN,)
 EVALUATION_CORPUS_ARG := $(if $(strip $(CORPUS)),--corpus "$(CORPUS)",)
+EVALUATION_CASE_IDS_ARG := $(if $(strip $(CASE_IDS)),--case-ids "$(CASE_IDS)",)
 EVALUATION_RERANK_ARG := $(if $(filter true 1 yes,$(strip $(RERANK))),--rerank,--no-rerank)
+EVALUATION_OMIT_CASE_DETAILS_ARG := $(if $(filter true 1 yes,$(strip $(OMIT_CASE_DETAILS))),--omit-case-details,)
 BASELINE ?=
 CANDIDATE ?= /evaluation/results/latest.json
 GATES ?=
 COMPARE_OUTPUT ?= /evaluation/results/comparison.json
+FAILURE_REPORT ?= /evaluation/results/skala-v1-dev-latest.json
+FAILURE_OUTPUT ?= /evaluation/results/skala-v1-dev-failures.json
+FAILURE_MARKDOWN ?= /evaluation/results/skala-v1-dev-failures.md
+DEV_GATES ?= /evaluation/quality-gates.dev-baseline.json
+ACCEPTANCE_GATES ?= /evaluation/quality-gates.acceptance-baseline.json
 COMPARE_BASELINE_ARG := $(if $(strip $(BASELINE)),--baseline "$(BASELINE)",)
 COMPARE_GATES_ARG := $(if $(strip $(GATES)),--gates "$(GATES)",)
 
 .PHONY: help local-env dev dev-docling dev-rerank dev-full down down-full logs ps ps-rerank
-.PHONY: local-build local-build-docling local-build-rerank local-build-full local-test evaluate evaluate-answers evaluate-compare
+.PHONY: local-build local-build-docling local-build-rerank local-build-full local-test
+.PHONY: evaluate evaluate-answers evaluate-dev evaluate-dev-check evaluate-acceptance evaluate-acceptance-check
+.PHONY: evaluate-splits-check evaluate-failures evaluate-compare
 .PHONY: api-test api-lint web-build smoke
 
 help:
@@ -41,6 +54,10 @@ help:
 	@echo "make local-test       - run API, worker and embedding tests in containers"
 	@echo "make evaluate WORKSPACE_ID=<uuid> - run retrieval evaluation"
 	@echo "make evaluate-answers WORKSPACE_ID=<uuid> - include LLM answers"
+	@echo "make evaluate-dev WORKSPACE_ID=<uuid> - run the 72-case tuning split"
+	@echo "make evaluate-acceptance WORKSPACE_ID=<uuid> - run the 24-case holdout"
+	@echo "make evaluate-failures - classify the latest dev failures"
+	@echo "make evaluate-splits-check - validate the 72/24 dataset partition"
 	@echo "make evaluate-compare BASELINE=<json> CANDIDATE=<json> - detect regressions"
 	@echo "make down             - stop the local stack"
 	@echo "make logs             - follow local stack logs"
@@ -105,8 +122,10 @@ evaluate:
 	$(LOCAL_COMPOSE) exec $(EVALUATION_TOKEN_ENV) api python -m app.evaluation.runner \
 		--workspace-id "$(WORKSPACE_ID)" \
 		--dataset "$(DATASET)" \
+		$(EVALUATION_CASE_IDS_ARG) \
 		$(EVALUATION_CORPUS_ARG) \
 		$(EVALUATION_RERANK_ARG) \
+		$(EVALUATION_OMIT_CASE_DETAILS_ARG) \
 		--output "$(EVALUATION_OUTPUT)"
 
 evaluate-answers:
@@ -114,10 +133,52 @@ evaluate-answers:
 	$(LOCAL_COMPOSE) exec $(EVALUATION_TOKEN_ENV) api python -m app.evaluation.runner \
 		--workspace-id "$(WORKSPACE_ID)" \
 		--dataset "$(DATASET)" \
+		$(EVALUATION_CASE_IDS_ARG) \
 		$(EVALUATION_CORPUS_ARG) \
 		$(EVALUATION_RERANK_ARG) \
+		$(EVALUATION_OMIT_CASE_DETAILS_ARG) \
 		--output "$(EVALUATION_OUTPUT)" \
 		--answers
+
+evaluate-dev:
+	$(MAKE) evaluate-answers \
+		WORKSPACE_ID="$(WORKSPACE_ID)" \
+		CASE_IDS="$(DEV_CASE_IDS)" \
+		RERANK=false \
+		EVALUATION_OUTPUT=/evaluation/results/skala-v1-dev-latest.json
+	$(MAKE) evaluate-failures
+
+evaluate-dev-check: evaluate-dev
+	$(MAKE) evaluate-compare \
+		CANDIDATE=/evaluation/results/skala-v1-dev-latest.json \
+		GATES="$(DEV_GATES)" \
+		COMPARE_OUTPUT=/evaluation/results/skala-v1-dev-comparison.json
+
+evaluate-acceptance:
+	$(MAKE) evaluate-answers \
+		WORKSPACE_ID="$(WORKSPACE_ID)" \
+		CASE_IDS="$(ACCEPTANCE_CASE_IDS)" \
+		RERANK=false \
+		OMIT_CASE_DETAILS=true \
+		EVALUATION_OUTPUT=/evaluation/results/skala-v1-acceptance-latest.json
+
+evaluate-acceptance-check: evaluate-acceptance
+	$(MAKE) evaluate-compare \
+		CANDIDATE=/evaluation/results/skala-v1-acceptance-latest.json \
+		GATES="$(ACCEPTANCE_GATES)" \
+		COMPARE_OUTPUT=/evaluation/results/skala-v1-acceptance-comparison.json
+
+evaluate-failures:
+	$(LOCAL_COMPOSE) exec api python -m app.evaluation.failures \
+		--report "$(FAILURE_REPORT)" \
+		--output "$(FAILURE_OUTPUT)" \
+		--markdown "$(FAILURE_MARKDOWN)"
+
+evaluate-splits-check:
+	$(LOCAL_COMPOSE) exec api python -m app.evaluation.splits \
+		--dataset "$(DATASET)" \
+		--dev "$(DEV_CASE_IDS)" \
+		--acceptance "$(ACCEPTANCE_CASE_IDS)"
 
 evaluate-compare:
 	@test -n "$(BASELINE)$(GATES)" || (echo "BASELINE or GATES is required" && exit 2)

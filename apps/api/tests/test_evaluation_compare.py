@@ -47,3 +47,30 @@ def test_compare_reports_checks_cited_gold_document_coverage() -> None:
         and check["passed"] is False
         for check in result["checks"]
     )
+
+
+def test_compare_reports_enforces_configuration_and_case_count() -> None:
+    candidate = _report(recall_at_5=0.90, p95_ms=100)
+    candidate.update(
+        {
+            "aggregate": {
+                **candidate["aggregate"],
+                "case_count": 24,
+            },
+            "configuration": {"rerank": False, "answers": True},
+        }
+    )
+
+    result = compare_reports(
+        candidate,
+        gates={
+            "equals": {
+                "aggregate.case_count": 24,
+                "configuration.rerank": False,
+                "configuration.answers": True,
+            }
+        },
+    )
+
+    assert result["passed"] is True
+    assert result["check_count"] == 3
