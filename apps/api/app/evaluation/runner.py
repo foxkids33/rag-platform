@@ -244,6 +244,7 @@ async def evaluate_case(
     mode: str,
     rerank: bool,
     include_answers: bool,
+    answer_temperature: float,
 ) -> dict[str, Any]:
     search_started = perf_counter()
     search_response = await client.post(
@@ -264,9 +265,11 @@ async def evaluate_case(
     retrieved_filenames = _unique([str(item["filename"]) for item in results])
 
     actual_abstention: bool | None = None
+    abstention_reason: str | None = None
     citation_valid: bool | None = None
     answer_text: str | None = None
     answer_latency_ms: float | None = None
+    generation_temperature: float | None = None
     answer_sources: list[dict[str, Any]] = []
     answer_metrics: AnswerCaseMetrics | None = None
 
@@ -279,14 +282,17 @@ async def evaluate_case(
                 "retrieval_limit": limit,
                 "mode": mode,
                 "rerank": rerank,
+                "temperature": answer_temperature,
             },
         )
         answer_response.raise_for_status()
         answer_payload = answer_response.json()
         answer_latency_ms = round((perf_counter() - answer_started) * 1000, 2)
         actual_abstention = bool(answer_payload["abstained"])
+        abstention_reason = answer_payload.get("abstention_reason")
         citation_valid = answer_payload.get("citation_valid")
         answer_text = answer_payload.get("answer")
+        generation_temperature = answer_payload.get("generation_temperature")
         answer_sources = answer_payload.get("sources", [])
         cited_sources = _cited_sources(answer_payload)
         answer_metrics = evaluate_answer_case(
@@ -343,7 +349,9 @@ async def evaluate_case(
             "evaluated": include_answers,
             "latency_ms": answer_latency_ms,
             "abstained": actual_abstention,
+            "abstention_reason": abstention_reason,
             "citation_valid": citation_valid,
+            "generation_temperature": generation_temperature,
             "text": answer_text,
             "sources": answer_sources,
         },
@@ -383,6 +391,7 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
                     mode=args.mode,
                     rerank=args.rerank,
                     include_answers=args.answers,
+                    answer_temperature=args.answer_temperature,
                 )
             except (httpx.HTTPError, KeyError, TypeError, ValueError) as exc:
                 errors.append({"case_id": case.id, "error": str(exc)})
@@ -416,6 +425,7 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
             "mode": args.mode,
             "rerank": args.rerank,
             "answers": args.answers,
+            "answer_temperature": args.answer_temperature,
             "case_details_included": not args.omit_case_details,
         },
         "requested_case_count": len(cases),
@@ -447,6 +457,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mode", choices=("hybrid", "semantic", "lexical"), default="hybrid")
     parser.add_argument("--timeout", type=float, default=180.0)
     parser.add_argument(
+        "--answer-temperature",
+        type=float,
+        default=0.0,
+        help="Generation temperature used by answer evaluation requests",
+    )
+    parser.add_argument(
         "--token",
         help="OIDC access token; prefer the RAG_API_TOKEN environment variable",
     )
@@ -466,6 +482,8 @@ def main() -> int:
     args = parser.parse_args()
     if args.limit < 1 or args.limit > 20:
         parser.error("--limit must be between 1 and 20")
+    if args.answer_temperature < 0.0 or args.answer_temperature > 2.0:
+        parser.error("--answer-temperature must be between 0 and 2")
 
     try:
         report = asyncio.run(run(args))

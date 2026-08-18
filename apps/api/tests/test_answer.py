@@ -1,10 +1,23 @@
+import asyncio
 import uuid
 
-from app.api.routes.answer import _messages
-from app.api.routes.search import SearchResult
-from app.services.context_builder import build_context, clean_context_text
+from app.api.routes import answer as answer_route
+from app.api.routes.answer import (
+    INSUFFICIENT_EVIDENCE_ANSWER,
+    PreparedAnswer,
+    _messages,
+)
+from app.api.routes.search import SearchResponse, SearchResult
+from app.services.answer_contract import ABSTAIN_MARKER, ANSWER_MARKER
+from app.services.context_builder import (
+    BuiltContext,
+    ContextSource,
+    build_context,
+    clean_context_text,
+)
 from app.services.conversation_context import HistoryMessage
-from app.services.llm import chat_completions_url
+from app.services.llm import LLMOutput, chat_completions_url
+from app.services.workspace_sources import WorkspaceSourceMode
 
 
 def _result(
@@ -37,6 +50,64 @@ def _result(
         rerank_rank=rank,
         rerank_fusion_score=0.02,
         rerank_penalty=0.0,
+    )
+
+
+def _prepared_answer() -> PreparedAnswer:
+    source = ContextSource(
+        index=1,
+        chunk_id=uuid.uuid4(),
+        document_id=uuid.uuid4(),
+        filename="document.txt",
+        chunk_index=0,
+        heading="Раздел",
+        page_start=None,
+        page_end=None,
+        excerpt="Фрагмент не содержит запрошенного факта.",
+        retrieval_rank=1,
+        rerank_score=None,
+        rerank_fusion_score=None,
+        source_scope="workspace",
+        knowledge_base_name=None,
+        knowledge_base_version=None,
+        quality_score=0.8,
+    )
+    context = BuiltContext(
+        text="[1] Источник: document.txt\nФрагмент не содержит запрошенного факта.",
+        sources=[source],
+        char_count=72,
+        candidate_count=1,
+        evidence_status="strong",
+        evidence_score=0.8,
+        rejected_low_score=0,
+        rejected_duplicate=0,
+        rejected_document_cap=0,
+    )
+    search_response = SearchResponse(
+        query="Какой срок гарантии?",
+        mode="hybrid",
+        workspace_source_mode=WorkspaceSourceMode.USER_DOCUMENTS,
+        knowledge_base_id=None,
+        knowledge_base_version_id=None,
+        candidate_limit=8,
+        rerank_requested=False,
+        rerank_applied=False,
+        rerank_model=None,
+        rerank_error=None,
+        results=[],
+    )
+    return PreparedAnswer(
+        question="Какой срок гарантии?",
+        retrieval_query="Какой срок гарантии?",
+        search_response=search_response,
+        context=context,
+        messages=[{"role": "user", "content": "test"}],
+        max_tokens=128,
+        temperature=0.1,
+        conversation=None,
+        parent_message_id=None,
+        history=[],
+        abstained=False,
     )
 
 
@@ -92,6 +163,11 @@ def test_messages_require_grounded_citations() -> None:
 
     assert messages[0]["role"] == "system"
     assert "только на основании" in messages[0]["content"]
+    assert ANSWER_MARKER in messages[0]["content"]
+    assert ABSTAIN_MARKER in messages[0]["content"]
+    assert "Частичный подтверждённый ответ не заменяй полным отказом" in messages[0]["content"]
+    assert "одного точного числа, даты или версии" in messages[0]["content"]
+    assert "Не переноси характеристики" in messages[0]["content"]
     assert "[1]" in messages[1]["content"]
     assert "Что такое МБД.Х?" in messages[1]["content"]
 
@@ -131,3 +207,170 @@ def test_messages_include_bounded_conversation_history() -> None:
     ]
     assert "АКТУАЛЬНЫЙ КОНТЕКСТ" in messages[-1]["content"]
     assert "Какие у неё преимущества?" in messages[-1]["content"]
+
+
+def test_non_stream_answer_exposes_model_abstention(monkeypatch) -> None:
+    prepared = _prepared_answer()
+    persisted: dict = {}
+
+    async def prepare(*_args, **_kwargs):
+        return prepared
+
+    async def chat(*_args, **kwargs):
+        assert kwargs["temperature"] == 0.1
+        return LLMOutput(text=ABSTAIN_MARKER, model="test-model", finish_reason="stop")
+
+    async def persist(*_args, **kwargs):
+        persisted.update(kwargs)
+        return None, None
+
+    monkeypatch.setattr(answer_route, "_prepare_answer", prepare)
+    monkeypatch.setattr(answer_route.llm, "chat", chat)
+    monkeypatch.setattr(answer_route, "_persist_exchange", persist)
+
+    response = asyncio.run(
+        answer_route.answer(
+            uuid.uuid4(),
+            answer_route.AnswerRequest(question="Вопрос"),
+            None,
+            None,
+        )
+    )
+
+    assert response.answer == INSUFFICIENT_EVIDENCE_ANSWER
+    assert response.generation_temperature == 0.1
+    assert response.abstained is True
+    assert response.abstention_reason == "model_reported_insufficient_context"
+    assert response.citation_valid is True
+    assert persisted["abstained"] is True
+
+
+def test_stream_answer_hides_marker_and_finalizes_abstention(monkeypatch) -> None:
+    prepared = _prepared_answer()
+    persisted: dict = {}
+
+    async def prepare(*_args, **_kwargs):
+        return prepared
+
+    async def persist_user(*_args, **_kwargs):
+        return None
+
+    async def persist_assistant(*_args, **kwargs):
+        persisted.update(kwargs)
+
+    async def stream_chat(*_args, **_kwargs):
+        yield " [[ABS"
+        yield "TAIN]]"
+
+    monkeypatch.setattr(answer_route, "_prepare_answer", prepare)
+    monkeypatch.setattr(answer_route, "_persist_stream_user", persist_user)
+    monkeypatch.setattr(answer_route, "_persist_stream_assistant", persist_assistant)
+    monkeypatch.setattr(answer_route.llm, "stream_chat", stream_chat)
+
+    async def collect() -> str:
+        response = await answer_route.answer_stream(
+            uuid.uuid4(),
+            answer_route.AnswerRequest(question="Вопрос"),
+            None,
+            None,
+        )
+        chunks = []
+        async for chunk in response.body_iterator:
+            chunks.append(chunk.decode() if isinstance(chunk, bytes) else chunk)
+        return "".join(chunks)
+
+    body = asyncio.run(collect())
+
+    assert ABSTAIN_MARKER not in body
+    assert INSUFFICIENT_EVIDENCE_ANSWER in body
+    assert '"abstained": true' in body
+    assert '"abstention_reason": "model_reported_insufficient_context"' in body
+    assert persisted["abstained"] is True
+
+
+def test_stream_answer_preserves_cited_partial_answer(monkeypatch) -> None:
+    prepared = _prepared_answer()
+    persisted: dict = {}
+
+    async def prepare(*_args, **_kwargs):
+        return prepared
+
+    async def persist_user(*_args, **_kwargs):
+        return None
+
+    async def persist_assistant(*_args, **kwargs):
+        persisted.update(kwargs)
+
+    async def stream_chat(*_args, **_kwargs):
+        yield "[[ANS"
+        yield "WER]]В предоставленном контексте нет точной даты, "
+        yield "но продукт использует Picodata [1]."
+
+    monkeypatch.setattr(answer_route, "_prepare_answer", prepare)
+    monkeypatch.setattr(answer_route, "_persist_stream_user", persist_user)
+    monkeypatch.setattr(answer_route, "_persist_stream_assistant", persist_assistant)
+    monkeypatch.setattr(answer_route.llm, "stream_chat", stream_chat)
+
+    async def collect() -> str:
+        response = await answer_route.answer_stream(
+            uuid.uuid4(),
+            answer_route.AnswerRequest(question="Вопрос"),
+            None,
+            None,
+        )
+        chunks = []
+        async for chunk in response.body_iterator:
+            chunks.append(chunk.decode() if isinstance(chunk, bytes) else chunk)
+        return "".join(chunks)
+
+    body = asyncio.run(collect())
+
+    assert "продукт использует Picodata [1]" in body
+    assert '"abstained": false' in body
+    assert '"cited_source_indices": [1]' in body
+    assert persisted["abstained"] is False
+
+
+def test_stream_answer_hides_trailing_marker_and_keeps_contextual_abstention(
+    monkeypatch,
+) -> None:
+    prepared = _prepared_answer()
+    persisted: dict = {}
+
+    async def prepare(*_args, **_kwargs):
+        return prepared
+
+    async def persist_user(*_args, **_kwargs):
+        return None
+
+    async def persist_assistant(*_args, **kwargs):
+        persisted.update(kwargs)
+
+    async def stream_chat(*_args, **_kwargs):
+        yield "Точное значение не указано [1]. [[ABS"
+        yield "TAIN]]"
+
+    monkeypatch.setattr(answer_route, "_prepare_answer", prepare)
+    monkeypatch.setattr(answer_route, "_persist_stream_user", persist_user)
+    monkeypatch.setattr(answer_route, "_persist_stream_assistant", persist_assistant)
+    monkeypatch.setattr(answer_route.llm, "stream_chat", stream_chat)
+
+    async def collect() -> str:
+        response = await answer_route.answer_stream(
+            uuid.uuid4(),
+            answer_route.AnswerRequest(question="Вопрос"),
+            None,
+            None,
+        )
+        chunks = []
+        async for chunk in response.body_iterator:
+            chunks.append(chunk.decode() if isinstance(chunk, bytes) else chunk)
+        return "".join(chunks)
+
+    body = asyncio.run(collect())
+
+    assert ABSTAIN_MARKER not in body
+    assert "Точное значение не указано [1]." in body
+    assert '"abstained": true' in body
+    assert '"cited_source_indices": [1]' in body
+    assert persisted["abstained"] is True

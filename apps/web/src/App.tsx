@@ -56,6 +56,7 @@ type ConversationSummary = {
 type StoredMessageMetadata = {
   status?: "complete" | "streaming" | "stopped" | "error";
   model?: string;
+  generation_temperature?: number;
   retrieval_query?: string;
   retrieval_mode?: string;
   workspace_source_mode?: WorkspaceSourceMode;
@@ -64,6 +65,7 @@ type StoredMessageMetadata = {
   rerank_applied?: boolean;
   context_chars?: number;
   abstained?: boolean;
+  abstention_reason?: AbstentionReason | null;
   evidence_status?: "strong" | "limited" | "insufficient";
   evidence_score?: number | null;
   candidate_count?: number;
@@ -127,6 +129,7 @@ type StreamMetadata = {
   user_message_id: string | null;
   parent_message_id: string | null;
   model: string;
+  generation_temperature: number;
   retrieval_mode: string;
   workspace_source_mode: WorkspaceSourceMode;
   knowledge_base_id: string | null;
@@ -134,6 +137,7 @@ type StreamMetadata = {
   rerank_applied: boolean;
   context_chars: number;
   abstained: boolean;
+  abstention_reason: AbstentionReason | null;
   evidence_status: "strong" | "limited" | "insufficient";
   evidence_score: number | null;
   candidate_count: number;
@@ -150,6 +154,7 @@ type StreamDone = {
   cited_source_indices?: number[];
   invalid_citations?: number[];
   abstained?: boolean;
+  abstention_reason?: AbstentionReason | null;
   evidence_status?: "strong" | "limited" | "insufficient";
   evidence_score?: number | null;
   candidate_count?: number;
@@ -167,6 +172,9 @@ type ChatMessage = {
 };
 
 type StreamStage = "idle" | "retrieving" | "generating";
+type AbstentionReason =
+  | "insufficient_retrieval_evidence"
+  | "model_reported_insufficient_context";
 
 const API = import.meta.env.VITE_API_BASE_URL || "http://localhost:8000";
 const ACCEPTED_FILES = ".txt,.md,.csv,.json,.html,.htm,.xml,.pdf,.docx";
@@ -232,6 +240,11 @@ function sourceTitle(source: AnswerSource): string {
   return source.heading || source.filename;
 }
 
+function citedSources(message: ChatMessage): AnswerSource[] {
+  const citedIndices = new Set(message.metadata?.cited_source_indices ?? []);
+  return (message.sources ?? []).filter((source) => citedIndices.has(source.index));
+}
+
 function renderAnswerText(message: ChatMessage): ReactNode[] {
   return message.content.split(/(\[\d+\])/g).map((part, index) => {
     const match = part.match(/^\[(\d+)\]$/);
@@ -272,6 +285,7 @@ function storedMessageToChat(message: StoredMessage): ChatMessage {
         user_message_id: null,
         parent_message_id: message.parent_message_id,
         model: message.metadata.model,
+        generation_temperature: message.metadata.generation_temperature ?? 0,
         retrieval_mode: message.metadata.retrieval_mode || "hybrid",
         workspace_source_mode: message.metadata.workspace_source_mode || "USER_DOCUMENTS",
         knowledge_base_id: message.metadata.knowledge_base_id ?? null,
@@ -279,6 +293,7 @@ function storedMessageToChat(message: StoredMessage): ChatMessage {
         rerank_applied: Boolean(message.metadata.rerank_applied),
         context_chars: message.metadata.context_chars || 0,
         abstained: Boolean(message.metadata.abstained),
+        abstention_reason: message.metadata.abstention_reason ?? null,
         evidence_status: message.metadata.evidence_status || "limited",
         evidence_score: message.metadata.evidence_score ?? null,
         candidate_count: message.metadata.candidate_count || 0,
@@ -1212,7 +1227,7 @@ export function App() {
                 content: message.content,
                 parentMessageId: message.parentMessageId,
                 status: message.status,
-                sourceCount: message.sources?.length || 0,
+                sourceCount: citedSources(message).length,
               }))}
               activeAssistantId={branchParentId}
               onSelectAssistant={(assistantId) => setBranchParentId(assistantId)}
@@ -1273,7 +1288,14 @@ export function App() {
                             ? "доказательства: ограниченные"
                             : "недостаточно доказательств"}
                       </span>
-                      {message.metadata.citation_valid != null && (
+                      {message.metadata.abstained && (
+                        <span>
+                          {message.metadata.abstention_reason === "insufficient_retrieval_evidence"
+                            ? "безопасный отказ: слабые retrieval-доказательства"
+                            : "безопасный отказ: контекст не подтверждает ответ"}
+                        </span>
+                      )}
+                      {!message.metadata.abstained && message.metadata.citation_valid != null && (
                         <span>
                           {message.metadata.citation_valid
                             ? "ссылки проверены"
@@ -1283,11 +1305,12 @@ export function App() {
                     </div>
                   )}
 
-                  {message.role === "assistant" && message.sources && message.sources.length > 0 && (
+                  {message.role === "assistant"
+                    && citedSources(message).length > 0 && (
                     <div className="sources-panel">
-                      <h4>Источники</h4>
+                      <h4>Использованные источники</h4>
                       <div className="source-list">
-                        {message.sources.map((source) => (
+                        {citedSources(message).map((source) => (
                           <details id={`${message.id}-source-${source.index}`} className="source-card" key={source.index}>
                             <summary>
                               <span className="source-index">{source.index}</span>

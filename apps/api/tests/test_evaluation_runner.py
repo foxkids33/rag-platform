@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import uuid
 
 import httpx
@@ -91,6 +92,7 @@ def test_evaluate_case_uses_filenames_as_stable_gold_keys() -> None:
                 mode="hybrid",
                 rerank=True,
                 include_answers=False,
+                answer_temperature=0.0,
             )
 
     result = asyncio.run(run_case())
@@ -118,10 +120,14 @@ def test_evaluate_case_scores_answer_and_only_cited_source_text() -> None:
                     ],
                 },
             )
+        request_payload = json.loads(request.content)
+        assert request_payload["temperature"] == 0.0
         return httpx.Response(
             200,
             json={
                 "abstained": False,
+                "abstention_reason": None,
+                "generation_temperature": 0.0,
                 "citation_valid": True,
                 "cited_source_indices": [1],
                 "answer": "Версия 2.1 от 01.09.2025 [1].",
@@ -163,6 +169,7 @@ def test_evaluate_case_scores_answer_and_only_cited_source_text() -> None:
                 mode="hybrid",
                 rerank=False,
                 include_answers=True,
+                answer_temperature=0.0,
             )
 
     result = asyncio.run(run_case())
@@ -171,3 +178,5 @@ def test_evaluate_case_scores_answer_and_only_cited_source_text() -> None:
     assert result["answer_metrics"]["citation_fact_coverage"] == 1.0
     assert result["answer_metrics"]["citation_source_coverage"] == 1.0
     assert result["answer_metrics"]["forbidden_fact_violation"] is False
+    assert result["answer"]["abstention_reason"] is None
+    assert result["answer"]["generation_temperature"] == 0.0

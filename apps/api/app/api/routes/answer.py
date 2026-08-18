@@ -19,6 +19,15 @@ from app.core.config import settings
 from app.core.security import Principal, get_current_principal
 from app.db.models import ChatMessage, ChatSession
 from app.db.session import SessionLocal, get_db
+from app.services.answer_contract import (
+    ABSTAIN_MARKER,
+    ANSWER_MARKER,
+    INSUFFICIENT_EVIDENCE_ANSWER,
+    AbstentionReason,
+    AbstentionStreamFilter,
+    ResolvedAnswer,
+    resolve_generated_answer,
+)
 from app.services.context_builder import BuiltContext, ContextSource, build_context
 from app.services.conversation_context import (
     BranchMessage,
@@ -33,10 +42,26 @@ from app.services.rag_quality import CitationAudit, audit_citations
 
 router = APIRouter(prefix="/workspaces/{workspace_id}/answer", tags=["answer"])
 
-SYSTEM_PROMPT = """Ты корпоративный RAG-ассистент.
+SYSTEM_PROMPT = f"""Ты корпоративный RAG-ассистент.
 Отвечай только на основании предоставленного контекста текущего запроса.
+Первая строка каждого ответа должна содержать ровно один управляющий маркер:
+- {ANSWER_MARKER} — если контекст подтверждает хотя бы один существенный запрошенный факт;
+- {ABSTAIN_MARKER} — если подтверждённого ответа нет.
+Никогда не ставь управляющий маркер в конце ответа и не повторяй его.
 Каждое проверяемое утверждение сопровождай ссылкой на источник в формате [1] или [2].
-Не придумывай факты, которых нет в контексте. Если данных недостаточно, прямо скажи об этом.
+Не придумывай факты, которых нет в контексте.
+Перед ответом проверь все перечисленные источники, а не только первые.
+Если контекст подтверждает хотя бы один существенный запрошенный факт, дай полезный частичный
+ответ после {ANSWER_MARKER} только по подтверждённой части и явно укажи, какая часть вопроса
+не подтверждена.
+Не выдавай частичный ответ за полный. Частичный подтверждённый ответ не заменяй полным отказом.
+Выбери {ABSTAIN_MARKER} только если:
+- в контексте нет прямых фактов, подтверждающих хотя бы одну существенную часть ответа; или
+- вопрос целиком требует одного точного числа, даты или версии, а точное значение для
+  запрошенного продукта в контексте отсутствует.
+После {ABSTAIN_MARKER} можешь кратко объяснить, каких данных нет. Если объяснение опирается
+на источник, добавь разрешённую ссылку [n]. Не подставляй близкое, но нерелевантное значение.
+Не переноси характеристики, числа или выводы с похожего продукта на запрошенный продукт.
 История диалога нужна только для понимания местоимений и продолжения темы. Старые ссылки и факты
 из истории не являются источниками для текущего ответа.
 Отвечай на языке вопроса, ясно и без лишней воды.
@@ -46,11 +71,6 @@ SYSTEM_PROMPT = """Ты корпоративный RAG-ассистент.
 Отвечай строго по текущему вопросу и не добавляй сведения, о которых не спрашивали.
 Используй только номера источников, перечисленные в актуальном контексте.
 """
-
-INSUFFICIENT_EVIDENCE_ANSWER = (
-    "В доступных документах недостаточно подтверждённой информации, "
-    "чтобы надёжно ответить на этот вопрос."
-)
 
 
 class AnswerRequest(BaseModel):
@@ -62,6 +82,7 @@ class AnswerRequest(BaseModel):
     source_limit: int | None = Field(default=None, ge=1, le=10)
     rerank: bool = True
     max_tokens: int | None = Field(default=None, ge=64, le=4096)
+    temperature: float | None = Field(default=None, ge=0.0, le=2.0)
 
 
 class AnswerSource(BaseModel):
@@ -90,6 +111,7 @@ class AnswerResponse(BaseModel):
     answer: str
     model: str
     finish_reason: str | None
+    generation_temperature: float
     retrieval_mode: str
     workspace_source_mode: str
     knowledge_base_id: uuid.UUID | None
@@ -101,6 +123,7 @@ class AnswerResponse(BaseModel):
     user_message_id: uuid.UUID | None
     assistant_message_id: uuid.UUID | None
     abstained: bool
+    abstention_reason: AbstentionReason | None
     evidence_status: str
     evidence_score: float | None
     citation_valid: bool
@@ -117,6 +140,7 @@ class PreparedAnswer:
     context: BuiltContext
     messages: list[dict[str, str]]
     max_tokens: int
+    temperature: float
     conversation: ChatSession | None
     parent_message_id: uuid.UUID | None
     history: list[HistoryMessage]
@@ -146,6 +170,22 @@ def _answer_sources(sources: list[ContextSource]) -> list[AnswerSource]:
         )
         for source in sources
     ]
+
+
+def _audit_resolved_answer(
+    resolved: ResolvedAnswer,
+    sources: list[AnswerSource],
+) -> CitationAudit:
+    if resolved.abstained and not resolved.has_citations:
+        return CitationAudit(
+            valid=True,
+            cited_source_indices=[],
+            invalid_citations=[],
+        )
+    return audit_citations(
+        resolved.text,
+        (source.index for source in sources),
+    )
 
 
 def _messages(
@@ -295,6 +335,9 @@ async def _prepare_answer(
     abstained = context.evidence_status == "insufficient" or not context.sources
 
     max_tokens = payload.max_tokens or settings.llm_max_tokens
+    temperature = (
+        settings.llm_temperature if payload.temperature is None else payload.temperature
+    )
     return PreparedAnswer(
         question=question,
         retrieval_query=retrieval_query,
@@ -302,6 +345,7 @@ async def _prepare_answer(
         context=context,
         messages=[] if abstained else _messages(question, context, history),
         max_tokens=max_tokens,
+        temperature=temperature,
         conversation=conversation,
         parent_message_id=parent_message_id,
         history=history,
@@ -309,9 +353,20 @@ async def _prepare_answer(
     )
 
 
-def _quality_payload(prepared: PreparedAnswer) -> dict:
+def _quality_payload(
+    prepared: PreparedAnswer,
+    *,
+    abstained: bool | None = None,
+    abstention_reason: AbstentionReason | None = None,
+) -> dict:
+    effective_abstention = prepared.abstained if abstained is None else abstained
+    effective_reason = abstention_reason
+    if prepared.abstained:
+        effective_abstention = True
+        effective_reason = "insufficient_retrieval_evidence"
     return {
-        "abstained": prepared.abstained,
+        "abstained": effective_abstention,
+        "abstention_reason": effective_reason,
         "evidence_status": prepared.context.evidence_status,
         "evidence_score": prepared.context.evidence_score,
         "candidate_count": prepared.context.candidate_count,
@@ -329,11 +384,14 @@ def _assistant_metadata(
     status: str,
     sources: list[AnswerSource],
     citation_audit: CitationAudit | None,
+    abstained: bool,
+    abstention_reason: AbstentionReason | None,
 ) -> dict:
     return {
         "status": status,
         "model": output.model if output else settings.vllm_model,
         "finish_reason": output.finish_reason if output else None,
+        "generation_temperature": prepared.temperature,
         "retrieval_query": prepared.retrieval_query,
         "retrieval_mode": prepared.search_response.mode,
         "workspace_source_mode": prepared.search_response.workspace_source_mode.value,
@@ -349,7 +407,11 @@ def _assistant_metadata(
         ),
         "rerank_applied": prepared.search_response.rerank_applied,
         "context_chars": prepared.context.char_count,
-        **_quality_payload(prepared),
+        **_quality_payload(
+            prepared,
+            abstained=abstained,
+            abstention_reason=abstention_reason,
+        ),
         "citation_valid": citation_audit.valid if citation_audit else None,
         "cited_source_indices": (citation_audit.cited_source_indices if citation_audit else []),
         "invalid_citations": citation_audit.invalid_citations if citation_audit else [],
@@ -369,6 +431,9 @@ async def _persist_exchange(
     output: LLMOutput,
     sources: list[AnswerSource],
     citation_audit: CitationAudit,
+    *,
+    abstained: bool,
+    abstention_reason: AbstentionReason | None,
 ) -> tuple[uuid.UUID | None, uuid.UUID | None]:
     if prepared.conversation is None:
         return None, None
@@ -393,6 +458,8 @@ async def _persist_exchange(
             status="complete",
             sources=sources,
             citation_audit=citation_audit,
+            abstained=abstained,
+            abstention_reason=abstention_reason,
         ),
     )
     _touch_conversation(prepared.conversation, prepared.question)
@@ -429,6 +496,8 @@ async def _persist_stream_assistant(
     parent_user_message_id: uuid.UUID | None,
     status: str,
     citation_audit: CitationAudit,
+    abstained: bool,
+    abstention_reason: AbstentionReason | None,
     output: LLMOutput | None = None,
 ) -> uuid.UUID | None:
     if prepared.conversation is None or not content.strip():
@@ -449,6 +518,8 @@ async def _persist_stream_assistant(
                 status=status,
                 sources=sources,
                 citation_audit=citation_audit,
+                abstained=abstained,
+                abstention_reason=abstention_reason,
             ),
         )
         conversation.updated_at = datetime.now(UTC)
@@ -468,29 +539,33 @@ async def answer(
     sources = _answer_sources(prepared.context.sources)
 
     if prepared.abstained:
-        output = LLMOutput(
+        resolved = ResolvedAnswer(
             text=INSUFFICIENT_EVIDENCE_ANSWER,
+            abstained=True,
+            abstention_reason="insufficient_retrieval_evidence",
+        )
+        output = LLMOutput(
+            text=resolved.text,
             model="retrieval-quality-gate",
             finish_reason="insufficient_context",
         )
-        citation_audit = CitationAudit(
-            valid=True,
-            cited_source_indices=[],
-            invalid_citations=[],
-        )
     else:
         try:
-            output = await llm.chat(
+            raw_output = await llm.chat(
                 prepared.messages,
                 max_tokens=prepared.max_tokens,
-                temperature=settings.llm_temperature,
+                temperature=prepared.temperature,
             )
         except LLMError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
-        citation_audit = audit_citations(
-            output.text,
-            (source.index for source in sources),
+        resolved = resolve_generated_answer(raw_output.text)
+        output = LLMOutput(
+            text=resolved.text,
+            model=raw_output.model,
+            finish_reason=raw_output.finish_reason,
         )
+
+    citation_audit = _audit_resolved_answer(resolved, sources)
 
     user_message_id, assistant_message_id = await _persist_exchange(
         db,
@@ -498,6 +573,8 @@ async def answer(
         output,
         sources,
         citation_audit,
+        abstained=resolved.abstained,
+        abstention_reason=resolved.abstention_reason,
     )
     return AnswerResponse(
         question=prepared.question,
@@ -505,6 +582,7 @@ async def answer(
         answer=output.text,
         model=output.model,
         finish_reason=output.finish_reason,
+        generation_temperature=prepared.temperature,
         retrieval_mode=prepared.search_response.mode,
         workspace_source_mode=prepared.search_response.workspace_source_mode.value,
         knowledge_base_id=prepared.search_response.knowledge_base_id,
@@ -515,7 +593,8 @@ async def answer(
         parent_message_id=prepared.parent_message_id,
         user_message_id=user_message_id,
         assistant_message_id=assistant_message_id,
-        abstained=prepared.abstained,
+        abstained=resolved.abstained,
+        abstention_reason=resolved.abstention_reason,
         evidence_status=prepared.context.evidence_status,
         evidence_score=prepared.context.evidence_score,
         citation_valid=citation_audit.valid,
@@ -542,7 +621,8 @@ async def answer_stream(
     serialized_sources = [source.model_dump(mode="json") for source in sources]
 
     async def event_stream():
-        parts: list[str] = []
+        stream_filter = AbstentionStreamFilter()
+        visible_parts: list[str] = []
         yield _sse(
             "metadata",
             {
@@ -556,6 +636,7 @@ async def answer_stream(
                     str(prepared.parent_message_id) if prepared.parent_message_id else None
                 ),
                 "model": ("retrieval-quality-gate" if prepared.abstained else settings.vllm_model),
+                "generation_temperature": prepared.temperature,
                 "retrieval_mode": prepared.search_response.mode,
                 "workspace_source_mode": prepared.search_response.workspace_source_mode.value,
                 "knowledge_base_id": (
@@ -597,6 +678,8 @@ async def answer_stream(
                 parent_user_message_id=user_message_id,
                 status="complete",
                 citation_audit=citation_audit,
+                abstained=True,
+                abstention_reason="insufficient_retrieval_evidence",
                 output=output,
             )
             yield _sse(
@@ -618,17 +701,20 @@ async def answer_stream(
             async for token in llm.stream_chat(
                 prepared.messages,
                 max_tokens=prepared.max_tokens,
-                temperature=settings.llm_temperature,
+                temperature=prepared.temperature,
             ):
-                parts.append(token)
-                yield _sse("token", {"text": token})
+                visible = stream_filter.feed(token)
+                if visible:
+                    visible_parts.append(visible)
+                    yield _sse("token", {"text": visible})
         except asyncio.CancelledError:
-            if parts:
-                content = "".join(parts)
-                citation_audit = audit_citations(
-                    content,
-                    (source.index for source in sources),
-                )
+            tail = stream_filter.finish()
+            if tail:
+                visible_parts.append(tail)
+            if stream_filter.raw_text:
+                resolved = resolve_generated_answer(stream_filter.raw_text)
+                content = resolved.text if resolved.abstained else "".join(visible_parts)
+                citation_audit = _audit_resolved_answer(resolved, sources)
                 await asyncio.shield(
                     _persist_stream_assistant(
                         prepared,
@@ -637,15 +723,18 @@ async def answer_stream(
                         parent_user_message_id=user_message_id,
                         status="stopped",
                         citation_audit=citation_audit,
+                        abstained=resolved.abstained,
+                        abstention_reason=resolved.abstention_reason,
                     )
                 )
             raise
         except LLMError as exc:
-            content = "".join(parts)
-            citation_audit = audit_citations(
-                content,
-                (source.index for source in sources),
-            )
+            tail = stream_filter.finish()
+            if tail:
+                visible_parts.append(tail)
+            resolved = resolve_generated_answer(stream_filter.raw_text)
+            content = resolved.text if resolved.abstained else "".join(visible_parts)
+            citation_audit = _audit_resolved_answer(resolved, sources)
             assistant_message_id = await _persist_stream_assistant(
                 prepared,
                 content,
@@ -653,6 +742,8 @@ async def answer_stream(
                 parent_user_message_id=user_message_id,
                 status="error",
                 citation_audit=citation_audit,
+                abstained=resolved.abstained,
+                abstention_reason=resolved.abstention_reason,
             )
             yield _sse(
                 "error",
@@ -661,6 +752,11 @@ async def answer_stream(
                     "assistant_message_id": (
                         str(assistant_message_id) if assistant_message_id else None
                     ),
+                    **_quality_payload(
+                        prepared,
+                        abstained=resolved.abstained,
+                        abstention_reason=resolved.abstention_reason,
+                    ),
                     "citation_valid": citation_audit.valid,
                     "cited_source_indices": citation_audit.cited_source_indices,
                     "invalid_citations": citation_audit.invalid_citations,
@@ -668,11 +764,15 @@ async def answer_stream(
             )
             return
 
-        content = "".join(parts)
-        citation_audit = audit_citations(
-            content,
-            (source.index for source in sources),
-        )
+        tail = stream_filter.finish()
+        if tail:
+            visible_parts.append(tail)
+            yield _sse("token", {"text": tail})
+        resolved = resolve_generated_answer(stream_filter.raw_text)
+        content = resolved.text
+        if not "".join(visible_parts).strip() and content:
+            yield _sse("token", {"text": content})
+        citation_audit = _audit_resolved_answer(resolved, sources)
         output = LLMOutput(
             text=content,
             model=settings.vllm_model,
@@ -685,6 +785,8 @@ async def answer_stream(
             parent_user_message_id=user_message_id,
             status="complete",
             citation_audit=citation_audit,
+            abstained=resolved.abstained,
+            abstention_reason=resolved.abstention_reason,
             output=output,
         )
         yield _sse(
@@ -694,7 +796,11 @@ async def answer_stream(
                 "assistant_message_id": (
                     str(assistant_message_id) if assistant_message_id else None
                 ),
-                **_quality_payload(prepared),
+                **_quality_payload(
+                    prepared,
+                    abstained=resolved.abstained,
+                    abstention_reason=resolved.abstention_reason,
+                ),
                 "citation_valid": citation_audit.valid,
                 "cited_source_indices": citation_audit.cited_source_indices,
                 "invalid_citations": citation_audit.invalid_citations,

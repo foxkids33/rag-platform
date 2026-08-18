@@ -73,6 +73,10 @@ make evaluate-answers WORKSPACE_ID=<uuid> \
   DATASET=/evaluation/datasets/example.jsonl CORPUS=
 ```
 
+Answer evaluation uses `ANSWER_TEMPERATURE=0.0` by default and records it as
+`configuration.answer_temperature`. Override it only for an explicit
+stochastic experiment; the checked dev and acceptance workflows require zero.
+
 For the Skala pilot the dataset and manifest are Makefile defaults. Save the
 first runs under stable names:
 
@@ -121,14 +125,29 @@ make evaluate-acceptance-check WORKSPACE_ID=<uuid>
 
 The baseline gates are calibrated to the accepted no-rerank schema-v3 run and
 protect the split size, execution mode, error count, quality metrics, and p95
-latency. `quality-gates.acceptance-target.json` contains the next product-quality
-targets; it is expected to fail until the quality sprint is complete.
+latency. The dev gate additionally requires at least 75% correct unanswerable
+abstention while retaining at least 40% non-abstention on answerable cases; this
+prevents both missed refusals and a trivial refuse-everything strategy.
+`quality-gates.acceptance-target.json` contains the next product-quality targets;
+it is expected to fail until the quality sprint is complete.
 
 The schema-v3 report contains Recall@1/5/10, MRR, nDCG@10, overall and
 class-balanced abstention accuracy, required-fact coverage, exact-value
 accuracy, forbidden-fact violation rate, citation syntax validity, cited-source
 fact coverage, cited gold-document coverage, p50/p95 latency, and breakdowns by
 question type and expected filename.
+
+The per-case answer diagnostics also record `abstention_reason`, distinguishing
+the deterministic retrieval quality gate from a model decision that the
+selected context does not support a reliable answer. The final SSE `done`
+event, persisted chat metadata, JSON answer endpoint, and evaluator use the
+same effective abstention value.
+Grounded partial answers are not abstentions: when at least one material part of
+the question is supported, the answer should cite that part and identify the
+missing part. A question that exclusively requests an absent exact number,
+date, or version should still abstain. Contextual abstentions may retain a short
+grounded explanation and cited sources while remaining machine-readable through
+`abstained=true`.
 
 The report also records how often reranking was actually applied. A requested
 reranker can fail open or be disabled by the active Compose stack, so do not

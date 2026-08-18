@@ -24,6 +24,7 @@
     "aggregate.case_count": 24,
     "configuration.rerank": false,
     "configuration.answers": true,
+    "configuration.answer_temperature": 0.0,
     "configuration.case_details_included": false
   }
 }

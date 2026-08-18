@@ -151,6 +151,9 @@ def build_failure_report(
                 "retrieved_filenames": result.get("retrieved_filenames", []),
                 "metrics": result.get("metrics"),
                 "answer_metrics": result.get("answer_metrics"),
+                "abstention_reason": result.get("answer", {}).get(
+                    "abstention_reason"
+                ),
                 "search_latency_ms": result.get("search", {}).get("latency_ms"),
                 "answer_latency_ms": result.get("answer", {}).get("latency_ms"),
             }

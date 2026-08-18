@@ -18,6 +18,7 @@ DEV_CASE_IDS ?= /evaluation/splits/skala-technical-reviews.v1.dev.txt
 ACCEPTANCE_CASE_IDS ?= /evaluation/splits/skala-technical-reviews.v1.acceptance.txt
 EVALUATION_OUTPUT ?= /evaluation/results/latest.json
 RERANK ?= false
+ANSWER_TEMPERATURE ?= 0.0
 OMIT_CASE_DETAILS ?= false
 EVALUATION_TOKEN_ENV := $(if $(strip $(RAG_API_TOKEN)),-e RAG_API_TOKEN,)
 EVALUATION_CORPUS_ARG := $(if $(strip $(CORPUS)),--corpus "$(CORPUS)",)
@@ -125,6 +126,7 @@ evaluate:
 		$(EVALUATION_CASE_IDS_ARG) \
 		$(EVALUATION_CORPUS_ARG) \
 		$(EVALUATION_RERANK_ARG) \
+		--answer-temperature "$(ANSWER_TEMPERATURE)" \
 		$(EVALUATION_OMIT_CASE_DETAILS_ARG) \
 		--output "$(EVALUATION_OUTPUT)"
 
@@ -136,6 +138,7 @@ evaluate-answers:
 		$(EVALUATION_CASE_IDS_ARG) \
 		$(EVALUATION_CORPUS_ARG) \
 		$(EVALUATION_RERANK_ARG) \
+		--answer-temperature "$(ANSWER_TEMPERATURE)" \
 		$(EVALUATION_OMIT_CASE_DETAILS_ARG) \
 		--output "$(EVALUATION_OUTPUT)" \
 		--answers

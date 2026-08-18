@@ -32,7 +32,11 @@ def _case() -> dict:
             "rerank_applied": False,
             "result_count": 2,
         },
-        "answer": {"latency_ms": 7000.0, "abstained": False},
+        "answer": {
+            "latency_ms": 7000.0,
+            "abstained": False,
+            "abstention_reason": None,
+        },
     }
 
 
@@ -62,6 +66,7 @@ def test_failure_report_classifies_pipeline_layers() -> None:
         "latency",
         "retrieval",
     ]
+    assert failure["abstention_reason"] is None
     assert report["summary"]["failing_case_count"] == 1
     assert report["summary"]["failure_count"] == 6
 
