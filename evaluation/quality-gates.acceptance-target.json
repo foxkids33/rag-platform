@@ -7,6 +7,9 @@
     "aggregate.retrieval.unanswerable_abstention_accuracy": 0.75,
     "aggregate.answer.required_fact_coverage": 0.6,
     "aggregate.answer.exact_value_accuracy": 0.6,
+    "aggregate.answer.context_fact_coverage": 0.7,
+    "aggregate.answer.context_source_coverage": 0.9,
+    "aggregate.answer.gold_context_fact_coverage": 0.7,
     "aggregate.answer.citation_fact_coverage": 0.75,
     "aggregate.answer.citation_source_coverage": 0.75,
     "aggregate.answer.citation_validity_rate": 0.9

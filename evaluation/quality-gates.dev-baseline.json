@@ -9,6 +9,9 @@
     "aggregate.retrieval.balanced_abstention_accuracy": 0.7,
     "aggregate.answer.required_fact_coverage": 0.3,
     "aggregate.answer.exact_value_accuracy": 0.25,
+    "aggregate.answer.context_fact_coverage": 0.4,
+    "aggregate.answer.context_source_coverage": 0.85,
+    "aggregate.answer.gold_context_fact_coverage": 0.36,
     "aggregate.answer.citation_fact_coverage": 0.3,
     "aggregate.answer.citation_source_coverage": 0.42,
     "aggregate.answer.citation_validity_rate": 0.4

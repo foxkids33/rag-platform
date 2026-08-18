@@ -175,8 +175,12 @@ def test_evaluate_case_scores_answer_and_only_cited_source_text() -> None:
     result = asyncio.run(run_case())
 
     assert result["answer_metrics"]["required_fact_coverage"] == 1.0
+    assert result["answer_metrics"]["context_fact_coverage"] == 1.0
+    assert result["answer_metrics"]["context_source_coverage"] == 1.0
+    assert result["answer_metrics"]["gold_context_fact_coverage"] == 1.0
     assert result["answer_metrics"]["citation_fact_coverage"] == 1.0
     assert result["answer_metrics"]["citation_source_coverage"] == 1.0
     assert result["answer_metrics"]["forbidden_fact_violation"] is False
     assert result["answer"]["abstention_reason"] is None
+    assert result["answer"]["cited_source_indices"] == [1]
     assert result["answer"]["generation_temperature"] == 0.0

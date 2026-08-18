@@ -174,6 +174,23 @@ def citation_source_coverage(
     return len(expected & cited) / len(expected)
 
 
+def context_source_coverage(
+    case: EvaluationCase,
+    observation: AnswerObservation,
+) -> float | None:
+    """Return the share of gold documents included in the LLM context."""
+
+    if case.expected_filenames:
+        expected = set(case.expected_filenames)
+        context_sources = set(observation.context_filenames)
+    else:
+        expected = set(case.expected_document_ids)
+        context_sources = set(observation.context_document_ids)
+    if not expected:
+        return None
+    return len(expected & context_sources) / len(expected)
+
+
 def evaluate_answer_case(
     case: EvaluationCase,
     observation: AnswerObservation,
@@ -205,6 +222,16 @@ def evaluate_answer_case(
         required_fact_coverage=required_fact_coverage,
         exact_value_correct=exact_value_correct,
         forbidden_fact_violation=forbidden_fact_violation,
+        context_fact_coverage=fact_coverage(
+            case.required_facts,
+            observation.context_source_text,
+        ),
+        context_source_coverage=context_source_coverage(case, observation),
+        gold_context_fact_coverage=(
+            fact_coverage(case.required_facts, observation.gold_context_source_text)
+            if case.expected_filenames or case.expected_document_ids
+            else None
+        ),
         citation_fact_coverage=(
             fact_coverage(case.required_facts, observation.cited_source_text)
             if not observation.actual_abstention
@@ -286,6 +313,21 @@ def aggregate_answer_metrics(
         for result in collected
         if result.forbidden_fact_violation is not None
     ]
+    context_fact_values = [
+        result.context_fact_coverage
+        for result in collected
+        if result.context_fact_coverage is not None
+    ]
+    context_source_values = [
+        result.context_source_coverage
+        for result in collected
+        if result.context_source_coverage is not None
+    ]
+    gold_context_fact_values = [
+        result.gold_context_fact_coverage
+        for result in collected
+        if result.gold_context_fact_coverage is not None
+    ]
     citation_fact_values = [
         result.citation_fact_coverage
         for result in collected
@@ -306,12 +348,18 @@ def aggregate_answer_metrics(
         fact_evaluated_cases=len(fact_values),
         exact_value_evaluated_cases=len(exact_values),
         forbidden_fact_evaluated_cases=len(forbidden_values),
+        context_fact_evaluated_cases=len(context_fact_values),
+        context_source_evaluated_cases=len(context_source_values),
+        gold_context_fact_evaluated_cases=len(gold_context_fact_values),
         citation_fact_evaluated_cases=len(citation_fact_values),
         citation_source_evaluated_cases=len(citation_source_values),
         citation_validity_evaluated_cases=len(citation_validity_values),
         required_fact_coverage=_mean_or_none(fact_values),
         exact_value_accuracy=_mean_or_none(exact_values),
         forbidden_fact_violation_rate=_mean_or_none(forbidden_values),
+        context_fact_coverage=_mean_or_none(context_fact_values),
+        context_source_coverage=_mean_or_none(context_source_values),
+        gold_context_fact_coverage=_mean_or_none(gold_context_fact_values),
         citation_fact_coverage=_mean_or_none(citation_fact_values),
         citation_source_coverage=_mean_or_none(citation_source_values),
         citation_validity_rate=_mean_or_none(citation_validity_values),

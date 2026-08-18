@@ -49,6 +49,22 @@ def test_compare_reports_checks_cited_gold_document_coverage() -> None:
     )
 
 
+def test_compare_reports_checks_gold_context_fact_coverage() -> None:
+    baseline = _report(recall_at_5=0.90, p95_ms=100)
+    candidate = _report(recall_at_5=0.90, p95_ms=100)
+    baseline["aggregate"]["answer"]["gold_context_fact_coverage"] = 0.8
+    candidate["aggregate"]["answer"]["gold_context_fact_coverage"] = 0.6
+
+    result = compare_reports(candidate, baseline=baseline)
+
+    assert result["passed"] is False
+    assert any(
+        check["path"] == "aggregate.answer.gold_context_fact_coverage"
+        and check["passed"] is False
+        for check in result["checks"]
+    )
+
+
 def test_compare_reports_enforces_configuration_and_case_count() -> None:
     candidate = _report(recall_at_5=0.90, p95_ms=100)
     candidate.update(

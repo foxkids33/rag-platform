@@ -76,18 +76,57 @@ def test_answer_metrics_check_facts_values_forbidden_text_and_citations() -> Non
             citation_valid=True,
             cited_source_text="Технический обзор версия 2.1 от 01.09.2025",
             cited_filenames=("review.txt",),
+            context_source_text="Технический обзор версия 2.1 от 01.09.2025",
         ),
     )
 
     assert result.required_fact_coverage == 1.0
     assert result.exact_value_correct is True
     assert result.forbidden_fact_violation is False
+    assert result.context_fact_coverage == 1.0
+    assert result.context_source_coverage is None
+    assert result.gold_context_fact_coverage is None
     assert result.citation_fact_coverage == 1.0
     assert result.citation_source_coverage is None
     assert result.citation_valid is True
     aggregate = aggregate_answer_metrics([result])
     assert aggregate.exact_value_accuracy == 1.0
     assert aggregate.forbidden_fact_violation_rate == 0.0
+    assert aggregate.context_fact_evaluated_cases == 1
+    assert aggregate.context_fact_coverage == 1.0
+
+
+def test_context_metrics_separate_document_presence_from_gold_chunk_facts() -> None:
+    case = EvaluationCase(
+        id="context-001",
+        question="Какая версия и дата?",
+        expected_filenames=("review.txt",),
+        required_facts=("2.1", "01.09.2025"),
+    )
+
+    result = evaluate_answer_case(
+        case,
+        AnswerObservation(
+            case_id=case.id,
+            text="Недостаточно информации.",
+            actual_abstention=True,
+            citation_valid=True,
+            cited_source_text="",
+            context_source_text=(
+                "Фрагмент review.txt содержит версию 2.1. "
+                "Другой документ содержит дату 01.09.2025."
+            ),
+            context_filenames=("review.txt", "other.txt"),
+            gold_context_source_text="Фрагмент review.txt содержит версию 2.1.",
+        ),
+    )
+
+    assert result.required_fact_coverage == 0.0
+    assert result.context_fact_coverage == 1.0
+    assert result.context_source_coverage == 1.0
+    assert result.gold_context_fact_coverage == 0.5
+    assert result.citation_fact_coverage is None
+    assert result.citation_source_coverage is None
 
 
 def test_exact_value_uses_atomic_required_facts_instead_of_full_answer_phrase() -> None:

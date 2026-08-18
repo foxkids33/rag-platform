@@ -36,13 +36,12 @@ def _unique(values: list[str]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(values))
 
 
+def _source_text(sources: list[dict[str, Any]]) -> str:
+    return "\n\n".join(str(source.get("excerpt", "")) for source in sources)
+
+
 def _cited_source_text(answer_payload: dict[str, Any]) -> str:
-    cited_indices = {int(value) for value in answer_payload.get("cited_source_indices", [])}
-    return "\n\n".join(
-        str(source.get("excerpt", ""))
-        for source in answer_payload.get("sources", [])
-        if source.get("index") in cited_indices
-    )
+    return _source_text(_cited_sources(answer_payload))
 
 
 def _cited_sources(answer_payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -51,6 +50,21 @@ def _cited_sources(answer_payload: dict[str, Any]) -> list[dict[str, Any]]:
         source
         for source in answer_payload.get("sources", [])
         if source.get("index") in cited_indices
+    ]
+
+
+def _gold_context_sources(
+    case: EvaluationCase,
+    sources: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if case.expected_filenames:
+        expected = set(case.expected_filenames)
+        return [source for source in sources if source.get("filename") in expected]
+    expected = set(case.expected_document_ids)
+    return [
+        source
+        for source in sources
+        if str(source.get("document_id", "")) in expected
     ]
 
 
@@ -271,6 +285,7 @@ async def evaluate_case(
     answer_latency_ms: float | None = None
     generation_temperature: float | None = None
     answer_sources: list[dict[str, Any]] = []
+    cited_source_indices: list[int] = []
     answer_metrics: AnswerCaseMetrics | None = None
 
     if include_answers:
@@ -294,7 +309,11 @@ async def evaluate_case(
         answer_text = answer_payload.get("answer")
         generation_temperature = answer_payload.get("generation_temperature")
         answer_sources = answer_payload.get("sources", [])
+        cited_source_indices = [
+            int(value) for value in answer_payload.get("cited_source_indices", [])
+        ]
         cited_sources = _cited_sources(answer_payload)
+        gold_context_sources = _gold_context_sources(case, answer_sources)
         answer_metrics = evaluate_answer_case(
             case,
             AnswerObservation(
@@ -309,6 +328,14 @@ async def evaluate_case(
                 cited_filenames=_unique(
                     [str(source.get("filename", "")) for source in cited_sources]
                 ),
+                context_source_text=_source_text(answer_sources),
+                context_document_ids=_unique(
+                    [str(source.get("document_id", "")) for source in answer_sources]
+                ),
+                context_filenames=_unique(
+                    [str(source.get("filename", "")) for source in answer_sources]
+                ),
+                gold_context_source_text=_source_text(gold_context_sources),
             ),
         )
 
@@ -351,6 +378,7 @@ async def evaluate_case(
             "abstained": actual_abstention,
             "abstention_reason": abstention_reason,
             "citation_valid": citation_valid,
+            "cited_source_indices": cited_source_indices,
             "generation_temperature": generation_temperature,
             "text": answer_text,
             "sources": answer_sources,

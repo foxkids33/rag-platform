@@ -26,6 +26,10 @@ CATEGORY_LAYERS = {
     "forbidden_fact": "generation",
     "invalid_citation": "citations",
     "context_missing_required_facts": "context",
+    "gold_source_missing_from_context": "context",
+    "gold_source_chunk_missing_required_facts": "context",
+    "model_abstained_with_available_context": "generation",
+    "citation_missing_required_facts": "citations",
     "citation_missing_gold_source": "citations",
     "slow_search": "latency",
     "slow_answer": "latency",
@@ -79,11 +83,13 @@ def _case_categories(
     if rerank_requested and search.get("rerank_applied") is not True:
         categories.append("rerank_not_applied")
 
+    false_abstention = False
     if metrics.get("abstention_correct") is False:
         if case.get("expected_abstention") is True and answer.get("abstained") is False:
             categories.append("missed_abstention")
         elif case.get("expected_abstention") is False and answer.get("abstained") is True:
             categories.append("false_abstention")
+            false_abstention = True
 
     if _below(answer_metrics.get("required_fact_coverage"), 1.0):
         categories.append("missing_required_facts")
@@ -93,8 +99,19 @@ def _case_categories(
         categories.append("forbidden_fact")
     if answer_metrics.get("citation_valid") is False:
         categories.append("invalid_citation")
-    if _below(answer_metrics.get("citation_fact_coverage"), 1.0):
+    context_source_coverage = answer_metrics.get("context_source_coverage")
+    gold_context_fact_coverage = answer_metrics.get("gold_context_fact_coverage")
+    context_fact_coverage = answer_metrics.get("context_fact_coverage")
+    if _below(context_source_coverage, 1.0):
+        categories.append("gold_source_missing_from_context")
+    elif _below(gold_context_fact_coverage, 1.0):
+        categories.append("gold_source_chunk_missing_required_facts")
+    if _below(context_fact_coverage, 1.0):
         categories.append("context_missing_required_facts")
+    if false_abstention and _above(gold_context_fact_coverage, 0.0):
+        categories.append("model_abstained_with_available_context")
+    if _below(answer_metrics.get("citation_fact_coverage"), 1.0):
+        categories.append("citation_missing_required_facts")
     if _below(answer_metrics.get("citation_source_coverage"), 1.0):
         categories.append("citation_missing_gold_source")
     if _above(search.get("latency_ms"), search_latency_ms):
@@ -139,6 +156,15 @@ def build_failure_report(
         layer_counts.update(layers)
         question_type = case.get("question_type") or "unspecified"
         question_type_counts[question_type] += 1
+        answer = result.get("answer", {})
+        answer_metrics = result.get("answer_metrics") or {}
+        context_filenames = list(
+            dict.fromkeys(
+                str(source.get("filename", ""))
+                for source in answer.get("sources", [])
+                if source.get("filename")
+            )
+        )
         failures.append(
             {
                 "case_id": case.get("id"),
@@ -149,11 +175,17 @@ def build_failure_report(
                 "categories": categories,
                 "expected_filenames": case.get("expected_filenames", []),
                 "retrieved_filenames": result.get("retrieved_filenames", []),
+                "context_filenames": context_filenames,
                 "metrics": result.get("metrics"),
                 "answer_metrics": result.get("answer_metrics"),
-                "abstention_reason": result.get("answer", {}).get(
-                    "abstention_reason"
+                "context_fact_coverage": answer_metrics.get("context_fact_coverage"),
+                "context_source_coverage": answer_metrics.get(
+                    "context_source_coverage"
                 ),
+                "gold_context_fact_coverage": answer_metrics.get(
+                    "gold_context_fact_coverage"
+                ),
+                "abstention_reason": answer.get("abstention_reason"),
                 "search_latency_ms": result.get("search", {}).get("latency_ms"),
                 "answer_latency_ms": result.get("answer", {}).get("latency_ms"),
             }
@@ -228,8 +260,8 @@ def render_markdown(report: dict[str, Any]) -> str:
             "",
             "## Failing cases",
             "",
-            "| Case | Type | Layers | Categories | Expected | Retrieved | Question |",
-            "|---|---|---|---|---|---|---|",
+            "| Case | Type | Layers | Categories | Expected | Retrieved | Context | Question |",
+            "|---|---|---|---|---|---|---|---|",
         ]
     )
     for failure in report["failures"]:
@@ -243,6 +275,7 @@ def render_markdown(report: dict[str, Any]) -> str:
                     _markdown_cell(", ".join(failure.get("categories", []))),
                     _markdown_cell(", ".join(failure.get("expected_filenames", []))),
                     _markdown_cell(", ".join(failure.get("retrieved_filenames", []))),
+                    _markdown_cell(", ".join(failure.get("context_filenames", []))),
                     _markdown_cell(failure.get("question")),
                 ]
             )

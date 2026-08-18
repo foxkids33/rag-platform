@@ -106,8 +106,19 @@ This writes:
 Each failing case is assigned to one or more layers: retrieval, reranker,
 generation, citations, latency, or evaluation execution. Categories distinguish
 ranking errors, incomplete Recall@10, missed/false abstention, missing required
-facts in the answer or cited context, exact-value errors, forbidden facts,
-citation failures, and slow cases.
+facts in the answer, LLM context, gold-document chunks, or cited context,
+exact-value errors, forbidden facts, citation failures, and slow cases. The
+failure JSON and Markdown include both the search result filenames and the
+smaller set of context filenames actually passed to the model.
+
+Context diagnostics separate three failure modes:
+
+- `gold_source_missing_from_context`: a required document was retrieved too low
+  or was absent and did not reach the LLM;
+- `gold_source_chunk_missing_required_facts`: the document reached the LLM, but
+  the selected chunks did not contain every annotated fact;
+- `model_abstained_with_available_context`: at least one annotated fact was in
+  a context chunk from an expected document, but the model still refused.
 
 At a milestone boundary, run the 24-case acceptance holdout. The aggregate
 report is saved without questions, answers, sources, or other per-case details:
@@ -128,6 +139,10 @@ protect the split size, execution mode, error count, quality metrics, and p95
 latency. The dev gate additionally requires at least 75% correct unanswerable
 abstention while retaining at least 40% non-abstention on answerable cases; this
 prevents both missed refusals and a trivial refuse-everything strategy.
+It also protects the first context diagnostic baseline: at least 0.40 context
+fact coverage, 0.85 expected-document context coverage, and 0.36 fact coverage
+inside expected-document chunks. These are regression floors, not product
+targets.
 `quality-gates.acceptance-target.json` contains the next product-quality targets;
 it is expected to fail until the quality sprint is complete.
 
@@ -135,7 +150,21 @@ The schema-v3 report contains Recall@1/5/10, MRR, nDCG@10, overall and
 class-balanced abstention accuracy, required-fact coverage, exact-value
 accuracy, forbidden-fact violation rate, citation syntax validity, cited-source
 fact coverage, cited gold-document coverage, p50/p95 latency, and breakdowns by
-question type and expected filename.
+question type and expected filename. It also reports three pre-generation
+metrics for every answerable case, including abstentions:
+
+- `context_source_coverage`: share of expected documents present in the LLM
+  context;
+- `context_fact_coverage`: share of required facts found anywhere in that
+  context;
+- `gold_context_fact_coverage`: share of required facts found specifically in
+  context chunks from expected documents, avoiding credit for a coincidental
+  value in a distractor document.
+
+Citation metrics remain post-generation metrics and are evaluated only for
+non-abstained answers. The per-case report now preserves
+`cited_source_indices`, while the aggregate context metrics make abstained cases
+observable instead of silently excluding them from context diagnosis.
 
 The per-case answer diagnostics also record `abstention_reason`, distinguishing
 the deterministic retrieval quality gate from a model decision that the

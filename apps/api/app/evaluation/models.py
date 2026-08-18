@@ -89,6 +89,10 @@ class AnswerObservation:
     cited_source_text: str
     cited_document_ids: tuple[str, ...] = ()
     cited_filenames: tuple[str, ...] = ()
+    context_source_text: str = ""
+    context_document_ids: tuple[str, ...] = ()
+    context_filenames: tuple[str, ...] = ()
+    gold_context_source_text: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,6 +103,9 @@ class AnswerCaseMetrics:
     required_fact_coverage: float | None
     exact_value_correct: bool | None
     forbidden_fact_violation: bool | None
+    context_fact_coverage: float | None
+    context_source_coverage: float | None
+    gold_context_fact_coverage: float | None
     citation_fact_coverage: float | None
     citation_source_coverage: float | None
     citation_valid: bool | None
@@ -112,12 +119,18 @@ class AnswerAggregateMetrics:
     fact_evaluated_cases: int
     exact_value_evaluated_cases: int
     forbidden_fact_evaluated_cases: int
+    context_fact_evaluated_cases: int
+    context_source_evaluated_cases: int
+    gold_context_fact_evaluated_cases: int
     citation_fact_evaluated_cases: int
     citation_source_evaluated_cases: int
     citation_validity_evaluated_cases: int
     required_fact_coverage: float | None
     exact_value_accuracy: float | None
     forbidden_fact_violation_rate: float | None
+    context_fact_coverage: float | None
+    context_source_coverage: float | None
+    gold_context_fact_coverage: float | None
     citation_fact_coverage: float | None
     citation_source_coverage: float | None
     citation_validity_rate: float | None
