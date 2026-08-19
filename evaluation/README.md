@@ -76,6 +76,9 @@ make evaluate-answers WORKSPACE_ID=<uuid> \
 Answer evaluation uses `ANSWER_TEMPERATURE=0.0` by default and records it as
 `configuration.answer_temperature`. Override it only for an explicit
 stochastic experiment; the checked dev and acceptance workflows require zero.
+It also sends and records `QUERY_SELECTION_WEIGHT=0.30`. Use `0` only for an
+explicit selector-off A/B run; checked reports require `0.30`, so an accidental
+configuration mismatch cannot be accepted as a quality result.
 
 For the Skala pilot the dataset and manifest are Makefile defaults. Save the
 first runs under stable names:

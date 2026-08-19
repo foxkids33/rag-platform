@@ -102,6 +102,120 @@ def test_context_removes_duplicates_and_limits_one_document() -> None:
     assert context.rejected_document_cap == 1
 
 
+def test_context_promotes_exact_query_signals_from_below_source_limit() -> None:
+    distractors = [
+        Candidate(
+            text=(
+                f"Общий архитектурный фрагмент номер {index} описывает вычислительные "
+                "узлы, эксплуатацию и масштабирование корпоративной платформы."
+            ),
+            document_id=uuid.uuid4(),
+            retrieval_rank=index,
+            rerank_score=None,
+            dense_score=0.70,
+            chunk_index=index,
+        )
+        for index in range(1, 6)
+    ]
+    relevant = Candidate(
+        text=(
+            "МБД.Г предназначена для аналитических запросов и использует "
+            "СУБД Arenadata DB для обработки структурированных данных."
+        ),
+        document_id=uuid.uuid4(),
+        retrieval_rank=6,
+        rerank_score=None,
+        dense_score=0.65,
+        chunk_index=6,
+        filename="relevant.txt",
+    )
+
+    context = build_context(
+        "Для какой СУБД предназначена МБД.Г?",
+        [*distractors, relevant],
+        max_context_chars=5000,
+        max_source_chars=1000,
+        max_sources=5,
+        query_selection_weight=0.30,
+    )
+
+    assert context.sources[0].filename == "relevant.txt"
+    assert context.sources[0].retrieval_rank == 6
+    assert context.sources[0].query_relevance_score == 1.0
+    assert context.sources[0].selection_score > context.sources[1].selection_score
+
+
+def test_context_query_selector_can_be_disabled() -> None:
+    candidates = [
+        Candidate(
+            text=f"Нерелевантный фрагмент {index} с общим описанием инфраструктуры.",
+            document_id=uuid.uuid4(),
+            retrieval_rank=index,
+            rerank_score=None,
+            dense_score=0.70,
+            chunk_index=index,
+            filename=f"rank-{index}.txt",
+        )
+        for index in range(1, 6)
+    ]
+    candidates.append(
+        Candidate(
+            text="Версия 2.1 выпущена 01.09.2025 и описывает целевой продукт.",
+            document_id=uuid.uuid4(),
+            retrieval_rank=6,
+            rerank_score=None,
+            dense_score=0.65,
+            chunk_index=6,
+            filename="relevant.txt",
+        )
+    )
+
+    context = build_context(
+        "Какой продукт имеет версию 2.1 от 01.09.2025?",
+        candidates,
+        max_context_chars=5000,
+        max_source_chars=1000,
+        max_sources=5,
+        source_similarity_threshold=1.1,
+        query_selection_weight=0.0,
+    )
+
+    assert [source.filename for source in context.sources] == [
+        f"rank-{index}.txt" for index in range(1, 6)
+    ]
+
+
+def test_context_selector_does_not_override_strong_reranker_gap() -> None:
+    reranked = [
+        Candidate(
+            text="Семантически релевантное описание целевого решения без повторения вопроса.",
+            document_id=uuid.uuid4(),
+            retrieval_rank=1,
+            rerank_score=0.95,
+            filename="reranker-winner.txt",
+        ),
+        Candidate(
+            text="Версия 2.1 от 01.09.2025 упомянута буквально.",
+            document_id=uuid.uuid4(),
+            retrieval_rank=2,
+            rerank_score=0.30,
+            filename="literal-match.txt",
+        ),
+    ]
+
+    context = build_context(
+        "Какая версия 2.1 опубликована 01.09.2025?",
+        reranked,
+        max_context_chars=3000,
+        max_source_chars=1000,
+        max_sources=2,
+        query_selection_weight=0.30,
+    )
+
+    assert context.sources[0].filename == "reranker-winner.txt"
+    assert context.sources[0].selection_score > context.sources[1].selection_score
+
+
 def test_citation_audit_rejects_unknown_indices() -> None:
     audit = audit_citations("Факт подтверждён [1], но ссылка [9] не существует.", [1, 2])
 

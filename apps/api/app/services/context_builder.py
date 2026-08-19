@@ -22,6 +22,14 @@ QUERY_STOP_WORDS = {
     "какой",
     "какая",
     "какие",
+    "какого",
+    "какому",
+    "каким",
+    "каком",
+    "который",
+    "которая",
+    "которые",
+    "которого",
     "как",
     "для",
     "чего",
@@ -39,6 +47,11 @@ QUERY_STOP_WORDS = {
     "когда",
     "зачем",
 }
+
+QUERY_ANCHOR_WEIGHT = 2.0
+QUERY_LONG_TERM_WEIGHT = 1.25
+QUERY_ANCHOR_SHARE = 0.35
+RERANK_QUERY_SELECTION_MAX_WEIGHT = 0.10
 
 
 class SearchResultLike(Protocol):
@@ -81,6 +94,8 @@ class ContextSource:
     knowledge_base_name: str | None
     knowledge_base_version: int | None
     quality_score: float
+    query_relevance_score: float
+    selection_score: float
 
     @property
     def citation(self) -> str:
@@ -134,6 +149,89 @@ def _query_terms(query: str) -> set[str]:
         for token in WORD_RE.findall(query)
         if len(token) >= 3 and token.casefold() not in QUERY_STOP_WORDS
     }
+
+
+def _normalise_signal_token(value: str) -> str:
+    return value.casefold().replace("ё", "е").replace(".", "").replace("-", "")
+
+
+def _query_signal_weights(query: str) -> tuple[dict[str, float], set[str]]:
+    """Return weighted query terms and high-precision anchors.
+
+    Numbers, versions, dates, and uppercase abbreviations carry more intent than
+    ordinary words. Every signal comes from the current query; the selector does
+    not depend on product-specific aliases.
+    """
+
+    weights: dict[str, float] = {}
+    anchors: set[str] = set()
+    for raw_token in WORD_RE.findall(query):
+        token = _normalise_signal_token(raw_token)
+        if not token or token in QUERY_STOP_WORDS:
+            continue
+
+        has_digit = any(char.isdigit() for char in raw_token)
+        is_abbreviation = len(token) >= 3 and raw_token.isupper()
+        has_compound_marker = any(marker in raw_token for marker in (".", "-"))
+        if len(token) < 3 and not has_digit:
+            continue
+
+        is_anchor = has_digit or is_abbreviation or has_compound_marker
+        if is_anchor:
+            weight = QUERY_ANCHOR_WEIGHT
+            anchors.add(token)
+        elif len(token) >= 8:
+            weight = QUERY_LONG_TERM_WEIGHT
+        else:
+            weight = 1.0
+        weights[token] = max(weights.get(token, 0.0), weight)
+    return weights, anchors
+
+
+def _query_relevance_score(
+    result: SearchResultLike,
+    signal_weights: dict[str, float],
+    anchors: set[str],
+) -> float:
+    if not signal_weights:
+        return 0.0
+
+    values = [result.text, result.heading or "", result.heading_breadcrumb or ""]
+    content_tokens = {
+        token
+        for value in values
+        for raw_token in WORD_RE.findall(value)
+        if (token := _normalise_signal_token(raw_token))
+    }
+    total_weight = sum(signal_weights.values())
+    matched_weight = sum(
+        weight for token, weight in signal_weights.items() if token in content_tokens
+    )
+    weighted_coverage = matched_weight / total_weight if total_weight else 0.0
+    if not anchors:
+        return weighted_coverage
+
+    anchor_coverage = len(anchors & content_tokens) / len(anchors)
+    return (
+        (1.0 - QUERY_ANCHOR_SHARE) * weighted_coverage
+        + QUERY_ANCHOR_SHARE * anchor_coverage
+    )
+
+
+def _selection_score(
+    result: SearchResultLike,
+    *,
+    quality_score: float,
+    query_relevance_score: float,
+    query_selection_weight: float,
+) -> float:
+    effective_weight = query_selection_weight
+    if result.rerank_score is not None:
+        effective_weight = min(effective_weight, RERANK_QUERY_SELECTION_MAX_WEIGHT)
+    return (
+        (1.0 - effective_weight) * quality_score
+        + effective_weight * query_relevance_score
+    )
 
 
 def focused_context_excerpt(value: str, query: str, max_chars: int) -> str:
@@ -240,6 +338,7 @@ def build_context(
     max_sources_per_document: int = 3,
     strong_evidence_score: float = 0.50,
     limited_evidence_score: float = 0.15,
+    query_selection_weight: float = 0.30,
 ) -> BuiltContext:
     candidates = list(results)
     candidate_scores = [source_quality_score(result) for result in candidates]
@@ -273,7 +372,40 @@ def build_context(
     rejected_document_cap = 0
     score_floor = max(min_source_score, (best_score or 0.0) * relative_source_score)
 
-    for result, quality_score in zip(candidates, candidate_scores, strict=True):
+    signal_weights, anchors = _query_signal_weights(question)
+    ranked_candidates: list[tuple[SearchResultLike, float, float, float, int]] = []
+    for position, (result, quality_score) in enumerate(
+        zip(candidates, candidate_scores, strict=True)
+    ):
+        query_relevance_score = _query_relevance_score(
+            result,
+            signal_weights,
+            anchors,
+        )
+        selection_score = _selection_score(
+            result,
+            quality_score=quality_score,
+            query_relevance_score=query_relevance_score,
+            query_selection_weight=query_selection_weight,
+        )
+        ranked_candidates.append(
+            (
+                result,
+                quality_score,
+                query_relevance_score,
+                selection_score,
+                position,
+            )
+        )
+    ranked_candidates.sort(key=lambda item: (-item[3], item[4]))
+
+    for (
+        result,
+        quality_score,
+        query_relevance_score,
+        selection_score,
+        _,
+    ) in ranked_candidates:
         if len(sources) >= max_sources:
             break
         if quality_score < score_floor:
@@ -312,6 +444,8 @@ def build_context(
             rerank_score=result.rerank_score,
             rerank_fusion_score=result.rerank_fusion_score,
             quality_score=quality_score,
+            query_relevance_score=query_relevance_score,
+            selection_score=selection_score,
             source_scope=getattr(result, "source_scope", "workspace"),
             knowledge_base_name=getattr(result, "knowledge_base_name", None),
             knowledge_base_version=getattr(result, "knowledge_base_version", None),

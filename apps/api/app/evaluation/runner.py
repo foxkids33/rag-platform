@@ -259,6 +259,7 @@ async def evaluate_case(
     rerank: bool,
     include_answers: bool,
     answer_temperature: float,
+    query_selection_weight: float,
 ) -> dict[str, Any]:
     search_started = perf_counter()
     search_response = await client.post(
@@ -298,6 +299,7 @@ async def evaluate_case(
                 "mode": mode,
                 "rerank": rerank,
                 "temperature": answer_temperature,
+                "query_selection_weight": query_selection_weight,
             },
         )
         answer_response.raise_for_status()
@@ -420,6 +422,7 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
                     rerank=args.rerank,
                     include_answers=args.answers,
                     answer_temperature=args.answer_temperature,
+                    query_selection_weight=args.query_selection_weight,
                 )
             except (httpx.HTTPError, KeyError, TypeError, ValueError) as exc:
                 errors.append({"case_id": case.id, "error": str(exc)})
@@ -454,6 +457,7 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
             "rerank": args.rerank,
             "answers": args.answers,
             "answer_temperature": args.answer_temperature,
+            "query_selection_weight": args.query_selection_weight,
             "case_details_included": not args.omit_case_details,
         },
         "requested_case_count": len(cases),
@@ -491,6 +495,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Generation temperature used by answer evaluation requests",
     )
     parser.add_argument(
+        "--query-selection-weight",
+        type=float,
+        default=0.30,
+        help="Query-aware context selection weight used by answer requests",
+    )
+    parser.add_argument(
         "--token",
         help="OIDC access token; prefer the RAG_API_TOKEN environment variable",
     )
@@ -512,6 +522,8 @@ def main() -> int:
         parser.error("--limit must be between 1 and 20")
     if args.answer_temperature < 0.0 or args.answer_temperature > 2.0:
         parser.error("--answer-temperature must be between 0 and 2")
+    if args.query_selection_weight < 0.0 or args.query_selection_weight > 1.0:
+        parser.error("--query-selection-weight must be between 0 and 1")
 
     try:
         report = asyncio.run(run(args))

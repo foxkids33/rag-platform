@@ -30,6 +30,7 @@
     "configuration.rerank": false,
     "configuration.answers": true,
     "configuration.answer_temperature": 0.0,
+    "configuration.query_selection_weight": 0.3,
     "configuration.case_details_included": true
   }
 }

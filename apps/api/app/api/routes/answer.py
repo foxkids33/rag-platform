@@ -83,6 +83,7 @@ class AnswerRequest(BaseModel):
     rerank: bool = True
     max_tokens: int | None = Field(default=None, ge=64, le=4096)
     temperature: float | None = Field(default=None, ge=0.0, le=2.0)
+    query_selection_weight: float | None = Field(default=None, ge=0.0, le=1.0)
 
 
 class AnswerSource(BaseModel):
@@ -100,6 +101,8 @@ class AnswerSource(BaseModel):
     rerank_score: float | None
     rerank_fusion_score: float | None
     quality_score: float
+    query_relevance_score: float
+    selection_score: float
     source_scope: str
     knowledge_base_name: str | None
     knowledge_base_version: int | None
@@ -112,6 +115,7 @@ class AnswerResponse(BaseModel):
     model: str
     finish_reason: str | None
     generation_temperature: float
+    query_selection_weight: float
     retrieval_mode: str
     workspace_source_mode: str
     knowledge_base_id: uuid.UUID | None
@@ -141,6 +145,7 @@ class PreparedAnswer:
     messages: list[dict[str, str]]
     max_tokens: int
     temperature: float
+    query_selection_weight: float
     conversation: ChatSession | None
     parent_message_id: uuid.UUID | None
     history: list[HistoryMessage]
@@ -164,6 +169,8 @@ def _answer_sources(sources: list[ContextSource]) -> list[AnswerSource]:
             rerank_score=source.rerank_score,
             rerank_fusion_score=source.rerank_fusion_score,
             quality_score=source.quality_score,
+            query_relevance_score=source.query_relevance_score,
+            selection_score=source.selection_score,
             source_scope=source.source_scope,
             knowledge_base_name=source.knowledge_base_name,
             knowledge_base_version=source.knowledge_base_version,
@@ -307,6 +314,11 @@ async def _prepare_answer(
     retrieval_query = await _standalone_retrieval_query(question, history)
     source_limit = payload.source_limit or settings.rag_source_limit
     retrieval_limit = max(payload.retrieval_limit, source_limit)
+    query_selection_weight = (
+        settings.rag_query_selection_weight
+        if payload.query_selection_weight is None
+        else payload.query_selection_weight
+    )
 
     search_response = await search(
         workspace_id=workspace_id,
@@ -329,6 +341,7 @@ async def _prepare_answer(
         relative_source_score=settings.rag_relative_source_score,
         source_similarity_threshold=settings.rag_source_similarity_threshold,
         max_sources_per_document=settings.rag_max_sources_per_document,
+        query_selection_weight=query_selection_weight,
         strong_evidence_score=settings.rag_strong_evidence_score,
         limited_evidence_score=settings.rag_limited_evidence_score,
     )
@@ -346,6 +359,7 @@ async def _prepare_answer(
         messages=[] if abstained else _messages(question, context, history),
         max_tokens=max_tokens,
         temperature=temperature,
+        query_selection_weight=query_selection_weight,
         conversation=conversation,
         parent_message_id=parent_message_id,
         history=history,
@@ -369,6 +383,7 @@ def _quality_payload(
         "abstention_reason": effective_reason,
         "evidence_status": prepared.context.evidence_status,
         "evidence_score": prepared.context.evidence_score,
+        "query_selection_weight": prepared.query_selection_weight,
         "candidate_count": prepared.context.candidate_count,
         "selected_source_count": len(prepared.context.sources),
         "rejected_low_score": prepared.context.rejected_low_score,
@@ -583,6 +598,7 @@ async def answer(
         model=output.model,
         finish_reason=output.finish_reason,
         generation_temperature=prepared.temperature,
+        query_selection_weight=prepared.query_selection_weight,
         retrieval_mode=prepared.search_response.mode,
         workspace_source_mode=prepared.search_response.workspace_source_mode.value,
         knowledge_base_id=prepared.search_response.knowledge_base_id,

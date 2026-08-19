@@ -72,6 +72,7 @@ class Settings(BaseSettings):
     rag_relative_source_score: float = 0.25
     rag_source_similarity_threshold: float = 0.78
     rag_max_sources_per_document: int = 3
+    rag_query_selection_weight: float = Field(default=0.30, ge=0.0, le=1.0)
     rag_strong_evidence_score: float = 0.50
     rag_limited_evidence_score: float = 0.15
     embedding_base_url: str = "http://embedding:8080"

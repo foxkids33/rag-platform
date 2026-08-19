@@ -71,6 +71,8 @@ def _prepared_answer() -> PreparedAnswer:
         knowledge_base_name=None,
         knowledge_base_version=None,
         quality_score=0.8,
+        query_relevance_score=0.6,
+        selection_score=0.74,
     )
     context = BuiltContext(
         text="[1] Источник: document.txt\nФрагмент не содержит запрошенного факта.",
@@ -104,6 +106,7 @@ def _prepared_answer() -> PreparedAnswer:
         messages=[{"role": "user", "content": "test"}],
         max_tokens=128,
         temperature=0.1,
+        query_selection_weight=0.3,
         conversation=None,
         parent_message_id=None,
         history=[],
@@ -239,6 +242,9 @@ def test_non_stream_answer_exposes_model_abstention(monkeypatch) -> None:
 
     assert response.answer == INSUFFICIENT_EVIDENCE_ANSWER
     assert response.generation_temperature == 0.1
+    assert response.query_selection_weight == 0.3
+    assert response.sources[0].query_relevance_score == 0.6
+    assert response.sources[0].selection_score == 0.74
     assert response.abstained is True
     assert response.abstention_reason == "model_reported_insufficient_context"
     assert response.citation_valid is True

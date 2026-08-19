@@ -93,6 +93,7 @@ def test_evaluate_case_uses_filenames_as_stable_gold_keys() -> None:
                 rerank=True,
                 include_answers=False,
                 answer_temperature=0.0,
+                query_selection_weight=0.3,
             )
 
     result = asyncio.run(run_case())
@@ -122,6 +123,7 @@ def test_evaluate_case_scores_answer_and_only_cited_source_text() -> None:
             )
         request_payload = json.loads(request.content)
         assert request_payload["temperature"] == 0.0
+        assert request_payload["query_selection_weight"] == 0.3
         return httpx.Response(
             200,
             json={
@@ -170,6 +172,7 @@ def test_evaluate_case_scores_answer_and_only_cited_source_text() -> None:
                 rerank=False,
                 include_answers=True,
                 answer_temperature=0.0,
+                query_selection_weight=0.3,
             )
 
     result = asyncio.run(run_case())

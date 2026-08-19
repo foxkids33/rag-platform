@@ -57,6 +57,7 @@ type StoredMessageMetadata = {
   status?: "complete" | "streaming" | "stopped" | "error";
   model?: string;
   generation_temperature?: number;
+  query_selection_weight?: number;
   retrieval_query?: string;
   retrieval_mode?: string;
   workspace_source_mode?: WorkspaceSourceMode;
@@ -117,6 +118,8 @@ type AnswerSource = {
   rerank_score: number | null;
   rerank_fusion_score: number | null;
   quality_score: number;
+  query_relevance_score: number;
+  selection_score: number;
   source_scope: "workspace" | "knowledge_base";
   knowledge_base_name: string | null;
   knowledge_base_version: number | null;
@@ -130,6 +133,7 @@ type StreamMetadata = {
   parent_message_id: string | null;
   model: string;
   generation_temperature: number;
+  query_selection_weight: number;
   retrieval_mode: string;
   workspace_source_mode: WorkspaceSourceMode;
   knowledge_base_id: string | null;
@@ -157,6 +161,7 @@ type StreamDone = {
   abstention_reason?: AbstentionReason | null;
   evidence_status?: "strong" | "limited" | "insufficient";
   evidence_score?: number | null;
+  query_selection_weight?: number;
   candidate_count?: number;
   selected_source_count?: number;
 };
@@ -286,6 +291,7 @@ function storedMessageToChat(message: StoredMessage): ChatMessage {
         parent_message_id: message.parent_message_id,
         model: message.metadata.model,
         generation_temperature: message.metadata.generation_temperature ?? 0,
+        query_selection_weight: message.metadata.query_selection_weight ?? 0.3,
         retrieval_mode: message.metadata.retrieval_mode || "hybrid",
         workspace_source_mode: message.metadata.workspace_source_mode || "USER_DOCUMENTS",
         knowledge_base_id: message.metadata.knowledge_base_id ?? null,
