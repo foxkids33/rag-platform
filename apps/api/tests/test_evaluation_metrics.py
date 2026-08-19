@@ -58,6 +58,43 @@ def test_fact_matching_normalizes_typography_and_pdf_hyphenation() -> None:
     assert fact_coverage(("20-28 узлов", "REST API"), text) == 1.0
 
 
+def test_fact_matching_tolerates_russian_inflection() -> None:
+    text = (
+        "Система предназначена для работы со структурированными данными "
+        "и распределенными вычислениями."
+    )
+
+    assert fact_coverage(("структурированных данных",), text) == 1.0
+
+
+def test_fact_matching_keeps_numbers_exact() -> None:
+    text = "Высокоскоростная сеть работает на скорости 250 Гбит/с."
+
+    assert fact_coverage(("25 Гбит/с",), text) == 0.0
+    assert fact_coverage(("250 Гбит/с",), text) == 1.0
+
+
+def test_fact_matching_does_not_confuse_negated_term() -> None:
+    text = "Система работает со структурированными данными."
+
+    assert fact_coverage(("неструктурированных данных",), text) == 0.0
+
+
+def test_fact_matching_keeps_latin_identifiers_exact() -> None:
+    text = "Для передачи сообщений используется Kafka."
+
+    assert fact_coverage(("Kafka",), text) == 1.0
+    assert fact_coverage(("Kafkax",), text) == 0.0
+
+
+def test_fact_matching_keeps_versions_and_dates_exact() -> None:
+    text = "Версия 2.1 от 01.09.2025."
+
+    assert fact_coverage(("2.1", "01.09.2025"), text) == 1.0
+    assert fact_coverage(("2.10",), text) == 0.0
+    assert fact_coverage(("01.09.2024",), text) == 0.0
+
+
 def test_answer_metrics_check_facts_values_forbidden_text_and_citations() -> None:
     case = EvaluationCase(
         id="exact-001",

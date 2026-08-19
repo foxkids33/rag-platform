@@ -20,6 +20,10 @@ from app.evaluation.models import (
 
 NON_WORD_RE = re.compile(r"[^0-9a-zа-я]+")
 HYPHENATED_WORD_RE = re.compile(r"(?<=[0-9a-zа-я])-\s*(?=[0-9a-zа-я])")
+CYRILLIC_WORD_RE = re.compile(r"^[а-я]+$")
+MORPH_MIN_STEM_LENGTH = 3
+MORPH_MAX_SUFFIX_LENGTH = 4
+MORPH_MIN_STEM_RATIO = 0.70
 
 
 def recall_at_k(
@@ -142,10 +146,74 @@ def normalize_for_match(value: str) -> str:
     return " ".join(NON_WORD_RE.sub(" ", normalized).split())
 
 
+def _common_prefix_length(left: str, right: str) -> int:
+    length = 0
+    for left_char, right_char in zip(left, right, strict=False):
+        if left_char != right_char:
+            break
+        length += 1
+    return length
+
+
+def _russian_inflection_match(expected: str, actual: str) -> bool:
+    """Match conservative Russian inflection variants without fuzzy value matching."""
+
+    if expected == actual:
+        return True
+
+    if (
+        CYRILLIC_WORD_RE.fullmatch(expected) is None
+        or CYRILLIC_WORD_RE.fullmatch(actual) is None
+    ):
+        return False
+
+    common = _common_prefix_length(expected, actual)
+    if common < MORPH_MIN_STEM_LENGTH:
+        return False
+
+    expected_suffix = len(expected) - common
+    actual_suffix = len(actual) - common
+    if (
+        expected_suffix > MORPH_MAX_SUFFIX_LENGTH
+        or actual_suffix > MORPH_MAX_SUFFIX_LENGTH
+    ):
+        return False
+
+    shorter = min(len(expected), len(actual))
+    return common / shorter >= MORPH_MIN_STEM_RATIO
+
+
+def _contains_normalized_fact(normalized_text: str, normalized_fact: str) -> bool:
+    if not normalized_fact:
+        return False
+
+    if normalized_fact in normalized_text:
+        return True
+
+    expected_tokens = normalized_fact.split()
+    text_tokens = normalized_text.split()
+    width = len(expected_tokens)
+    if width == 0 or len(text_tokens) < width:
+        return False
+
+    for start in range(len(text_tokens) - width + 1):
+        window = text_tokens[start : start + width]
+        if all(
+            _russian_inflection_match(expected, actual)
+            for expected, actual in zip(expected_tokens, window, strict=True)
+        ):
+            return True
+
+    return False
+
+
 def _contains_fact(text: str, fact: str) -> bool:
     normalized_text = normalize_for_match(text)
     alternatives = [item for item in fact.split("||") if item.strip()]
-    return any(normalize_for_match(item) in normalized_text for item in alternatives)
+    return any(
+        _contains_normalized_fact(normalized_text, normalize_for_match(item))
+        for item in alternatives
+    )
 
 
 def fact_coverage(facts: Iterable[str], text: str) -> float | None:
