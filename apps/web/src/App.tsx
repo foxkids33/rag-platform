@@ -12,6 +12,8 @@ import {
 import { readSseEvents } from "./sse";
 import { KnowledgeBaseManager } from "./KnowledgeBaseManager";
 import { ConversationGraph } from "./ConversationGraph";
+import { ConfluenceImportPanel } from "./ConfluenceImportPanel";
+import { apiFetch as fetch } from "./api";
 
 type WorkspaceSourceMode = "USER_DOCUMENTS" | "KNOWLEDGE_BASE" | "HYBRID";
 
@@ -71,6 +73,8 @@ type StoredMessageMetadata = {
   evidence_score?: number | null;
   candidate_count?: number;
   selected_source_count?: number;
+  required_anchor_count?: number;
+  matched_anchor_count?: number;
   citation_valid?: boolean | null;
   cited_source_indices?: number[];
   invalid_citations?: number[];
@@ -100,6 +104,12 @@ type DocumentRecord = {
   sha256: string;
   status: string;
   search_enabled: boolean;
+  title: string | null;
+  source_url: string | null;
+  source_type: "UPLOAD" | "CONFLUENCE";
+  external_id: string | null;
+  external_version: string | null;
+  synced_at: string | null;
   created_at: string;
 };
 
@@ -123,6 +133,9 @@ type AnswerSource = {
   source_scope: "workspace" | "knowledge_base";
   knowledge_base_name: string | null;
   knowledge_base_version: number | null;
+  source_url?: string | null;
+  source_page_id?: string | null;
+  source_version?: string | null;
 };
 
 type StreamMetadata = {
@@ -146,6 +159,8 @@ type StreamMetadata = {
   evidence_score: number | null;
   candidate_count: number;
   selected_source_count: number;
+  required_anchor_count: number;
+  matched_anchor_count: number;
   citation_valid: boolean | null;
   cited_source_indices: number[];
   invalid_citations: number[];
@@ -164,6 +179,8 @@ type StreamDone = {
   query_selection_weight?: number;
   candidate_count?: number;
   selected_source_count?: number;
+  required_anchor_count?: number;
+  matched_anchor_count?: number;
 };
 
 type ChatMessage = {
@@ -177,17 +194,27 @@ type ChatMessage = {
 };
 
 type StreamStage = "idle" | "retrieving" | "generating";
+type ViewMode = "chat" | "documents" | "confluence" | "knowledge" | "graph";
 type AbstentionReason =
   | "insufficient_retrieval_evidence"
-  | "model_reported_insufficient_context";
+  | "model_reported_insufficient_context"
+  | "citation_validation_failed";
 
-const API = import.meta.env.VITE_API_BASE_URL || "http://localhost:8000";
+const API = import.meta.env.VITE_API_BASE_URL || "";
 const ACCEPTED_FILES = ".txt,.md,.csv,.json,.html,.htm,.xml,.pdf,.docx";
 const SUGGESTED_QUESTIONS = [
   "Кратко опиши назначение продукта",
   "Какие ключевые компоненты входят в решение?",
   "Как обеспечивается отказоустойчивость?",
 ];
+
+const COLLAPSED_CONVERSATION_COUNT = 6;
+const VIEW_MODES = new Set<ViewMode>(["chat", "documents", "confluence", "knowledge", "graph"]);
+
+function initialViewMode(): ViewMode {
+  const candidate = window.location.hash.replace(/^#/, "") as ViewMode;
+  return VIEW_MODES.has(candidate) ? candidate : "chat";
+}
 
 async function readJson<T>(response: Response): Promise<T> {
   if (!response.ok) {
@@ -239,6 +266,90 @@ function pageLabel(source: AnswerSource): string | null {
     return `стр. ${source.page_start}`;
   }
   return `стр. ${source.page_start}–${source.page_end}`;
+}
+
+type WorkspaceDocumentListProps = {
+  documents: DocumentRecord[];
+  emptyText: string;
+  actionId: string | null;
+  onToggle: (document: DocumentRecord) => void;
+  onDelete: (document: DocumentRecord) => void;
+};
+
+function WorkspaceDocumentList({
+  documents,
+  emptyText,
+  actionId,
+  onToggle,
+  onDelete,
+}: WorkspaceDocumentListProps) {
+  if (documents.length === 0) {
+    return (
+      <div className="resource-empty">
+        <span aria-hidden="true">◇</span>
+        <strong>{emptyText}</strong>
+        <small>Новые источники появятся здесь после отправки в обработку.</small>
+      </div>
+    );
+  }
+
+  return (
+    <div className="resource-document-list">
+      {documents.map((document) => {
+        const busy = document.status === "QUEUED" || document.status === "PROCESSING";
+        const actionPending = actionId === document.id;
+        const excluded = document.status === "READY" && !document.search_enabled;
+        const title = document.title || document.filename;
+
+        return (
+          <article className={`resource-document ${excluded ? "excluded" : ""}`} key={document.id}>
+            <div className={`resource-document-icon ${document.source_type.toLowerCase()}`} aria-hidden="true">
+              {document.source_type === "CONFLUENCE" ? "C" : "▤"}
+            </div>
+            <div className="resource-document-copy">
+              <strong title={title}>
+                {document.source_url ? (
+                  <a className="document-source-link" href={document.source_url} target="_blank" rel="noreferrer">
+                    {title}
+                  </a>
+                ) : title}
+              </strong>
+              <span>
+                {document.source_type === "CONFLUENCE" ? "Confluence" : document.filename}
+                {document.external_version ? ` · версия ${document.external_version}` : ""}
+                {` · ${new Date(document.synced_at || document.created_at).toLocaleString("ru-RU")}`}
+              </span>
+            </div>
+            <span className={`badge ${excluded ? "status-excluded" : `status-${document.status.toLowerCase()}`}`}>
+              {excluded ? "Не в поиске" : statusLabel(document.status)}
+            </span>
+            <div className="resource-document-actions">
+              <button
+                className="document-action"
+                type="button"
+                disabled={document.status !== "READY" || Boolean(actionId)}
+                onClick={() => onToggle(document)}
+                title={document.search_enabled ? "Исключить из поиска" : "Вернуть в поиск"}
+                aria-label={document.search_enabled ? "Исключить документ из поиска" : "Вернуть документ в поиск"}
+              >
+                {actionPending ? "…" : document.search_enabled ? "⊘" : "↻"}
+              </button>
+              <button
+                className="document-action danger"
+                type="button"
+                disabled={busy || Boolean(actionId)}
+                onClick={() => onDelete(document)}
+                title={busy ? "Дождитесь завершения обработки" : "Удалить документ навсегда"}
+                aria-label="Удалить документ навсегда"
+              >
+                {actionPending ? "…" : "×"}
+              </button>
+            </div>
+          </article>
+        );
+      })}
+    </div>
+  );
 }
 
 function sourceTitle(source: AnswerSource): string {
@@ -304,6 +415,8 @@ function storedMessageToChat(message: StoredMessage): ChatMessage {
         evidence_score: message.metadata.evidence_score ?? null,
         candidate_count: message.metadata.candidate_count || 0,
         selected_source_count: message.metadata.selected_source_count || (sources?.length ?? 0),
+        required_anchor_count: message.metadata.required_anchor_count || 0,
+        matched_anchor_count: message.metadata.matched_anchor_count || 0,
         citation_valid: message.metadata.citation_valid ?? null,
         cited_source_indices: message.metadata.cited_source_indices || [],
         invalid_citations: message.metadata.invalid_citations || [],
@@ -335,6 +448,7 @@ export function App() {
   const [selectedWorkspaceId, setSelectedWorkspaceId] = useState("");
   const [documents, setDocuments] = useState<DocumentRecord[]>([]);
   const [conversations, setConversations] = useState<ConversationSummary[]>([]);
+  const [showAllConversations, setShowAllConversations] = useState(false);
   const [selectedConversationId, setSelectedConversationId] = useState("");
   const [conversationLoading, setConversationLoading] = useState(false);
   const [conversationActionId, setConversationActionId] = useState<string | null>(null);
@@ -343,11 +457,16 @@ export function App() {
   const [dragging, setDragging] = useState(false);
   const [documentActionId, setDocumentActionId] = useState<string | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
-  const [viewMode, setViewMode] = useState<"chat" | "graph">("chat");
+  const [viewMode, setViewMode] = useState<ViewMode>(initialViewMode);
   const [branchParentId, setBranchParentId] = useState<string | null>(null);
   const [question, setQuestion] = useState("");
   const [streamStage, setStreamStage] = useState<StreamStage>("idle");
   const [error, setError] = useState("");
+
+  const selectViewMode = (mode: ViewMode) => {
+    setViewMode(mode);
+    window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}#${mode}`);
+  };
 
   const selectedWorkspace = useMemo(
     () => workspaces.find((workspace) => workspace.id === selectedWorkspaceId) ?? null,
@@ -377,6 +496,11 @@ export function App() {
   const searchableCount = documents.filter((document) => (
     document.status === "READY" && document.search_enabled
   )).length;
+  const uploadedDocuments = documents.filter((document) => document.source_type === "UPLOAD");
+  const confluenceDocuments = documents.filter((document) => document.source_type === "CONFLUENCE");
+  const confluenceSearchableCount = confluenceDocuments.filter((document) => (
+    document.status === "READY" && document.search_enabled
+  )).length;
   const hasActiveKnowledgeBase = Boolean(
     selectedKnowledgeBase?.active_version_id
     && selectedKnowledgeBase.active_document_count > 0
@@ -387,6 +511,9 @@ export function App() {
       ? hasActiveKnowledgeBase
       : searchableCount > 0 || hasActiveKnowledgeBase;
   const isStreaming = streamStage !== "idle";
+  const visibleConversations = showAllConversations
+    ? conversations
+    : conversations.slice(0, COLLAPSED_CONVERSATION_COUNT);
   const canSubmit = Boolean(
     selectedWorkspaceId
     && hasSearchableContent
@@ -552,6 +679,7 @@ export function App() {
     setMessages([]);
     setBranchParentId(null);
     setConversations([]);
+    setShowAllConversations(false);
     setSelectedConversationId("");
     setQuestion("");
     setError("");
@@ -968,11 +1096,14 @@ export function App() {
     <div className="app-shell">
       <header className="topbar">
         <div className="brand">Скала<span>^р</span><small>RAG</small></div>
-        <nav>
-          <button className={viewMode === "chat" ? "active" : ""} onClick={() => setViewMode("chat")}>Чат</button>
+        <nav aria-label="Основная навигация">
+          <button className={viewMode === "chat" ? "active" : ""} onClick={() => selectViewMode("chat")}>Чат</button>
+          <button className={viewMode === "documents" ? "active" : ""} onClick={() => selectViewMode("documents")}>Документы</button>
+          <button className={viewMode === "confluence" ? "active" : ""} onClick={() => selectViewMode("confluence")}>Confluence</button>
+          <button className={viewMode === "knowledge" ? "active" : ""} onClick={() => selectViewMode("knowledge")}>Базы знаний</button>
           <button
             className={viewMode === "graph" ? "active" : ""}
-            onClick={() => setViewMode("graph")}
+            onClick={() => selectViewMode("graph")}
             disabled={!selectedConversationId}
           >
             Граф
@@ -1065,13 +1196,27 @@ export function App() {
             </p>
           </section>
 
-          <KnowledgeBaseManager
-            apiBaseUrl={API}
-            knowledgeBases={knowledgeBases}
-            refreshKnowledgeBases={refreshKnowledgeBases}
-            refreshWorkspaces={refreshWorkspaces}
-            onError={setError}
-          />
+          <section className="source-shortcuts">
+            <div className="section-title">
+              <h3>Источники</h3>
+              <span className="counter">{searchableCount} готово</span>
+            </div>
+            <button type="button" onClick={() => selectViewMode("documents")}>
+              <span className="source-shortcut-icon">▤</span>
+              <span><strong>Документы</strong><small>{uploadedDocuments.length} файлов workspace</small></span>
+              <i>›</i>
+            </button>
+            <button type="button" onClick={() => selectViewMode("confluence")}>
+              <span className="source-shortcut-icon confluence">C</span>
+              <span><strong>Confluence</strong><small>{confluenceDocuments.length} страниц</small></span>
+              <i>›</i>
+            </button>
+            <button type="button" onClick={() => selectViewMode("knowledge")}>
+              <span className="source-shortcut-icon knowledge">◆</span>
+              <span><strong>Базы знаний</strong><small>{knowledgeBases.length} баз</small></span>
+              <i>›</i>
+            </button>
+          </section>
 
           <section className="chat-history-section">
             <div className="section-title">
@@ -1091,7 +1236,7 @@ export function App() {
               {!conversationLoading && conversations.length === 0 && (
                 <p className="empty-documents">Диалогов пока нет</p>
               )}
-              {conversations.map((conversation) => (
+              {visibleConversations.map((conversation) => (
                 <div
                   className={`chat-history-item ${selectedConversationId === conversation.id ? "active" : ""}`}
                   key={conversation.id}
@@ -1120,91 +1265,154 @@ export function App() {
                 </div>
               ))}
             </div>
+            {conversations.length > COLLAPSED_CONVERSATION_COUNT && (
+              <button
+                type="button"
+                className="chat-history-more"
+                onClick={() => setShowAllConversations((current) => !current)}
+                aria-expanded={showAllConversations}
+              >
+                {showAllConversations
+                  ? "Свернуть"
+                  : `Показать ещё ${conversations.length - COLLAPSED_CONVERSATION_COUNT}`}
+                <span aria-hidden="true">{showAllConversations ? "↑" : "↓"}</span>
+              </button>
+            )}
           </section>
 
-          <section>
-            <div className="section-title">
-              <h3>Документы</h3>
-              <span className="counter">{searchableCount}/{documents.length} локальных включено</span>
-            </div>
-            <input
-              ref={fileInput}
-              type="file"
-              multiple
-              accept={ACCEPTED_FILES}
-              hidden
-              onChange={(event) => event.target.files && void uploadFiles(event.target.files)}
-            />
-            <div
-              className={`dropzone ${dragging ? "dragging" : ""} ${uploading ? "busy" : ""}`}
-              onClick={() => !uploading && fileInput.current?.click()}
-              onDragOver={(event) => { event.preventDefault(); setDragging(true); }}
-              onDragLeave={() => setDragging(false)}
-              onDrop={handleDrop}
-              role="button"
-              tabIndex={0}
-            >
-              <strong>{uploading ? "Загрузка…" : "Добавить документы"}</strong>
-              <small>PDF, DOCX, TXT, MD, CSV, JSON, HTML, XML</small>
-            </div>
-
-            <div className="document-list">
-              {documents.length === 0 && <p className="empty-documents">Документов пока нет</p>}
-              {documents.map((document) => {
-                const busy = document.status === "QUEUED" || document.status === "PROCESSING";
-                const actionPending = documentActionId === document.id;
-                const excluded = document.status === "READY" && !document.search_enabled;
-
-                return (
-                  <div
-                    className={`document-item ${excluded ? "excluded" : ""}`}
-                    key={document.id}
-                    title={document.filename}
-                  >
-                    <div className="document-icon">▤</div>
-                    <div className="document-info">
-                      <strong>{document.filename}</strong>
-                      <span>{new Date(document.created_at).toLocaleString("ru-RU")}</span>
-                    </div>
-                    <span className={`badge ${excluded ? "status-excluded" : `status-${document.status.toLowerCase()}`}`}>
-                      {excluded ? "Не в поиске" : statusLabel(document.status)}
-                    </span>
-                    <div className="document-actions">
-                      <button
-                        className="document-action"
-                        type="button"
-                        disabled={document.status !== "READY" || Boolean(documentActionId)}
-                        onClick={() => void toggleDocumentSearch(document)}
-                        title={document.search_enabled ? "Исключить из поиска" : "Вернуть в поиск"}
-                        aria-label={document.search_enabled ? "Исключить документ из поиска" : "Вернуть документ в поиск"}
-                      >
-                        {actionPending ? "…" : document.search_enabled ? "⊘" : "↻"}
-                      </button>
-                      <button
-                        className="document-action danger"
-                        type="button"
-                        disabled={busy || Boolean(documentActionId)}
-                        onClick={() => void deleteDocument(document)}
-                        title={busy ? "Дождитесь завершения обработки" : "Удалить документ навсегда"}
-                        aria-label="Удалить документ навсегда"
-                      >
-                        {actionPending ? "…" : "×"}
-                      </button>
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          </section>
-
-          <section>
+          <section className="answer-mode-section">
             <h3>Режим ответа</h3>
-            <div className="mode active"><span>Быстрый hybrid RAG</span><small>RRF + reranker</small></div>
-            <div className="mode disabled">Расширенный поиск · скоро</div>
+            <div className="mode active">
+              <span><i aria-hidden="true" /> Hybrid RAG</span>
+              <small>Dense + полнотекстовый поиск · RRF</small>
+            </div>
+            <p className="mode-note">Reranker и расширенный режим подключим после серверного A/B-теста.</p>
           </section>
         </aside>
 
-        <main className="chat">
+        <main className={`chat ${["documents", "confluence", "knowledge"].includes(viewMode) ? "management-surface" : ""}`}>
+          {error && <div className="error-banner"><span>{error}</span><button onClick={() => setError("")}>×</button></div>}
+
+          {viewMode === "documents" ? (
+            <div className="management-page">
+              <header className="management-hero">
+                <div>
+                  <span className="eyebrow">Источники workspace</span>
+                  <h1>Документы</h1>
+                  <p>Загружайте рабочие файлы и управляйте тем, что участвует в поиске.</p>
+                </div>
+                <div className="management-metrics">
+                  <span><strong>{uploadedDocuments.length}</strong> файлов</span>
+                  <span><strong>{uploadedDocuments.filter((item) => item.status === "READY" && item.search_enabled).length}</strong> в поиске</span>
+                </div>
+              </header>
+
+              <div className="resource-layout">
+                <section className="resource-card upload-card">
+                  <div className="resource-card-heading">
+                    <span className="resource-card-icon">＋</span>
+                    <div><h2>Добавить документы</h2><p>Файлы будут обработаны в фоне и автоматически появятся в списке.</p></div>
+                  </div>
+                  <input
+                    ref={fileInput}
+                    type="file"
+                    multiple
+                    accept={ACCEPTED_FILES}
+                    hidden
+                    onChange={(event) => event.target.files && void uploadFiles(event.target.files)}
+                  />
+                  <div
+                    className={`dropzone large ${dragging ? "dragging" : ""} ${uploading ? "busy" : ""}`}
+                    onClick={() => !uploading && fileInput.current?.click()}
+                    onDragOver={(event) => { event.preventDefault(); setDragging(true); }}
+                    onDragLeave={() => setDragging(false)}
+                    onDrop={handleDrop}
+                    role="button"
+                    tabIndex={0}
+                  >
+                    <span className="upload-glyph" aria-hidden="true">⇧</span>
+                    <strong>{uploading ? "Загружаю документы…" : "Перетащите файлы или выберите на компьютере"}</strong>
+                    <small>PDF, DOCX, TXT, MD, CSV, JSON, HTML и XML</small>
+                  </div>
+                </section>
+
+                <section className="resource-card resource-list-card">
+                  <div className="resource-card-heading compact">
+                    <div><h2>Файлы workspace</h2><p>Готовые документы можно временно исключить из поиска.</p></div>
+                    <span className="counter">{uploadedDocuments.length}</span>
+                  </div>
+                  <WorkspaceDocumentList
+                    documents={uploadedDocuments}
+                    emptyText="Файлов пока нет"
+                    actionId={documentActionId}
+                    onToggle={(document) => void toggleDocumentSearch(document)}
+                    onDelete={(document) => void deleteDocument(document)}
+                  />
+                </section>
+              </div>
+            </div>
+          ) : viewMode === "confluence" ? (
+            <div className="management-page confluence-page">
+              <header className="management-hero confluence-hero">
+                <div>
+                  <span className="eyebrow">Подключённый источник</span>
+                  <h1>Confluence</h1>
+                  <p>Синхронизируйте отдельные страницы или целые пространства в выбранный workspace.</p>
+                </div>
+                <div className="management-metrics">
+                  <span><strong>{confluenceDocuments.length}</strong> страниц</span>
+                  <span><strong>{confluenceSearchableCount}</strong> в поиске</span>
+                </div>
+              </header>
+
+              <div className="resource-layout confluence-layout">
+                <ConfluenceImportPanel
+                  apiBaseUrl={API}
+                  workspaceId={selectedWorkspaceId}
+                  onImported={async () => {
+                    await loadDocuments(selectedWorkspaceId);
+                    await refreshWorkspaces();
+                  }}
+                  onError={setError}
+                />
+                <section className="resource-card resource-list-card">
+                  <div className="resource-card-heading compact">
+                    <div><h2>Синхронизированные страницы</h2><p>Ссылка открывает исходную страницу в Confluence.</p></div>
+                    <span className="counter">{confluenceDocuments.length}</span>
+                  </div>
+                  <WorkspaceDocumentList
+                    documents={confluenceDocuments}
+                    emptyText="Страницы ещё не импортированы"
+                    actionId={documentActionId}
+                    onToggle={(document) => void toggleDocumentSearch(document)}
+                    onDelete={(document) => void deleteDocument(document)}
+                  />
+                </section>
+              </div>
+            </div>
+          ) : viewMode === "knowledge" ? (
+            <div className="management-page knowledge-page">
+              <header className="management-hero knowledge-hero">
+                <div>
+                  <span className="eyebrow">Управляемый контент</span>
+                  <h1>Базы знаний</h1>
+                  <p>Собирайте неизменяемые версии, проверяйте индексацию и публикуйте их атомарно.</p>
+                </div>
+                <div className="management-metrics">
+                  <span><strong>{knowledgeBases.length}</strong> баз</span>
+                  <span><strong>{knowledgeBases.filter((item) => item.active_version_id).length}</strong> активных</span>
+                </div>
+              </header>
+              <KnowledgeBaseManager
+                apiBaseUrl={API}
+                knowledgeBases={knowledgeBases}
+                refreshKnowledgeBases={refreshKnowledgeBases}
+                refreshWorkspaces={refreshWorkspaces}
+                onError={setError}
+              />
+            </div>
+          ) : (
+          <>
           <div className="chat-head">
             <div>
               <strong>{selectedConversation?.title || "Новый диалог"}</strong>
@@ -1215,15 +1423,13 @@ export function App() {
             </div>
             <div className="chat-head-stats">
               <span>{conversations.length} диалогов</span>
-              <span>{searchableCount} локальных включено</span>
+              <span>{searchableCount} документов включено</span>
               {selectedKnowledgeBase?.active_version != null && (
                 <span>KB v{selectedKnowledgeBase.active_version}</span>
               )}
               <span>Hybrid retrieval</span>
             </div>
           </div>
-
-          {error && <div className="error-banner"><span>{error}</span><button onClick={() => setError("")}>×</button></div>}
 
           {viewMode === "graph" ? (
             <ConversationGraph
@@ -1250,10 +1456,10 @@ export function App() {
               <div className="empty-state">
                 <div className="spark">✦</div>
                 <h1>Задайте вопрос по документам</h1>
-                <p>Ответ строится по hybrid retrieval, reranker и выбранным источникам. Проверяйте утверждения по ссылкам под ответом.</p>
+                <p>Ответ строится по hybrid retrieval и выбранным источникам. Проверяйте утверждения по ссылкам под ответом.</p>
                 <div className="summary-card">
                   <span><strong>{documents.length}</strong> документов workspace</span>
-                  <span><strong>{searchableCount}</strong> локальных включено</span>
+                  <span><strong>{searchableCount}</strong> включено в поиск</span>
                   {selectedKnowledgeBase?.active_version != null && (
                     <span><strong>{selectedKnowledgeBase.active_document_count}</strong> в базе знаний</span>
                   )}
@@ -1332,7 +1538,12 @@ export function App() {
                                 {source.rerank_score == null ? "—" : source.rerank_score.toFixed(3)}
                               </span>
                             </summary>
-                            <p>{source.excerpt}</p>
+                            <p style={{ whiteSpace: "pre-wrap" }}>{source.excerpt}</p>
+                            {source.source_url && /^https?:\/\//i.test(source.source_url) && (
+                              <a href={source.source_url} target="_blank" rel="noopener noreferrer">
+                                Открыть в Confluence{source.source_version ? ` · версия ${source.source_version}` : ""}
+                              </a>
+                            )}
                           </details>
                         ))}
                       </div>
@@ -1359,7 +1570,7 @@ export function App() {
             {branchParentId && selectedConversationId && (
               <div className="branch-context">
                 <span>↗ Новый вопрос продолжит выбранную ветку</span>
-                <button type="button" onClick={() => setViewMode("graph")}>Выбрать другую карточку</button>
+                <button type="button" onClick={() => selectViewMode("graph")}>Выбрать другую карточку</button>
               </div>
             )}
             <div className={`composer ${!hasSearchableContent ? "disabled-composer" : ""}`}>
@@ -1379,6 +1590,8 @@ export function App() {
             </div>
             <div className="composer-hint">{composerHint}</div>
           </div>
+          </>
+          )}
         </main>
       </div>
     </div>

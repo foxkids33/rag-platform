@@ -9,7 +9,7 @@ from pathlib import Path
 from anyio import to_thread
 from fastapi import APIRouter, Depends, File, HTTPException, Response, UploadFile, status
 from pydantic import BaseModel, ConfigDict
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.access import workspace_for_principal
@@ -17,7 +17,11 @@ from app.core.config import settings
 from app.core.security import Principal, get_current_principal
 from app.db.models import Document, IngestionJob
 from app.db.session import get_db
-from app.services.queue import QueueError, ingestion_queue
+from app.services.object_cleanup import (
+    schedule_object_deletions,
+    try_delete_scheduled_objects,
+)
+from app.services.queue import ingestion_queue
 from app.services.storage import StorageError, storage
 
 router = APIRouter(prefix="/workspaces/{workspace_id}/documents", tags=["documents"])
@@ -41,6 +45,12 @@ class DocumentOut(BaseModel):
     sha256: str
     status: str
     search_enabled: bool
+    title: str | None
+    source_url: str | None
+    source_type: str
+    external_id: str | None
+    external_version: str | None
+    synced_at: datetime | None
     created_at: datetime
 
 
@@ -107,6 +117,18 @@ async def upload_workspace_document(
     sha256, size = await _hash_and_measure(file)
     if size == 0:
         raise HTTPException(status_code=400, detail="Uploaded file is empty")
+    await db.execute(
+        text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
+        {"lock_key": f"workspace-upload:{workspace_id}:{sha256}"},
+    )
+    duplicate = await db.scalar(
+        select(Document.id).where(
+            Document.workspace_id == workspace_id,
+            Document.sha256 == sha256,
+        )
+    )
+    if duplicate is not None:
+        raise HTTPException(status_code=409, detail="This file is already present in the workspace")
 
     document_id = uuid.uuid4()
     job_id = uuid.uuid4()
@@ -146,9 +168,10 @@ async def upload_workspace_document(
             status="QUEUED",
             progress=0,
         )
-        db.add_all([document, job])
-
+        db.add(document)
         try:
+            await db.flush()
+            db.add(job)
             await db.commit()
             committed = True
             await db.refresh(document)
@@ -161,18 +184,7 @@ async def upload_workspace_document(
                     pass
             raise
 
-        try:
-            await ingestion_queue.enqueue(job_id)
-        except QueueError as exc:
-            # Keep PostgreSQL and MinIO consistent when Redis is unavailable.
-            await db.delete(document)
-            await db.commit()
-            committed = False
-            try:
-                await to_thread.run_sync(storage.delete, object_key)
-            except StorageError:
-                pass
-            raise HTTPException(status_code=503, detail="Ingestion queue is unavailable") from exc
+        await ingestion_queue.notify(job_id)
 
         return document
     except Exception:
@@ -197,13 +209,19 @@ async def reindex_workspace_document(
     principal: Principal = Depends(get_current_principal),
 ):
     await workspace_for_principal(db, workspace_id, principal)
-    document = await db.get(Document, document_id)
-    if document is None or document.workspace_id != workspace_id:
+    document = await db.scalar(
+        select(Document)
+        .where(
+            Document.id == document_id,
+            Document.workspace_id == workspace_id,
+        )
+        .with_for_update()
+    )
+    if document is None:
         raise HTTPException(status_code=404, detail="Document not found")
     if document.status in {"QUEUED", "PROCESSING"}:
         raise HTTPException(status_code=409, detail="Document is already being processed")
 
-    previous_status = document.status
     job = IngestionJob(
         id=uuid.uuid4(),
         document_id=document.id,
@@ -213,15 +231,7 @@ async def reindex_workspace_document(
     document.status = "QUEUED"
     db.add(job)
     await db.commit()
-
-    try:
-        await ingestion_queue.enqueue(job.id)
-    except QueueError as exc:
-        job.status = "FAILED"
-        job.error = "Ingestion queue is unavailable"
-        document.status = previous_status
-        await db.commit()
-        raise HTTPException(status_code=503, detail="Ingestion queue is unavailable") from exc
+    await ingestion_queue.notify(job.id)
 
     await db.refresh(document)
     return document
@@ -236,8 +246,15 @@ async def update_workspace_document(
     principal: Principal = Depends(get_current_principal),
 ):
     await workspace_for_principal(db, workspace_id, principal)
-    document = await db.get(Document, document_id)
-    if document is None or document.workspace_id != workspace_id:
+    document = await db.scalar(
+        select(Document)
+        .where(
+            Document.id == document_id,
+            Document.workspace_id == workspace_id,
+        )
+        .with_for_update()
+    )
+    if document is None:
         raise HTTPException(status_code=404, detail="Document not found")
 
     if payload.search_enabled and document.status != "READY":
@@ -260,8 +277,15 @@ async def delete_workspace_document(
     principal: Principal = Depends(get_current_principal),
 ) -> Response:
     await workspace_for_principal(db, workspace_id, principal)
-    document = await db.get(Document, document_id)
-    if document is None or document.workspace_id != workspace_id:
+    document = await db.scalar(
+        select(Document)
+        .where(
+            Document.id == document_id,
+            Document.workspace_id == workspace_id,
+        )
+        .with_for_update()
+    )
+    if document is None:
         raise HTTPException(status_code=404, detail="Document not found")
 
     if document.status in {"QUEUED", "PROCESSING"}:
@@ -270,14 +294,8 @@ async def delete_workspace_document(
             detail="Document cannot be deleted while ingestion is running",
         )
 
-    try:
-        await to_thread.run_sync(storage.delete, document.object_key)
-    except StorageError as exc:
-        raise HTTPException(
-            status_code=503,
-            detail="Object storage is unavailable; document was not deleted",
-        ) from exc
-
+    object_keys = await schedule_object_deletions(db, [document.object_key])
     await db.delete(document)
     await db.commit()
+    await try_delete_scheduled_objects(db, object_keys)
     return Response(status_code=status.HTTP_204_NO_CONTENT)

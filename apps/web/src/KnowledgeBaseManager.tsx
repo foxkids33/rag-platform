@@ -1,4 +1,5 @@
 import { ChangeEvent, useEffect, useMemo, useRef, useState } from "react";
+import { apiFetch as fetch } from "./api";
 
 type KnowledgeBaseSummary = {
   id: string;

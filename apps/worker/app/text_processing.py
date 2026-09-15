@@ -54,6 +54,16 @@ def _normalize(text: str) -> str:
     return normalized.strip()
 
 
+def normalize_exact_text(value: str) -> str:
+    """Normalize punctuation and case for exact identifier retrieval."""
+
+    return "".join(
+        character
+        for character in value.casefold().replace("ё", "е")
+        if character.isalnum()
+    )
+
+
 def extract_text(filename: str, data: bytes) -> str:
     extension = Path(filename).suffix.lower()
     text = _decode(data)

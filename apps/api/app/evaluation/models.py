@@ -20,6 +20,9 @@ class EvaluationCase:
     forbidden_facts: tuple[str, ...] = ()
     difficulty: str | None = None
     notes: str | None = None
+    required_code_blocks: tuple[str, ...] = ()
+    source_page_id: str | None = None
+    source_version: str | None = None
 
     def __post_init__(self) -> None:
         if not self.id.strip():
@@ -27,6 +30,13 @@ class EvaluationCase:
 
         if not self.question.strip():
             raise ValueError("Evaluation question must not be empty")
+        if (self.source_page_id is None) != (self.source_version is None):
+            raise ValueError("source_page_id and source_version must be provided together")
+        if self.source_page_id is not None and (
+            not isinstance(self.source_page_id, str) or not self.source_page_id.isdigit()
+            or not isinstance(self.source_version, str) or not self.source_version.isdigit()
+        ):
+            raise ValueError("Source identity/version must be numeric strings")
 
         if len(set(self.expected_document_ids)) != len(self.expected_document_ids):
             raise ValueError("expected_document_ids must not contain duplicates")
@@ -109,6 +119,8 @@ class AnswerCaseMetrics:
     citation_fact_coverage: float | None
     citation_source_coverage: float | None
     citation_valid: bool | None
+    code_block_coverage: float | None = None
+    code_order_correct: bool | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -134,3 +146,6 @@ class AnswerAggregateMetrics:
     citation_fact_coverage: float | None
     citation_source_coverage: float | None
     citation_validity_rate: float | None
+    code_evaluated_cases: int = 0
+    code_block_coverage: float | None = None
+    code_order_accuracy: float | None = None

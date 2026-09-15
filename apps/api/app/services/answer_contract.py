@@ -15,6 +15,7 @@ INSUFFICIENT_EVIDENCE_ANSWER = (
 AbstentionReason = Literal[
     "insufficient_retrieval_evidence",
     "model_reported_insufficient_context",
+    "citation_validation_failed",
 ]
 
 _LEGACY_REFUSAL_PREFIXES = (

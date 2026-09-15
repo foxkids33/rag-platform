@@ -22,6 +22,14 @@ def test_compare_reports_accepts_small_regression() -> None:
     assert result["passed"] is True
 
 
+def test_compare_reports_checks_verbatim_code_and_order():
+    baseline = {"aggregate": {"answer": {"code_block_coverage": 1.0, "code_order_accuracy": 1.0}}}
+    candidate = {"aggregate": {"answer": {"code_block_coverage": 0.8, "code_order_accuracy": 0.7}}}
+    result = compare_reports(candidate, baseline=baseline)
+    assert result["passed"] is False
+    assert result["failed_check_count"] == 2
+
+
 def test_compare_reports_rejects_quality_and_gate_regression() -> None:
     result = compare_reports(
         _report(recall_at_5=0.80, p95_ms=150),

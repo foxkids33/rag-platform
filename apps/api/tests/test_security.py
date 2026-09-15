@@ -4,11 +4,11 @@ import asyncio
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
+import httpx
 import jwt
 import pytest
 from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi import HTTPException
-from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 from app.api.routes.workspaces import WorkspaceCreate
@@ -72,6 +72,22 @@ def _auth_settings() -> Settings:
 def test_symmetric_oidc_algorithm_is_rejected() -> None:
     with pytest.raises(ValueError, match="asymmetric"):
         Settings(_env_file=None, oidc_algorithm="HS256")
+
+
+def test_server_environment_cannot_disable_authentication() -> None:
+    with pytest.raises(ValueError, match="must be enabled"):
+        Settings(_env_file=None, app_env="server", auth_enabled=False)
+
+
+def test_confluence_base_url_rejects_query_and_fragment() -> None:
+    with pytest.raises(ValueError, match="query or fragment"):
+        Settings(
+            _env_file=None,
+            confluence_enabled=True,
+            confluence_base_url="https://docs.example.test/wiki?redirect=other",
+            confluence_email="bot@example.test",
+            confluence_api_token="token",
+        )
 
 
 def test_oidc_verifier_validates_identity_tenant_and_roles() -> None:
@@ -152,9 +168,11 @@ def test_cross_tenant_workspace_lookup_returns_not_found() -> None:
     assert exc_info.value.status_code == 404
 
 
-def test_local_auth_me_preserves_development_workflow() -> None:
-    client = TestClient(app)
-    response = client.get("/api/v1/auth/me")
+@pytest.mark.asyncio
+async def test_local_auth_me_preserves_development_workflow() -> None:
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/api/v1/auth/me")
     assert response.status_code == 200
     assert response.json() == {
         "subject": settings.auth_local_subject,
@@ -164,9 +182,11 @@ def test_local_auth_me_preserves_development_workflow() -> None:
     }
 
 
-def test_enabled_auth_requires_bearer_token(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.asyncio
+async def test_enabled_auth_requires_bearer_token(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "auth_enabled", True)
-    client = TestClient(app)
-    response = client.get("/api/v1/auth/me")
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/api/v1/auth/me")
     assert response.status_code == 401
     assert response.headers["www-authenticate"] == "Bearer"

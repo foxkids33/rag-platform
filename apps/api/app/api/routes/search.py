@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import uuid
 from typing import Literal
@@ -15,6 +16,12 @@ from app.core.security import Principal, get_current_principal
 from app.db.models import KnowledgeBase, KnowledgeBaseVersion
 from app.db.session import get_db
 from app.services.embeddings import EmbeddingError, embeddings
+from app.services.query_signals import (
+    build_disjunctive_lexical_query,
+    contains_exact_identifier,
+    exact_identifier_pattern,
+    extract_exact_identifiers,
+)
 from app.services.reranker import RerankError, reranker
 from app.services.workspace_sources import (
     WorkspaceSourceMode,
@@ -27,15 +34,11 @@ router = APIRouter(prefix="/workspaces/{workspace_id}/search", tags=["search"])
 RRF_K = 60
 MIN_CANDIDATES = 40
 MAX_CANDIDATES = 200
-PARENT_PREVIEW_CHARS = 4000
+PARENT_PREVIEW_CHARS = 12000
 
 PAGE_MARKER_RE = re.compile(r"^\s*\d{1,4}\s+из\s+\d{1,4}\s*$", re.IGNORECASE)
 STANDALONE_PAGE_RE = re.compile(r"^\s*\d{1,4}\s*$")
 DOT_LEADER_RE = re.compile(r"\.{4,}")
-DOCUMENT_TITLE_RE = re.compile(
-    r"машина\s+больших\s+данных.*техническ(?:ий|ого)\s+обзор",
-    re.IGNORECASE,
-)
 URL_OR_EMAIL_RE = re.compile(r"(?:https?://|www\.|\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,})", re.IGNORECASE)
 WORD_RE = re.compile(r"[0-9A-Za-zА-Яа-яЁё]+(?:[.\-][0-9A-Za-zА-Яа-яЁё]+)*")
 QUERY_STOP_WORDS = {
@@ -85,9 +88,11 @@ class SearchResult(BaseModel):
     score: float | None
     dense_score: float | None
     lexical_score: float | None
+    exact_score: float | None = None
     rrf_score: float
     dense_rank: int | None
     lexical_rank: int | None
+    exact_rank: int | None = None
     retrieval_rank: int
     rerank_score: float | None = None
     rerank_rank: int | None = None
@@ -96,6 +101,9 @@ class SearchResult(BaseModel):
     source_scope: Literal["workspace", "knowledge_base"] = "workspace"
     knowledge_base_name: str | None = None
     knowledge_base_version: int | None = None
+    source_url: str | None = None
+    source_page_id: str | None = None
+    source_version: str | None = None
 
 
 class SearchResponse(BaseModel):
@@ -105,6 +113,7 @@ class SearchResponse(BaseModel):
     knowledge_base_id: uuid.UUID | None
     knowledge_base_version_id: uuid.UUID | None
     candidate_limit: int
+    exact_identifiers: list[str] = Field(default_factory=list)
     rerank_requested: bool
     rerank_applied: bool
     rerank_model: str | None
@@ -140,8 +149,6 @@ def _clean_rerank_text(value: str) -> str:
             continue
         if DOT_LEADER_RE.search(line):
             continue
-        if DOCUMENT_TITLE_RE.search(line):
-            continue
         if URL_OR_EMAIL_RE.search(line):
             continue
         if line.casefold() in {"оглавление", "содержание"}:
@@ -171,6 +178,7 @@ def _focused_excerpt(value: str, query: str, max_chars: int) -> str:
         return cleaned
 
     terms = _query_terms(query)
+    exact_identifiers = extract_exact_identifiers(query)
     paragraphs = [part.strip() for part in cleaned.split("\n\n") if part.strip()]
     if not paragraphs:
         return cleaned[:max_chars].rstrip()
@@ -179,6 +187,10 @@ def _focused_excerpt(value: str, query: str, max_chars: int) -> str:
         paragraph_terms = {token.casefold() for token in WORD_RE.findall(paragraph)}
         overlap = len(terms & paragraph_terms)
         score = float(overlap)
+        score += 5.0 * sum(
+            contains_exact_identifier(paragraph, identifier)
+            for identifier in exact_identifiers
+        )
         lowered = paragraph.casefold()
         if query.casefold().startswith("что такое") and any(
             marker in lowered for marker in (" — это ", " это ", "предназначен", "предназначена")
@@ -253,6 +265,17 @@ def _rerank_fusion_score(
     return (rerank_component + retrieval_component) * (1.0 - penalty)
 
 
+def _reranked_result_sort_key(result: SearchResult) -> tuple[float, float, int, int]:
+    """Keep deterministic identifier evidence before model-only reranker wins."""
+
+    return (
+        -(result.exact_score or 0.0),
+        -(result.rerank_fusion_score or 0.0),
+        result.rerank_rank or MAX_CANDIDATES,
+        result.retrieval_rank,
+    )
+
+
 @router.post("", response_model=SearchResponse)
 async def search(
     workspace_id: uuid.UUID,
@@ -290,6 +313,8 @@ async def search(
         query_vector = [0.0] * settings.embedding_dim
 
     candidate_limit = _candidate_limit(payload.limit)
+    exact_identifiers = extract_exact_identifiers(query)
+    lexical_query = build_disjunctive_lexical_query(query)
     rerank_requested = payload.rerank and settings.rerank_enabled
     result_limit = (
         _rerank_candidate_limit(payload.limit, candidate_limit)
@@ -304,8 +329,8 @@ async def search(
                 SELECT
                     CAST(:query_vector AS vector) AS query_vector,
                     (
-                        websearch_to_tsquery('russian', :query)
-                        || websearch_to_tsquery('simple', :query)
+                        websearch_to_tsquery('russian', :lexical_query)
+                        || websearch_to_tsquery('simple', :lexical_query)
                     ) AS ts_query
             ),
             eligible AS NOT MATERIALIZED (
@@ -322,7 +347,11 @@ async def search(
                     c.page_end,
                     c.embedding,
                     c.search_vector,
+                    c.normalized_text,
                     d.filename,
+                    d.source_url,
+                    d.external_id AS source_page_id,
+                    d.external_version AS source_version,
                     CASE
                         WHEN d.workspace_id IS NOT NULL THEN 'workspace'
                         ELSE 'knowledge_base'
@@ -351,21 +380,21 @@ async def search(
                 SELECT
                     e.id,
                     row_number() OVER (
-                        ORDER BY e.embedding <=> q.query_vector
+                        ORDER BY e.embedding <=> q.query_vector, e.id
                     ) AS dense_rank,
                     1 - (e.embedding <=> q.query_vector) AS dense_score
                 FROM eligible AS e
                 CROSS JOIN query_input AS q
                 WHERE :use_dense
                   AND e.embedding IS NOT NULL
-                ORDER BY e.embedding <=> q.query_vector
+                ORDER BY e.embedding <=> q.query_vector, e.id
                 LIMIT :candidate_limit
             ),
             lexical AS (
                 SELECT
                     e.id,
                     row_number() OVER (
-                        ORDER BY ts_rank_cd(e.search_vector, q.ts_query, 32) DESC
+                        ORDER BY ts_rank_cd(e.search_vector, q.ts_query, 32) DESC, e.id
                     ) AS lexical_rank,
                     ts_rank_cd(e.search_vector, q.ts_query, 32) AS lexical_score
                 FROM eligible AS e
@@ -373,16 +402,65 @@ async def search(
                 WHERE :use_lexical
                   AND e.search_vector IS NOT NULL
                   AND e.search_vector @@ q.ts_query
-                ORDER BY ts_rank_cd(e.search_vector, q.ts_query, 32) DESC
+                ORDER BY ts_rank_cd(e.search_vector, q.ts_query, 32) DESC, e.id
                 LIMIT :candidate_limit
+            ),
+            exact_scored AS (
+                SELECT
+                    e.id,
+                    count(DISTINCT identifiers.identifier)::double precision
+                        / NULLIF(CAST(:exact_identifier_count AS integer), 0) AS exact_score
+                FROM eligible AS e
+                CROSS JOIN jsonb_to_recordset(
+                    CAST(:exact_identifiers AS jsonb)
+                ) AS identifiers(identifier text, match_pattern text)
+                WHERE e.normalized_text LIKE '%' || identifiers.identifier || '%'
+                  AND lower(
+                        translate(
+                            concat_ws(' ', e.heading_breadcrumb, e.heading, e.text),
+                            'Ёё',
+                            'Ее'
+                        )
+                    ) ~ identifiers.match_pattern
+                GROUP BY e.id
+            ),
+            exact AS (
+                SELECT
+                    x.id,
+                    x.exact_score,
+                    row_number() OVER (
+                        ORDER BY
+                            x.exact_score DESC,
+                            l.lexical_score DESC NULLS LAST,
+                            d.dense_score DESC NULLS LAST,
+                            x.id
+                    ) AS exact_rank
+                FROM exact_scored AS x
+                LEFT JOIN lexical AS l ON l.id = x.id
+                LEFT JOIN dense AS d ON d.id = x.id
+                ORDER BY
+                    x.exact_score DESC,
+                    l.lexical_score DESC NULLS LAST,
+                    d.dense_score DESC NULLS LAST,
+                    x.id
+                LIMIT :candidate_limit
+            ),
+            candidate_ids AS (
+                SELECT id FROM dense
+                UNION
+                SELECT id FROM lexical
+                UNION
+                SELECT id FROM exact
             ),
             fused AS (
                 SELECT
-                    COALESCE(d.id, l.id) AS id,
+                    candidates.id,
                     d.dense_rank,
                     l.lexical_rank,
+                    x.exact_rank,
                     d.dense_score,
                     l.lexical_score,
+                    x.exact_score,
                     (
                         CASE
                             WHEN d.dense_rank IS NULL THEN 0.0
@@ -393,15 +471,26 @@ async def search(
                             WHEN l.lexical_rank IS NULL THEN 0.0
                             ELSE 1.0 / (:rrf_k + l.lexical_rank)
                         END
+                        +
+                        CASE
+                            WHEN x.exact_rank IS NULL THEN 0.0
+                            ELSE :exact_rrf_weight * x.exact_score
+                                / (:rrf_k + x.exact_rank)
+                        END
                     )::double precision AS rrf_score
-                FROM dense AS d
-                FULL OUTER JOIN lexical AS l ON l.id = d.id
+                FROM candidate_ids AS candidates
+                LEFT JOIN dense AS d ON d.id = candidates.id
+                LEFT JOIN lexical AS l ON l.id = candidates.id
+                LEFT JOIN exact AS x ON x.id = candidates.id
             ),
             deduplicated AS (
                 SELECT
                     e.id AS chunk_id,
                     e.document_id,
                     e.filename,
+                    e.source_url,
+                    e.source_page_id,
+                    e.source_version,
                     e.source_scope,
                     e.knowledge_base_name,
                     e.knowledge_base_version,
@@ -416,15 +505,18 @@ async def search(
                     e.page_end,
                     f.dense_score,
                     f.lexical_score,
+                    f.exact_score,
                     f.rrf_score,
                     f.dense_rank,
                     f.lexical_rank,
+                    f.exact_rank,
                     row_number() OVER (
                         PARTITION BY COALESCE(e.parent_chunk_id, e.id)
                         ORDER BY
                             f.rrf_score DESC,
                             f.dense_score DESC NULLS LAST,
                             f.lexical_score DESC NULLS LAST,
+                            f.exact_score DESC NULLS LAST,
                             e.chunk_index
                     ) AS parent_position
                 FROM fused AS f
@@ -434,6 +526,9 @@ async def search(
                 chunk_id,
                 document_id,
                 filename,
+                source_url,
+                source_page_id,
+                source_version,
                 source_scope,
                 knowledge_base_name,
                 knowledge_base_version,
@@ -445,18 +540,25 @@ async def search(
                 heading_breadcrumb,
                 page_start,
                 page_end,
-                dense_score AS score,
+                CASE
+                    WHEN exact_score IS NULL THEN dense_score
+                    WHEN dense_score IS NULL THEN exact_score
+                    ELSE GREATEST(exact_score, dense_score)
+                END AS score,
                 dense_score,
                 lexical_score,
+                exact_score,
                 rrf_score,
                 dense_rank,
-                lexical_rank
+                lexical_rank,
+                exact_rank
             FROM deduplicated
             WHERE parent_position = 1
             ORDER BY
                 rrf_score DESC,
-                dense_score DESC NULLS LAST,
-                lexical_score DESC NULLS LAST
+                 dense_score DESC NULLS LAST,
+                 lexical_score DESC NULLS LAST,
+                 exact_score DESC NULLS LAST
             LIMIT :result_limit
             """
         ),
@@ -469,7 +571,19 @@ async def search(
                 active_version.id if active_version is not None else uuid.UUID(int=0)
             ),
             "query": query,
+            "lexical_query": lexical_query,
             "query_vector": _vector_literal(query_vector),
+            "exact_identifiers": json.dumps(
+                [
+                    {
+                        "identifier": identifier,
+                        "match_pattern": exact_identifier_pattern(identifier),
+                    }
+                    for identifier in exact_identifiers
+                ]
+            ),
+            "exact_identifier_count": len(exact_identifiers),
+            "exact_rrf_weight": 3.0,
             "use_dense": use_dense,
             "use_lexical": use_lexical,
             "candidate_limit": candidate_limit,
@@ -523,13 +637,7 @@ async def search(
                     )
                 )
 
-            reranked_rows.sort(
-                key=lambda row: (
-                    -(row.rerank_fusion_score or 0.0),
-                    row.rerank_rank or MAX_CANDIDATES,
-                    row.retrieval_rank,
-                )
-            )
+            reranked_rows.sort(key=_reranked_result_sort_key)
             rows = reranked_rows
             rerank_applied = True
 
@@ -540,6 +648,7 @@ async def search(
         knowledge_base_id=knowledge_base.id if knowledge_base else None,
         knowledge_base_version_id=active_version.id if active_version else None,
         candidate_limit=candidate_limit,
+        exact_identifiers=exact_identifiers,
         rerank_requested=rerank_requested,
         rerank_applied=rerank_applied,
         rerank_model=rerank_model,

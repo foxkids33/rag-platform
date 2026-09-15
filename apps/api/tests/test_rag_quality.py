@@ -13,6 +13,7 @@ class Candidate:
     document_id: uuid.UUID
     retrieval_rank: int
     rerank_score: float | None
+    exact_score: float | None = None
     dense_score: float | None = 0.5
     lexical_score: float | None = 0.01
     rrf_score: float = 0.03
@@ -160,7 +161,7 @@ def test_context_query_selector_can_be_disabled() -> None:
     ]
     candidates.append(
         Candidate(
-            text="Версия 2.1 выпущена 01.09.2025 и описывает целевой продукт.",
+            text="Целевой продукт поддерживает уникальный протокол репликации данных.",
             document_id=uuid.uuid4(),
             retrieval_rank=6,
             rerank_score=None,
@@ -171,7 +172,7 @@ def test_context_query_selector_can_be_disabled() -> None:
     )
 
     context = build_context(
-        "Какой продукт имеет версию 2.1 от 01.09.2025?",
+        "Какой продукт поддерживает уникальный протокол репликации?",
         candidates,
         max_context_chars=5000,
         max_source_chars=1000,
@@ -234,3 +235,200 @@ def test_source_quality_prefers_reranker_score() -> None:
     )
 
     assert source_quality_score(candidate) == 0.82
+
+
+def test_source_quality_keeps_stronger_dense_score_for_partial_exact_match() -> None:
+    candidate = Candidate(
+        text="Релевантный фрагмент.",
+        document_id=uuid.uuid4(),
+        retrieval_rank=1,
+        rerank_score=None,
+        exact_score=0.5,
+        dense_score=0.84,
+    )
+
+    assert source_quality_score(candidate) == 0.84
+
+
+def test_source_quality_keeps_exact_match_when_reranker_is_uncertain() -> None:
+    candidate = Candidate(
+        text="Код BLUE-KB-942.",
+        document_id=uuid.uuid4(),
+        retrieval_rank=1,
+        rerank_score=0.21,
+        exact_score=1.0,
+        dense_score=0.40,
+    )
+
+    assert source_quality_score(candidate) == 1.0
+
+
+def test_source_quality_uses_rank_fusion_for_lexical_only_candidate() -> None:
+    candidate = Candidate(
+        text="Поздний lexical-only фрагмент.",
+        document_id=uuid.uuid4(),
+        retrieval_rank=19,
+        rerank_score=None,
+        dense_score=None,
+        lexical_score=0.98,
+        rrf_score=1.0 / 61.0,
+    )
+
+    assert source_quality_score(candidate) == 25.0 / 61.0
+
+
+def test_context_does_not_promote_lexical_only_tail_over_relevant_dense_chunk() -> None:
+    relevant = Candidate(
+        text=(
+            "На балансировщиках и узлах хранения устанавливают пакеты "
+            "для кластера PostgreSQL."
+        ),
+        document_id=uuid.uuid4(),
+        retrieval_rank=7,
+        rerank_score=None,
+        dense_score=0.40,
+        lexical_score=0.91,
+        rrf_score=0.022,
+        filename="relevant.txt",
+    )
+    lexical_tail = Candidate(
+        text="Общий список метрик эксплуатации инфраструктуры.",
+        document_id=uuid.uuid4(),
+        retrieval_rank=19,
+        rerank_score=None,
+        dense_score=None,
+        lexical_score=0.98,
+        rrf_score=1.0 / 61.0,
+        filename="lexical-tail.txt",
+    )
+
+    context = build_context(
+        "Какие пакеты устанавливают на балансировщиках и узлах хранения PostgreSQL?",
+        [lexical_tail, relevant],
+        max_context_chars=3000,
+        max_source_chars=1000,
+        max_sources=1,
+        query_selection_weight=0.30,
+    )
+
+    assert context.sources[0].filename == "relevant.txt"
+
+
+def test_context_softly_matches_russian_inflections_for_section_selection() -> None:
+    dense_distractor = Candidate(
+        text="Общее описание архитектуры высокой доступности.",
+        document_id=uuid.uuid4(),
+        retrieval_rank=1,
+        rerank_score=None,
+        dense_score=0.65,
+        filename="distractor.txt",
+    )
+    installation_section = Candidate(
+        text="Перечень установленных пакетов для целевого узла.",
+        document_id=uuid.uuid4(),
+        retrieval_rank=2,
+        rerank_score=None,
+        dense_score=0.45,
+        heading="Установка компонентов",
+        heading_breadcrumb="Развёртывание > Установка компонентов",
+        filename="installation.txt",
+    )
+
+    context = build_context(
+        "Какие пакеты устанавливают?",
+        [dense_distractor, installation_section],
+        max_context_chars=3000,
+        max_source_chars=1000,
+        max_sources=1,
+        query_selection_weight=0.30,
+    )
+
+    assert context.sources[0].filename == "installation.txt"
+    assert context.sources[0].query_relevance_score == 1.0
+
+
+def test_context_does_not_treat_shared_breadcrumb_as_direct_section_evidence() -> None:
+    shared_breadcrumb = (
+        "Развёртывание > HA-кластер PostgreSQL > Балансировщики и узлы хранения"
+    )
+    generic_section = Candidate(
+        text="Ожидаемый результат: кластер доступен.",
+        document_id=uuid.uuid4(),
+        retrieval_rank=1,
+        rerank_score=None,
+        dense_score=0.72,
+        heading="Ожидаемый результат",
+        heading_breadcrumb=shared_breadcrumb + " > Ожидаемый результат",
+        filename="generic.txt",
+    )
+    installation_section = Candidate(
+        text=(
+            "Установите пакеты на балансировщиках, затем установите пакеты "
+            "на узлах хранения."
+        ),
+        document_id=uuid.uuid4(),
+        retrieval_rank=2,
+        rerank_score=None,
+        dense_score=0.61,
+        heading="Установка компонентов",
+        heading_breadcrumb=shared_breadcrumb + " > Установка компонентов",
+        filename="installation.txt",
+    )
+
+    context = build_context(
+        (
+            "Приведи обе команды дословно: какие пакеты устанавливают "
+            "на балансировщиках и узлах хранения? Сохрани порядок."
+        ),
+        [generic_section, installation_section],
+        max_context_chars=3000,
+        max_source_chars=1000,
+        max_sources=1,
+        query_selection_weight=0.30,
+    )
+
+    assert context.sources[0].filename == "installation.txt"
+    assert context.sources[0].query_relevance_score > 0.8
+
+
+def test_context_reserves_room_for_second_literal_section_match() -> None:
+    keyword_summary = Candidate(
+        text="Пакеты устанавливают на узлах; подробности приведены в инструкции.",
+        document_id=uuid.uuid4(),
+        retrieval_rank=1,
+        rerank_score=None,
+        dense_score=0.55,
+        filename="keyword-summary.txt",
+    )
+    installation = Candidate(
+        text="Установка пакетов на узлах: dnf install package-name -y",
+        document_id=uuid.uuid4(),
+        retrieval_rank=6,
+        rerank_score=None,
+        dense_score=0.40,
+        heading="Установка компонентов",
+        filename="installation.txt",
+    )
+    generic = [
+        Candidate(
+            text=f"Общий архитектурный раздел номер {index}.",
+            document_id=uuid.uuid4(),
+            retrieval_rank=index + 1,
+            rerank_score=None,
+            dense_score=0.90 - index / 100,
+            filename=f"generic-{index}.txt",
+        )
+        for index in range(4)
+    ]
+
+    context = build_context(
+        "Какие пакеты устанавливают на узлах?",
+        [keyword_summary, *generic, installation],
+        max_context_chars=6000,
+        max_source_chars=1000,
+        max_sources=5,
+        query_selection_weight=0.30,
+        source_similarity_threshold=1.1,
+    )
+
+    assert "installation.txt" in [source.filename for source in context.sources]

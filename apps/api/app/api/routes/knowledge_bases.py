@@ -9,7 +9,7 @@ from pathlib import Path
 from anyio import to_thread
 from fastapi import APIRouter, Depends, File, HTTPException, Response, UploadFile, status
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.access import knowledge_base_for_principal
@@ -23,7 +23,11 @@ from app.services.knowledge_base_lifecycle import (
     version_can_publish,
     version_is_editable,
 )
-from app.services.queue import QueueError, ingestion_queue
+from app.services.object_cleanup import (
+    schedule_object_deletions,
+    try_delete_scheduled_objects,
+)
+from app.services.queue import ingestion_queue
 from app.services.storage import StorageError, storage
 
 router = APIRouter(prefix="/knowledge-bases", tags=["knowledge-bases"])
@@ -66,6 +70,12 @@ class KnowledgeBaseDocumentOut(BaseModel):
     sha256: str
     status: str
     search_enabled: bool
+    title: str | None
+    source_url: str | None
+    source_type: str
+    external_id: str | None
+    external_version: str | None
+    synced_at: datetime | None
     created_at: datetime
 
 
@@ -242,15 +252,37 @@ async def _ensure_editable_version(version: KnowledgeBaseVersion) -> None:
         )
 
 
-async def _delete_objects(documents: list[Document]) -> None:
-    for document in documents:
-        try:
-            await to_thread.run_sync(storage.delete, document.object_key)
-        except StorageError as exc:
-            raise HTTPException(
-                status_code=503,
-                detail="Object storage is unavailable; database records were not deleted",
-            ) from exc
+async def _lock_editable_version(
+    db: AsyncSession,
+    knowledge_base_id: uuid.UUID,
+    version_id: uuid.UUID,
+    principal: Principal,
+) -> KnowledgeBaseVersion:
+    """Serialize content changes with publication and re-check immutability."""
+
+    locked_base = await db.scalar(
+        select(KnowledgeBase.id)
+        .where(
+            KnowledgeBase.id == knowledge_base_id,
+            KnowledgeBase.tenant_id == principal.tenant_id,
+        )
+        .with_for_update()
+    )
+    if locked_base is None:
+        raise HTTPException(status_code=404, detail="Knowledge base not found")
+    version = await db.scalar(
+        select(KnowledgeBaseVersion)
+        .where(
+            KnowledgeBaseVersion.id == version_id,
+            KnowledgeBaseVersion.knowledge_base_id == knowledge_base_id,
+        )
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if version is None:
+        raise HTTPException(status_code=404, detail="Knowledge base version not found")
+    await _ensure_editable_version(version)
+    return version
 
 
 @router.get("", response_model=list[KnowledgeBaseOut])
@@ -327,7 +359,18 @@ async def delete_knowledge_base(
     principal: Principal = Depends(get_current_principal),
 ) -> Response:
     require_tenant_admin(principal)
-    knowledge_base = await _get_knowledge_base(db, knowledge_base_id, principal)
+    await _get_knowledge_base(db, knowledge_base_id, principal)
+    knowledge_base = await db.scalar(
+        select(KnowledgeBase)
+        .where(
+            KnowledgeBase.id == knowledge_base_id,
+            KnowledgeBase.tenant_id == principal.tenant_id,
+        )
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if knowledge_base is None:
+        raise HTTPException(status_code=404, detail="Knowledge base not found")
     workspace_count = int(
         await db.scalar(
             select(func.count(Workspace.id)).where(
@@ -357,9 +400,12 @@ async def delete_knowledge_base(
             detail="Knowledge base cannot be deleted while indexing is running",
         )
 
-    await _delete_objects(documents)
+    object_keys = await schedule_object_deletions(
+        db, (document.object_key for document in documents)
+    )
     await db.delete(knowledge_base)
     await db.commit()
+    await try_delete_scheduled_objects(db, object_keys)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
@@ -397,6 +443,11 @@ async def create_knowledge_base_version(
 ) -> KnowledgeBaseVersionOut:
     require_tenant_admin(principal)
     await _get_knowledge_base(db, knowledge_base_id, principal)
+    await db.execute(
+        select(KnowledgeBase)
+        .where(KnowledgeBase.id == knowledge_base_id)
+        .with_for_update()
+    )
     embedding_model = payload.embedding_model or settings.embedding_model
     embedding_dimension = payload.embedding_dimension or settings.embedding_dim
     chunker_version = payload.chunker_version or DEFAULT_CHUNKER_VERSION
@@ -438,8 +489,27 @@ async def delete_knowledge_base_version(
     principal: Principal = Depends(get_current_principal),
 ) -> Response:
     require_tenant_admin(principal)
-    knowledge_base = await _get_knowledge_base(db, knowledge_base_id, principal)
-    version = await _get_version(db, knowledge_base_id, version_id, principal)
+    await _get_knowledge_base(db, knowledge_base_id, principal)
+    knowledge_base = await db.scalar(
+        select(KnowledgeBase)
+        .where(
+            KnowledgeBase.id == knowledge_base_id,
+            KnowledgeBase.tenant_id == principal.tenant_id,
+        )
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    version = await db.scalar(
+        select(KnowledgeBaseVersion)
+        .where(
+            KnowledgeBaseVersion.id == version_id,
+            KnowledgeBaseVersion.knowledge_base_id == knowledge_base_id,
+        )
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if knowledge_base is None or version is None:
+        raise HTTPException(status_code=404, detail="Knowledge base version not found")
     if knowledge_base.active_version_id == version.id or version.status == "ACTIVE":
         raise HTTPException(status_code=409, detail="The active version cannot be deleted")
 
@@ -449,9 +519,12 @@ async def delete_knowledge_base_version(
             status_code=409,
             detail="Version cannot be deleted while indexing is running",
         )
-    await _delete_objects(documents)
+    object_keys = await schedule_object_deletions(
+        db, (document.object_key for document in documents)
+    )
     await db.delete(version)
     await db.commit()
+    await try_delete_scheduled_objects(db, object_keys)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
@@ -466,7 +539,14 @@ async def publish_knowledge_base_version(
     principal: Principal = Depends(get_current_principal),
 ) -> KnowledgeBaseOut:
     require_tenant_admin(principal)
-    knowledge_base = await _get_knowledge_base(db, knowledge_base_id, principal)
+    await _get_knowledge_base(db, knowledge_base_id, principal)
+    locked = await db.execute(
+        select(KnowledgeBase)
+        .where(KnowledgeBase.id == knowledge_base_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    knowledge_base = locked.scalar_one()
     version = await _get_version(db, knowledge_base_id, version_id, principal)
     await _synchronize_version_status(db, version)
 
@@ -543,6 +623,10 @@ async def upload_knowledge_base_document(
     sha256, size = await _hash_and_measure(file)
     if size == 0:
         raise HTTPException(status_code=400, detail="Uploaded file is empty")
+    await db.execute(
+        text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
+        {"lock_key": f"knowledge-base-upload:{version.id}:{sha256}"},
+    )
     duplicate = await db.scalar(
         select(Document.id).where(
             Document.knowledge_base_version_id == version.id,
@@ -576,6 +660,13 @@ async def upload_knowledge_base_document(
         except StorageError as exc:
             raise HTTPException(status_code=503, detail="Object storage is unavailable") from exc
 
+        version = await _lock_editable_version(
+            db,
+            knowledge_base_id,
+            version_id,
+            principal,
+        )
+
         document = Document(
             id=document_id,
             knowledge_base_version_id=version.id,
@@ -594,8 +685,10 @@ async def upload_knowledge_base_document(
             progress=0,
         )
         version.status = "INDEXING"
-        db.add_all([document, job])
+        db.add(document)
         try:
+            await db.flush()
+            db.add(job)
             await db.commit()
             committed = True
             await db.refresh(document)
@@ -608,19 +701,7 @@ async def upload_knowledge_base_document(
                     pass
             raise
 
-        try:
-            await ingestion_queue.enqueue(job_id)
-        except QueueError as exc:
-            await db.delete(document)
-            await db.flush()
-            await _synchronize_version_status(db, version)
-            await db.commit()
-            committed = False
-            try:
-                await to_thread.run_sync(storage.delete, object_key)
-            except StorageError:
-                pass
-            raise HTTPException(status_code=503, detail="Ingestion queue is unavailable") from exc
+        await ingestion_queue.notify(job_id)
 
         return document
     except Exception:
@@ -647,15 +728,25 @@ async def reindex_knowledge_base_document(
     principal: Principal = Depends(get_current_principal),
 ) -> KnowledgeBaseDocumentOut:
     require_tenant_admin(principal)
-    version = await _get_version(db, knowledge_base_id, version_id, principal)
-    await _ensure_editable_version(version)
-    document = await db.get(Document, document_id)
-    if document is None or document.knowledge_base_version_id != version.id:
+    version = await _lock_editable_version(
+        db,
+        knowledge_base_id,
+        version_id,
+        principal,
+    )
+    document = await db.scalar(
+        select(Document)
+        .where(
+            Document.id == document_id,
+            Document.knowledge_base_version_id == version.id,
+        )
+        .with_for_update()
+    )
+    if document is None:
         raise HTTPException(status_code=404, detail="Document not found")
     if document.status in BUSY_DOCUMENT_STATUSES:
         raise HTTPException(status_code=409, detail="Document is already being processed")
 
-    previous_status = document.status
     job = IngestionJob(
         id=uuid.uuid4(),
         document_id=document.id,
@@ -666,15 +757,7 @@ async def reindex_knowledge_base_document(
     version.status = "INDEXING"
     db.add(job)
     await db.commit()
-    try:
-        await ingestion_queue.enqueue(job.id)
-    except QueueError as exc:
-        job.status = "FAILED"
-        job.error = "Ingestion queue is unavailable"
-        document.status = previous_status
-        await _synchronize_version_status(db, version)
-        await db.commit()
-        raise HTTPException(status_code=503, detail="Ingestion queue is unavailable") from exc
+    await ingestion_queue.notify(job.id)
 
     await db.refresh(document)
     return document
@@ -693,10 +776,21 @@ async def update_knowledge_base_document(
     principal: Principal = Depends(get_current_principal),
 ) -> KnowledgeBaseDocumentOut:
     require_tenant_admin(principal)
-    version = await _get_version(db, knowledge_base_id, version_id, principal)
-    await _ensure_editable_version(version)
-    document = await db.get(Document, document_id)
-    if document is None or document.knowledge_base_version_id != version.id:
+    version = await _lock_editable_version(
+        db,
+        knowledge_base_id,
+        version_id,
+        principal,
+    )
+    document = await db.scalar(
+        select(Document)
+        .where(
+            Document.id == document_id,
+            Document.knowledge_base_version_id == version.id,
+        )
+        .with_for_update()
+    )
+    if document is None:
         raise HTTPException(status_code=404, detail="Document not found")
     if payload.search_enabled and document.status != "READY":
         raise HTTPException(status_code=409, detail="Only READY documents can be enabled")
@@ -718,10 +812,21 @@ async def delete_knowledge_base_document(
     principal: Principal = Depends(get_current_principal),
 ) -> Response:
     require_tenant_admin(principal)
-    version = await _get_version(db, knowledge_base_id, version_id, principal)
-    await _ensure_editable_version(version)
-    document = await db.get(Document, document_id)
-    if document is None or document.knowledge_base_version_id != version.id:
+    version = await _lock_editable_version(
+        db,
+        knowledge_base_id,
+        version_id,
+        principal,
+    )
+    document = await db.scalar(
+        select(Document)
+        .where(
+            Document.id == document_id,
+            Document.knowledge_base_version_id == version.id,
+        )
+        .with_for_update()
+    )
+    if document is None:
         raise HTTPException(status_code=404, detail="Document not found")
     if document.status in BUSY_DOCUMENT_STATUSES:
         raise HTTPException(
@@ -729,16 +834,10 @@ async def delete_knowledge_base_document(
             detail="Document cannot be deleted while ingestion is running",
         )
 
-    try:
-        await to_thread.run_sync(storage.delete, document.object_key)
-    except StorageError as exc:
-        raise HTTPException(
-            status_code=503,
-            detail="Object storage is unavailable; document was not deleted",
-        ) from exc
-
+    object_keys = await schedule_object_deletions(db, [document.object_key])
     await db.delete(document)
     await db.flush()
     await _synchronize_version_status(db, version)
     await db.commit()
+    await try_delete_scheduled_objects(db, object_keys)
     return Response(status_code=status.HTTP_204_NO_CONTENT)

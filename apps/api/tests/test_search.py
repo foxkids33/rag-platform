@@ -9,7 +9,16 @@ from app.api.routes.search import (
     _focused_excerpt,
     _rerank_candidate_limit,
     _rerank_fusion_score,
+    _reranked_result_sort_key,
     _vector_literal,
+)
+from app.services.query_signals import (
+    build_disjunctive_lexical_query,
+    contains_exact_identifier,
+    extract_exact_identifiers,
+    normalize_exact_text,
+    requests_exact_code,
+    requests_live_operational_state,
 )
 
 
@@ -56,7 +65,7 @@ def test_rerank_document_prefers_breadcrumb_and_child_text() -> None:
     )
 
 
-def test_clean_rerank_text_removes_pdf_boilerplate() -> None:
+def test_clean_rerank_text_removes_pdf_boilerplate_without_domain_title_rules() -> None:
     source = """
 Машина больших данных Скала^р МБД.Х. Технический обзор
 
@@ -69,9 +78,62 @@ info@skala-r.ru
 МБД.Х — это программно-аппаратный комплекс для хранения данных.
 """
 
-    assert _clean_rerank_text(source) == (
-        "МБД.Х — это программно-аппаратный комплекс для хранения данных."
+    cleaned = _clean_rerank_text(source)
+
+    assert "Технический обзор" in cleaned
+    assert "МБД.Х — это программно-аппаратный комплекс для хранения данных." in cleaned
+    assert "2 из 50" not in cleaned
+    assert "ОГЛАВЛЕНИЕ" not in cleaned
+
+
+def test_exact_identifiers_are_domain_agnostic_and_punctuation_insensitive() -> None:
+    assert extract_exact_identifiers("Сравни BLUE-KB-942 и МБД.Х с версией v2.4") == [
+        "bluekb942",
+        "мбдх",
+        "v24",
+    ]
+    assert normalize_exact_text("Blue_KB.942") == "bluekb942"
+    assert extract_exact_identifiers("программно-аппаратный комплекс") == []
+    assert extract_exact_identifiers("страница S3-запросов") == []
+    assert extract_exact_identifiers("содержимое ostor-agentd.env") == [
+        "ostoragentdenv"
+    ]
+    assert contains_exact_identifier("Код blue_kb.942 зарегистрирован", "bluekb942")
+    assert not contains_exact_identifier("Код BLUE-KB-9421 зарегистрирован", "bluekb942")
+
+
+def test_disjunctive_lexical_query_splits_identifiers_and_removes_stop_words() -> None:
+    assert build_disjunctive_lexical_query(
+        "Что показано в ostor-agentd.env для multimount?"
+    ) == "показано OR ostor OR agentd OR env OR multimount"
+
+
+def test_live_state_detection_separates_observation_from_instructions() -> None:
+    assert requests_live_operational_state(
+        "Какова текущая загрузка CPU каждого узла моего кластера прямо сейчас?"
     )
+    assert requests_live_operational_state(
+        "Какой объём был записан в мою корзину за последние пять минут?"
+    )
+    assert requests_live_operational_state(
+        "Назови последний инцидент сегодня в моей системе мониторинга и его статус."
+    )
+    assert requests_live_operational_state(
+        "Подтверди по текущему состоянию моего стенда, что данные не потеряны."
+    )
+    assert not requests_live_operational_state(
+        "Как проверить текущее состояние моего кластера?"
+    )
+    assert not requests_live_operational_state(
+        "Какой командой посмотреть текущие настройки алиасов?"
+    )
+
+
+def test_exact_code_request_detection_is_explicit() -> None:
+    assert requests_exact_code("Приведи обе команды дословно")
+    assert requests_exact_code("Какой командой посмотреть настройки?")
+    assert requests_exact_code("Приведи точное содержимое файла")
+    assert not requests_exact_code("Какие пакеты нужны для установки?")
 
 
 def test_focused_excerpt_prefers_definition_over_unrelated_text() -> None:
@@ -136,3 +198,45 @@ def test_rank_fusion_prefers_retrieval_backed_definition_over_toc() -> None:
     )
 
     assert definition_score > title_score
+
+
+def test_reranker_sort_keeps_exact_identifier_candidate() -> None:
+    exact = SearchResult(
+        chunk_id=uuid.uuid4(),
+        document_id=uuid.uuid4(),
+        filename="exact.txt",
+        chunk_index=0,
+        text="BLUE-KB-942",
+        parent_text=None,
+        parent_text_truncated=False,
+        heading=None,
+        heading_breadcrumb=None,
+        page_start=None,
+        page_end=None,
+        score=1.0,
+        dense_score=0.2,
+        lexical_score=None,
+        exact_score=1.0,
+        rrf_score=0.05,
+        dense_rank=20,
+        lexical_rank=None,
+        exact_rank=1,
+        retrieval_rank=2,
+        rerank_score=0.1,
+        rerank_rank=2,
+        rerank_fusion_score=0.01,
+    )
+    noise = exact.model_copy(
+        update={
+            "chunk_id": uuid.uuid4(),
+            "filename": "noise.txt",
+            "exact_score": None,
+            "exact_rank": None,
+            "rerank_score": 0.99,
+            "rerank_rank": 1,
+            "rerank_fusion_score": 0.03,
+            "retrieval_rank": 1,
+        }
+    )
+
+    assert min([noise, exact], key=_reranked_result_sort_key) is exact

@@ -22,5 +22,9 @@ class ObjectStorage:
             response.close()
             response.release_conn()
 
+    def delete(self, object_key: str) -> None:
+        # S3-compatible remove is idempotent, which makes outbox retries safe.
+        self._client.remove_object(settings.minio_bucket, object_key)
+
 
 storage = ObjectStorage()

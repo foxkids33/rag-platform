@@ -29,7 +29,10 @@ async def system_info(
             "knowledge_bases": True,
             "workspace_overlay": True,
             "user_documents_only": True,
-            "hybrid_retrieval": "planned",
+            "hybrid_retrieval": True,
+            "reranking": settings.rerank_enabled,
+            "advanced_search": False,
+            "conversation_graph": True,
             "knowledge_graph": "planned",
         },
     }

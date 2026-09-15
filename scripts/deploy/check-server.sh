@@ -14,7 +14,6 @@ REQUIRED_SERVICES=(
   redis
   minio
   embedding
-  reranker
   api
   worker
   web
@@ -88,6 +87,13 @@ mapfile -t configured_services < <(
     sort -u
 )
 
+if printf '%s\n' "${configured_services[@]}" | grep -Fxq reranker; then
+  REQUIRED_SERVICES+=(reranker)
+  info "reranker profile is active"
+else
+  info "reranker profile is disabled (expected for the v0.1 baseline)"
+fi
+
 for service in "${REQUIRED_SERVICES[@]}"; do
   if printf '%s\n' "${configured_services[@]}" |
       grep -Fxq "$service"; then
@@ -98,9 +104,9 @@ for service in "${REQUIRED_SERVICES[@]}"; do
 done
 
 if [[ "${#configured_services[@]}" -eq "${#REQUIRED_SERVICES[@]}" ]]; then
-  ok "Compose contains exactly 8 services"
+  ok "Compose contains exactly ${#REQUIRED_SERVICES[@]} services"
 else
-  fail "expected 8 services, found ${#configured_services[@]}"
+  fail "expected ${#REQUIRED_SERVICES[@]} services, found ${#configured_services[@]}"
 fi
 
 echo
@@ -159,14 +165,12 @@ done
 echo
 echo "===== PUBLISHED PORTS ====="
 
-project_name="$(read_env_value COMPOSE_PROJECT_NAME rag-platform)"
+project_name="$(read_env_value COMPOSE_PROJECT_NAME rag-kbr-v01)"
 bind_host="$(read_env_value RAG_BIND_HOST 127.0.0.1)"
-api_host_port="$(read_env_value RAG_API_HOST_PORT 18000)"
 web_host_port="$(read_env_value RAG_WEB_HOST_PORT 15173)"
 
 export RAG_CHECK_PROJECT_NAME="$project_name"
 export RAG_CHECK_BIND_HOST="$bind_host"
-export RAG_CHECK_API_PORT="$api_host_port"
 export RAG_CHECK_WEB_PORT="$web_host_port"
 
 if python3 <<'PY'
@@ -177,12 +181,10 @@ import sys
 
 project = os.environ["RAG_CHECK_PROJECT_NAME"]
 bind_host = os.environ["RAG_CHECK_BIND_HOST"]
-api_port = os.environ["RAG_CHECK_API_PORT"]
 web_port = os.environ["RAG_CHECK_WEB_PORT"]
 
 expected = {
-    ("api", "8000/tcp"): (bind_host, api_port),
-    ("web", "5173/tcp"): (bind_host, web_port),
+    ("web", "80/tcp"): (bind_host, web_port),
 }
 
 container_ids = subprocess.check_output(
@@ -270,25 +272,9 @@ if errors:
 print("Published ports: OK")
 PY
 then
-  ok "only API and web ports are published"
+  ok "only the reverse-proxy web port is published"
 else
   fail "published-port validation failed"
-fi
-
-echo
-echo "===== RESERVED HOST PORTS ====="
-
-reserved_ports="$(
-  ss -H -lntp 2>/dev/null |
-    grep -E ':(8000|5173|9000)([[:space:]]|$)' ||
-    true
-)"
-
-if [[ -z "$reserved_ports" ]]; then
-  ok "host ports 8000, 5173 and 9000 are free"
-else
-  fail "reserved host ports are occupied"
-  printf '%s\n' "$reserved_ports" >&2
 fi
 
 echo
@@ -314,10 +300,10 @@ else
     --connect-timeout 5 \
     --max-time 15 \
     --output /dev/null \
-    "http://${probe_host}:${api_host_port}/api/v1/health"; then
-    ok "API health endpoint is available"
+    "http://${probe_host}:${web_host_port}/"; then
+    ok "web endpoint is available"
   else
-    fail "API health endpoint is unavailable"
+    fail "web endpoint is unavailable"
   fi
 
   if curl \
@@ -327,11 +313,50 @@ else
     --connect-timeout 5 \
     --max-time 15 \
     --output /dev/null \
-    "http://${probe_host}:${web_host_port}/"; then
-    ok "web endpoint is available"
+    "http://${probe_host}:${web_host_port}/api/v1/health"; then
+    ok "API health endpoint is available through web proxy"
   else
-    fail "web endpoint is unavailable"
+    fail "API health endpoint is unavailable through web proxy"
   fi
+fi
+
+echo
+echo "===== SECURITY SETTINGS ====="
+
+app_env="$(read_env_value APP_ENV '')"
+auth_enabled="$(read_env_value AUTH_ENABLED false)"
+oidc_client_id="$(read_env_value OIDC_CLIENT_ID '')"
+oidc_redirect_uri="$(read_env_value OIDC_REDIRECT_URI '')"
+oidc_logout_uri="$(read_env_value OIDC_POST_LOGOUT_REDIRECT_URI '')"
+if [[ "$app_env" == "server" ]]; then
+  ok "APP_ENV is server"
+else
+  fail "APP_ENV must be server"
+fi
+if [[ "${auth_enabled,,}" == "true" ]]; then
+  ok "authentication is enabled"
+else
+  fail "AUTH_ENABLED must be true on the shared server"
+fi
+if [[ -n "$oidc_client_id" ]]; then
+  ok "OIDC public SPA client is configured"
+else
+  fail "OIDC_CLIENT_ID must be configured for the browser UI"
+fi
+if [[ "$oidc_redirect_uri" == https://* ]]; then
+  ok "OIDC redirect URI uses HTTPS"
+else
+  fail "OIDC_REDIRECT_URI must be an external HTTPS callback"
+fi
+if [[ "$oidc_logout_uri" == https://* ]]; then
+  ok "OIDC post-logout URI uses HTTPS"
+else
+  fail "OIDC_POST_LOGOUT_REDIRECT_URI must use external HTTPS"
+fi
+if [[ "$bind_host" == "127.0.0.1" || "$bind_host" == "::1" ]]; then
+  ok "web port is bound to loopback for the reverse proxy"
+else
+  fail "RAG_BIND_HOST must be a loopback address on the shared server"
 fi
 
 echo

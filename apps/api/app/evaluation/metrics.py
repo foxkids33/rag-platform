@@ -19,7 +19,8 @@ from app.evaluation.models import (
 )
 
 NON_WORD_RE = re.compile(r"[^0-9a-zа-я]+")
-HYPHENATED_WORD_RE = re.compile(r"(?<=[0-9a-zа-я])-\s*(?=[0-9a-zа-я])")
+HYPHENATED_LINE_BREAK_RE = re.compile(r"(?<=[0-9a-zа-я])-\s+(?=[0-9a-zа-я])")
+CITATION_MARKER_RE = re.compile(r"\[(?:\d+)(?:\s*,\s*\d+)*\]")
 CYRILLIC_WORD_RE = re.compile(r"^[а-я]+$")
 MORPH_MIN_STEM_LENGTH = 3
 MORPH_MAX_SUFFIX_LENGTH = 4
@@ -142,7 +143,7 @@ def normalize_for_match(value: str) -> str:
 
     normalized = unicodedata.normalize("NFKC", value).casefold().replace("ё", "е")
     normalized = normalized.translate(str.maketrans("‐‑‒–—−", "------"))
-    normalized = HYPHENATED_WORD_RE.sub("", normalized)
+    normalized = HYPHENATED_LINE_BREAK_RE.sub("", normalized)
     return " ".join(NON_WORD_RE.sub(" ", normalized).split())
 
 
@@ -186,9 +187,6 @@ def _russian_inflection_match(expected: str, actual: str) -> bool:
 def _contains_normalized_fact(normalized_text: str, normalized_fact: str) -> bool:
     if not normalized_fact:
         return False
-
-    if normalized_fact in normalized_text:
-        return True
 
     expected_tokens = normalized_fact.split()
     text_tokens = normalized_text.split()
@@ -266,7 +264,11 @@ def evaluate_answer_case(
     if observation.case_id != case.id:
         raise ValueError("Observation case_id does not match evaluation case id")
 
-    required_fact_coverage = fact_coverage(case.required_facts, observation.text)
+    # Citation labels are answer-contract metadata, not evidence that a numeric
+    # fact was stated. Without removing them, required fact ``2`` can be
+    # spuriously satisfied by an otherwise unrelated citation ``[2]``.
+    answer_text = CITATION_MARKER_RE.sub(" ", observation.text)
+    required_fact_coverage = fact_coverage(case.required_facts, answer_text)
     if observation.actual_abstention and required_fact_coverage is not None:
         required_fact_coverage = 0.0
 
@@ -277,13 +279,17 @@ def evaluate_answer_case(
         elif required_fact_coverage is not None:
             exact_value_correct = required_fact_coverage == 1.0
         elif case.expected_answer:
-            exact_value_correct = _contains_fact(observation.text, case.expected_answer)
+            exact_value_correct = _contains_fact(answer_text, case.expected_answer)
 
     forbidden_fact_violation: bool | None = None
     if case.forbidden_facts:
         forbidden_fact_violation = any(
-            _contains_fact(observation.text, fact) for fact in case.forbidden_facts
+            _contains_fact(answer_text, fact) for fact in case.forbidden_facts
         )
+
+    code_coverage, code_order = exact_code_metrics(case.required_code_blocks, observation.text)
+    if observation.actual_abstention and case.required_code_blocks:
+        code_coverage, code_order = 0.0, False
 
     return AnswerCaseMetrics(
         case_id=case.id,
@@ -309,7 +315,31 @@ def evaluate_answer_case(
         citation_valid=(
             observation.citation_valid if not observation.actual_abstention else None
         ),
+        code_block_coverage=code_coverage,
+        code_order_correct=code_order,
     )
+
+
+def exact_code_metrics(expected: tuple[str, ...], answer: str) -> tuple[float | None, bool | None]:
+    """Case/whitespace-sensitive block containment and order; only CRLF is normalized.
+
+    This checks reproduction, not execution safety, procedure completeness, or
+    absence of extra commands. Those require separate review/evaluation cases.
+    """
+    if not expected:
+        return None, None
+    actual = answer.replace("\r\n", "\n")
+    blocks = [match[2] for match in re.finditer(r"(?m)^(`{3,}|~{3,})[^\n]*\n([\s\S]*?)^\1[ \t]*$", actual)]
+    joined = "\n\n".join(blocks)
+    normalized = [block.replace("\r\n", "\n") for block in expected]
+    hits = sum(any(block in candidate for candidate in blocks) for block in normalized)
+    cursor = 0
+    for block in normalized:
+        position = joined.find(block, cursor)
+        if position < 0:
+            return hits / len(expected), False
+        cursor = position + len(block)
+    return hits / len(expected), True
 
 
 def _mean_or_none(values: Iterable[float]) -> float | None:
@@ -431,4 +461,7 @@ def aggregate_answer_metrics(
         citation_fact_coverage=_mean_or_none(citation_fact_values),
         citation_source_coverage=_mean_or_none(citation_source_values),
         citation_validity_rate=_mean_or_none(citation_validity_values),
+        code_evaluated_cases=sum(result.code_block_coverage is not None for result in collected),
+        code_block_coverage=_mean_or_none(result.code_block_coverage for result in collected if result.code_block_coverage is not None),
+        code_order_accuracy=_mean_or_none(float(result.code_order_correct) for result in collected if result.code_order_correct is not None),
     )

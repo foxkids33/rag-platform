@@ -22,6 +22,12 @@ Facts are matched deterministically after Unicode, case, punctuation, and PDF
 line-break normalization. Use `||` inside one fact when multiple renderings are
 equivalent, for example `"20 Тбайт||20 ТБ"`. Every item in `required_facts`
 must be present; alternatives separated by `||` count as one item.
+Regular hyphens act as word separators, while only a hyphen followed by
+whitespace is treated as PDF line-break hyphenation. Matching observes token
+boundaries, so `2` does not match `250` and `Kafka` does not match `Kafkax`.
+Answer citation labels such as `[2]` are removed before facts and forbidden
+facts are scored; a citation number is metadata, not an answer value. Add an
+explicit `||` alternative when digits and number words are both acceptable.
 
 ## Skala technical-review pilot
 
@@ -148,6 +154,12 @@ inside expected-document chunks. These are regression floors, not product
 targets.
 `quality-gates.acceptance-target.json` contains the next product-quality targets;
 it is expected to fail until the quality sprint is complete.
+
+Run that target separately without replacing the non-regression floor:
+
+```bash
+make evaluate-acceptance-target-check WORKSPACE_ID=<uuid>
+```
 
 The schema-v3 report contains Recall@1/5/10, MRR, nDCG@10, overall and
 class-balanced abstention accuracy, required-fact coverage, exact-value

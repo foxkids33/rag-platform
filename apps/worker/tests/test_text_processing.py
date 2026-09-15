@@ -1,4 +1,4 @@
-from app.text_processing import extract_text, split_into_chunks
+from app.text_processing import extract_text, normalize_exact_text, split_into_chunks
 
 
 def test_extract_html_text() -> None:
@@ -13,6 +13,10 @@ def test_split_into_chunks_keeps_content() -> None:
     chunks = split_into_chunks(source)
     assert len(chunks) > 1
     assert all(chunk.strip() for chunk in chunks)
+
+
+def test_normalize_exact_text_removes_identifier_punctuation() -> None:
+    assert normalize_exact_text("BLUE-KB_942 / МБД.Х") == "bluekb942мбдх"
 
 
 def test_plain_document_builds_parent_child_chunks(monkeypatch):

@@ -6,6 +6,11 @@ from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from typing import Protocol
 
+from app.services.query_signals import (
+    contains_exact_identifier,
+    extract_exact_identifiers,
+    requests_live_operational_state,
+)
 from app.services.rag_quality import evidence_status, source_quality_score
 
 PAGE_MARKER_RE = re.compile(r"^\s*\d{1,4}\s+из\s+\d{1,4}\s*$", re.IGNORECASE)
@@ -46,12 +51,28 @@ QUERY_STOP_WORDS = {
     "где",
     "когда",
     "зачем",
+    "ответь",
+    "приведи",
+    "покажи",
+    "укажи",
+    "перечисли",
+    "дословно",
+    "сохрани",
+    "порядок",
+    "сначала",
+    "затем",
+    "обе",
+    "оба",
+    "обоих",
 }
 
 QUERY_ANCHOR_WEIGHT = 2.0
 QUERY_LONG_TERM_WEIGHT = 1.25
 QUERY_ANCHOR_SHARE = 0.35
+BREADCRUMB_SIGNAL_WEIGHT = 0.15
 RERANK_QUERY_SELECTION_MAX_WEIGHT = 0.10
+SOFT_CYRILLIC_PREFIX_CHARS = 5
+QUERY_RELEVANCE_RESERVED_SOURCES = 2
 
 
 class SearchResultLike(Protocol):
@@ -68,6 +89,7 @@ class SearchResultLike(Protocol):
     retrieval_rank: int
     dense_score: float | None
     lexical_score: float | None
+    exact_score: float | None
     rrf_score: float
     rerank_score: float | None
     rerank_fusion_score: float | None
@@ -96,6 +118,9 @@ class ContextSource:
     quality_score: float
     query_relevance_score: float
     selection_score: float
+    source_url: str | None = None
+    source_page_id: str | None = None
+    source_version: str | None = None
 
     @property
     def citation(self) -> str:
@@ -113,13 +138,26 @@ class BuiltContext:
     rejected_low_score: int
     rejected_duplicate: int
     rejected_document_cap: int
+    required_anchor_count: int = 0
+    matched_anchor_count: int = 0
 
 
 def clean_context_text(value: str) -> str:
     cleaned_lines: list[str] = []
     previous_line: str | None = None
+    fence: str | None = None
 
     for raw_line in value.replace("\x0c", "\n").splitlines():
+        marker = re.match(r"^(`{3,}|~{3,})", raw_line)
+        if fence is not None:
+            cleaned_lines.append(raw_line)
+            if raw_line.rstrip() == fence:
+                fence = None
+            continue
+        if marker:
+            fence = marker[1]
+            cleaned_lines.append(raw_line)
+            continue
         line = " ".join(raw_line.split()).strip()
         if not line:
             if cleaned_lines and cleaned_lines[-1] != "":
@@ -129,7 +167,7 @@ def clean_context_text(value: str) -> str:
             continue
         if DOT_LEADER_RE.search(line):
             continue
-        if URL_OR_EMAIL_RE.search(line):
+        if re.fullmatch(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}", line):
             continue
         if line.casefold() in {"оглавление", "содержание"}:
             continue
@@ -140,7 +178,33 @@ def clean_context_text(value: str) -> str:
 
     while cleaned_lines and cleaned_lines[-1] == "":
         cleaned_lines.pop()
-    return re.sub(r"\n{3,}", "\n\n", "\n".join(cleaned_lines)).strip()
+    # Blank lines inside a configuration/code fence are significant.
+    return "\n".join(cleaned_lines).strip()
+
+
+def _technical_excerpt(value: str, max_chars: int) -> str:
+    """Return an ordered prefix, never a sliced or unclosed command block."""
+    if len(value) <= max_chars:
+        return value
+    notice = "[Фрагмент инструкции: продолжение не вошло; полный порядок действий не подтверждён.]"
+    if max_chars <= len(notice):
+        return ""
+    limit = max_chars - len(notice) - 2
+    end = value.rfind("\n", 0, limit) + 1
+    opened: str | None = None
+    opening_offset = 0
+    offset = 0
+    for line in value[:end].splitlines(keepends=True):
+        marker = re.match(r"^(`{3,}|~{3,})", line)
+        if opened is None and marker:
+            opened, opening_offset = marker[1], offset
+        elif opened is not None and line.strip() == opened:
+            opened = None
+        offset += len(line)
+    if opened is not None:
+        end = opening_offset
+    prefix = value[:end].rstrip()
+    return (prefix + "\n\n" if prefix else "") + notice
 
 
 def _query_terms(query: str) -> set[str]:
@@ -153,6 +217,28 @@ def _query_terms(query: str) -> set[str]:
 
 def _normalise_signal_token(value: str) -> str:
     return value.casefold().replace("ё", "е").replace(".", "").replace("-", "")
+
+
+def _soft_lexical_match(query_token: str, content_token: str) -> bool:
+    """Match common Russian inflections without weakening exact anchors.
+
+    This is intentionally only a soft context-selection signal. Retrieval still
+    comes from PostgreSQL's Russian text-search configuration, while identifiers,
+    numbers and abbreviations continue to require exact matching.
+    """
+
+    if query_token == content_token:
+        return True
+    if len(query_token) < 6 or len(content_token) < 6:
+        return False
+    if not query_token.isalpha() or not content_token.isalpha():
+        return False
+    if not all("а" <= character <= "я" for character in query_token + content_token):
+        return False
+    return (
+        query_token[:SOFT_CYRILLIC_PREFIX_CHARS]
+        == content_token[:SOFT_CYRILLIC_PREFIX_CHARS]
+    )
 
 
 def _query_signal_weights(query: str) -> tuple[dict[str, float], set[str]]:
@@ -196,22 +282,49 @@ def _query_relevance_score(
     if not signal_weights:
         return 0.0
 
-    values = [result.text, result.heading or "", result.heading_breadcrumb or ""]
-    content_tokens = {
+    direct_tokens = {
         token
-        for value in values
+        for value in (result.text, result.heading or "")
         for raw_token in WORD_RE.findall(value)
         if (token := _normalise_signal_token(raw_token))
     }
+    breadcrumb_tokens = {
+        token
+        for raw_token in WORD_RE.findall(result.heading_breadcrumb or "")
+        if (token := _normalise_signal_token(raw_token))
+    }
+
+    def matched_tokens(content_tokens: set[str]) -> set[str]:
+        return {
+            token
+            for token in signal_weights
+            if token in content_tokens
+            or (
+                token not in anchors
+                and any(
+                    _soft_lexical_match(token, content_token)
+                    for content_token in content_tokens
+                )
+            )
+        }
+
+    direct_matches = matched_tokens(direct_tokens)
+    breadcrumb_only_matches = matched_tokens(breadcrumb_tokens) - direct_matches
     total_weight = sum(signal_weights.values())
-    matched_weight = sum(
-        weight for token, weight in signal_weights.items() if token in content_tokens
+    matched_weight = sum(signal_weights[token] for token in direct_matches) + (
+        BREADCRUMB_SIGNAL_WEIGHT
+        * sum(signal_weights[token] for token in breadcrumb_only_matches)
     )
     weighted_coverage = matched_weight / total_weight if total_weight else 0.0
     if not anchors:
         return weighted_coverage
 
-    anchor_coverage = len(anchors & content_tokens) / len(anchors)
+    direct_anchor_count = len(anchors & direct_matches)
+    breadcrumb_anchor_count = len(anchors & breadcrumb_only_matches)
+    anchor_coverage = (
+        direct_anchor_count
+        + BREADCRUMB_SIGNAL_WEIGHT * breadcrumb_anchor_count
+    ) / len(anchors)
     return (
         (1.0 - QUERY_ANCHOR_SHARE) * weighted_coverage
         + QUERY_ANCHOR_SHARE * anchor_coverage
@@ -238,8 +351,11 @@ def focused_context_excerpt(value: str, query: str, max_chars: int) -> str:
     cleaned = clean_context_text(value)
     if len(cleaned) <= max_chars:
         return cleaned
+    if re.search(r"(?m)^(`{3,}|~{3,})", cleaned):
+        return _technical_excerpt(cleaned, max_chars)
 
     terms = _query_terms(query)
+    exact_identifiers = extract_exact_identifiers(query)
     paragraphs = [part.strip() for part in cleaned.split("\n\n") if part.strip()]
     if not paragraphs:
         return cleaned[:max_chars].rstrip()
@@ -248,6 +364,10 @@ def focused_context_excerpt(value: str, query: str, max_chars: int) -> str:
         paragraph_terms = {token.casefold() for token in WORD_RE.findall(paragraph)}
         overlap = len(terms & paragraph_terms)
         score = float(overlap)
+        score += 5.0 * sum(
+            contains_exact_identifier(paragraph, identifier)
+            for identifier in exact_identifiers
+        )
         lowered = paragraph.casefold()
         if query.casefold().startswith("что такое") and any(
             marker in lowered
@@ -322,6 +442,10 @@ def _source_header(source: ContextSource) -> str:
         details.append(page_label)
     if source.heading:
         details.append(source.heading)
+    if source.source_version:
+        details.append(f"Confluence v{source.source_version}")
+    if source.source_url:
+        details.append(source.source_url)
     return f"{source.citation} Источник: " + ", ".join(details)
 
 
@@ -341,6 +465,36 @@ def build_context(
     query_selection_weight: float = 0.30,
 ) -> BuiltContext:
     candidates = list(results)
+    if requests_live_operational_state(question):
+        return BuiltContext(
+            text="",
+            sources=[],
+            char_count=0,
+            candidate_count=len(candidates),
+            evidence_status="insufficient",
+            evidence_score=None,
+            rejected_low_score=len(candidates),
+            rejected_duplicate=0,
+            rejected_document_cap=0,
+        )
+    required_identifiers = set(extract_exact_identifiers(question))
+    candidate_matched_identifiers = {
+        identifier
+        for candidate in candidates
+        for identifier in required_identifiers
+        if contains_exact_identifier(
+            " ".join(
+                value
+                for value in (
+                    candidate.text,
+                    candidate.heading or "",
+                    candidate.heading_breadcrumb or "",
+                )
+                if value
+            ),
+            identifier,
+        )
+    }
     candidate_scores = [source_quality_score(result) for result in candidates]
     best_score = max(candidate_scores, default=None)
     status = evidence_status(
@@ -348,6 +502,8 @@ def build_context(
         strong_threshold=strong_evidence_score,
         limited_threshold=limited_evidence_score,
     )
+    if required_identifiers and candidate_matched_identifiers != required_identifiers:
+        status = "insufficient"
 
     if status == "insufficient":
         return BuiltContext(
@@ -360,6 +516,8 @@ def build_context(
             rejected_low_score=len(candidates),
             rejected_duplicate=0,
             rejected_document_cap=0,
+            required_anchor_count=len(required_identifiers),
+            matched_anchor_count=len(candidate_matched_identifiers),
         )
 
     sources: list[ContextSource] = []
@@ -399,6 +557,33 @@ def build_context(
         )
     ranked_candidates.sort(key=lambda item: (-item[3], item[4]))
 
+    # A long, high-similarity section can otherwise consume the character budget
+    # before a more literal leaf section is considered. Reserve at most two of
+    # the available source slots for the strongest direct query matches while
+    # retaining at least two slots ordered by the blended quality score.
+    reserved_count = min(
+        QUERY_RELEVANCE_RESERVED_SOURCES,
+        max(0, max_sources - 2),
+    )
+    if reserved_count and query_selection_weight > 0.0:
+        relevance_leaders = sorted(
+            (
+                item
+                for item in ranked_candidates
+                if item[1] >= score_floor and item[2] > 0.0
+            ),
+            key=lambda item: (-item[2], -item[3], item[4]),
+        )[:reserved_count]
+        reserved_positions = {item[4] for item in relevance_leaders}
+        ranked_candidates = [
+            *relevance_leaders,
+            *(
+                item
+                for item in ranked_candidates
+                if item[4] not in reserved_positions
+            ),
+        ]
+
     for (
         result,
         quality_score,
@@ -419,7 +604,14 @@ def build_context(
         if len(source_text.strip()) < 240 and result.parent_text:
             source_text = result.parent_text
 
-        excerpt = focused_context_excerpt(source_text, question, max_source_chars)
+        technical = result.filename.endswith(".confluence.json")
+        if technical and result.parent_text and not getattr(result, "parent_text_truncated", False):
+            source_text = result.parent_text
+        source_budget = max_source_chars
+        if technical:
+            source_budget = max(max_source_chars, min(10000, max_context_chars - 1000))
+
+        excerpt = focused_context_excerpt(source_text, question, source_budget)
         if len(excerpt) < 40:
             rejected_low_score += 1
             continue
@@ -449,6 +641,9 @@ def build_context(
             source_scope=getattr(result, "source_scope", "workspace"),
             knowledge_base_name=getattr(result, "knowledge_base_name", None),
             knowledge_base_version=getattr(result, "knowledge_base_version", None),
+            source_url=getattr(result, "source_url", None),
+            source_page_id=getattr(result, "source_page_id", None),
+            source_version=getattr(result, "source_version", None),
         )
         block = f"{_source_header(source)}\n{source.excerpt}"
         separator_chars = 2 if blocks else 0
@@ -456,10 +651,16 @@ def build_context(
         if remaining < 120:
             break
         if len(block) > remaining:
-            shortened_excerpt_chars = max(40, remaining - len(_source_header(source)) - 1)
-            shortened_excerpt = source.excerpt[:shortened_excerpt_chars].rstrip()
+            shortened_excerpt_chars = remaining - len(_source_header(source)) - 1
+            if shortened_excerpt_chars < 40:
+                continue
+            shortened_excerpt = focused_context_excerpt(source.excerpt, question, shortened_excerpt_chars)
+            if not shortened_excerpt:
+                continue
             source = replace(source, excerpt=shortened_excerpt)
             block = f"{_source_header(source)}\n{source.excerpt}"
+            if len(block) > remaining:
+                continue
 
         sources.append(source)
         blocks.append(block)
@@ -471,6 +672,29 @@ def build_context(
         status = "insufficient"
 
     context_text = "\n\n".join(blocks)
+    selected_matched_identifiers = {
+        identifier
+        for source in sources
+        for identifier in required_identifiers
+        if contains_exact_identifier(
+            " ".join(value for value in (source.heading or "", source.excerpt) if value),
+            identifier,
+        )
+    }
+    if required_identifiers and selected_matched_identifiers != required_identifiers:
+        return BuiltContext(
+            text="",
+            sources=[],
+            char_count=0,
+            candidate_count=len(candidates),
+            evidence_status="insufficient",
+            evidence_score=best_score,
+            rejected_low_score=rejected_low_score,
+            rejected_duplicate=rejected_duplicate,
+            rejected_document_cap=rejected_document_cap,
+            required_anchor_count=len(required_identifiers),
+            matched_anchor_count=len(selected_matched_identifiers),
+        )
     return BuiltContext(
         text=context_text,
         sources=sources,
@@ -481,4 +705,6 @@ def build_context(
         rejected_low_score=rejected_low_score,
         rejected_duplicate=rejected_duplicate,
         rejected_document_cap=rejected_document_cap,
+        required_anchor_count=len(required_identifiers),
+        matched_anchor_count=len(selected_matched_identifiers),
     )

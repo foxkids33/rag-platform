@@ -41,15 +41,18 @@ jobs:
           working-directory: apps/api
       - run: uv sync --frozen --all-groups
       - run: uv run ruff check .
-      - run: uv run python -m pytest -q
       - run: uv run alembic upgrade head
+      - run: uv run alembic check
+      - run: uv run python -m pytest -q
+        env:
+          RUN_DATABASE_TESTS: "1"
 
   python-services:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        service: [worker, embedding]
+        service: [worker, embedding, reranker]
     defaults:
       run:
         working-directory: apps/${{ matrix.service }}

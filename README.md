@@ -13,10 +13,10 @@
 ## Архитектура первого этапа
 
 - `apps/api` — FastAPI API и orchestration.
-- `apps/worker` — ingestion jobs (пока skeleton).
+- `apps/worker` — надёжные ingestion и object-cleanup jobs с PostgreSQL lease/heartbeat.
 - `apps/web` — React/Vite UI в стиле существующего production UI.
 - PostgreSQL + pgvector — метаданные, chunks, dense vectors, full-text index.
-- Redis — очередь/координация фоновых задач.
+- Redis — необязательный wake-up канал; надёжная очередь и lease хранятся в PostgreSQL.
 - MinIO — оригинальные документы.
 - Внешние сервисы — внутренний vLLM, embeddings и reranker endpoints.
 
@@ -27,10 +27,12 @@ cp .env.example .env
 make dev
 ```
 
-`make dev` запускает лёгкий TXT/HTML/JSON stack и локальный embedding service.
+`make dev` запускает лёгкий TXT/HTML/JSON stack и локальный embedding service;
+проверенный профиль первого релиза работает без reranker.
 Он не устанавливает многогигабайтные Torch/CUDA-зависимости Docling. Для
-PDF/DOCX используйте `make dev-docling`, а полный вариант с Docling и
-cross-encoder reranker запускается командой `make dev-full`.
+PDF/DOCX используйте `make dev-docling`. Reranker включается только для явного
+A/B-прогона через `make dev-rerank`, а полный вариант с Docling и reranker —
+через `make dev-full`.
 
 ### Чистый запуск после Docker prune / Clean-Purge data
 
@@ -60,7 +62,7 @@ make local-test
 make logs
 ```
 
-После запуска:
+После запуска все локальные порты привязаны только к `127.0.0.1`:
 
 - UI: `http://localhost:5173`
 - API: `http://localhost:8000`
@@ -110,8 +112,8 @@ Host-side UI development requires Node.js 20.19+; `.nvmrc` selects Node 24.
 13. Добавить управление workspace и режимами источников: user-only, KB-only и hybrid.
 14. Добавить версии и публикацию готовых баз знаний.
 15. Добавить ветвящийся граф диалогов и устойчивые прокручиваемые списки UI.
-16. Добавить OIDC authentication и tenant/workspace isolation.
-17. Добавить frontend OIDC login, document/group ACL и PostgreSQL RLS.
+16. Добавить OIDC authentication, frontend PKCE login и tenant/workspace isolation.
+17. Добавить document/group ACL и PostgreSQL RLS.
 18. Добавить Neo4j и семантический knowledge graph.
 
 ## Локальный reranker
@@ -189,8 +191,11 @@ chunks и ingestion jobs удаляются каскадно. Документы
 В источниках доступны `query_relevance_score` и итоговый `selection_score`.
 При недостаточных доказательствах API возвращает детерминированный
 отказ и не вызывает vLLM. После генерации проверяется, что все ссылки `[n]`
-относятся к реально переданным источникам. В JSON/SSE metadata доступны
-`evidence_status`, `evidence_score`, `abstained` и `citation_valid`.
+относятся к реально переданным источникам. Ответ с отсутствующей или выдуманной
+ссылкой не отдаётся клиенту: API заменяет его детерминированным безопасным
+отказом с причиной `citation_validation_failed`. Поэтому поток LLM буферизуется
+до завершения проверки ссылок. В JSON/SSE metadata доступны `evidence_status`,
+`evidence_score`, `abstained` и `citation_valid`.
 Если retrieval-контекст выглядит релевантным по score, модель начинает вывод с
 внутреннего маркера `[[ANSWER]]` или `[[ABSTAIN]]`. API удаляет управляющие
 маркеры из JSON и SSE независимо от границ токенов и их позиции. Для отказа API
@@ -207,6 +212,20 @@ API хранит все переданные модели фрагменты д�
 в блоке «Использованные источники» только индексы из `cited_source_indices`, в том
 числе для контекстного безопасного отказа.
 
+Точные коды, версии и идентификаторы проходят дополнительный retrieval-канал.
+Он нормализует регистр и пунктуацию (`BLUE-KB-942`, `blue_kb_942`), объединяется
+с dense/FTS через взвешенный RRF и запрещает генерацию, если в evidence найден
+не каждый обязательный идентификатор вопроса.
+
+
+## Confluence
+
+Страницы Confluence Cloud или Data Center можно импортировать по page ID либо
+по space key из UI и API. Повторная синхронизация идемпотентна и использует
+версию/хеш страницы; персональный token вводится в UI, передаётся только в запросе
+и хранится лишь в памяти вкладки. Настройка и
+важная граница ACL описаны в [`docs/confluence.md`](docs/confluence.md).
+
 
 ## Workspace и режимы источников
 
@@ -214,7 +233,7 @@ Workspace теперь явно хранит `source_mode`:
 
 - `USER_DOCUMENTS` — retrieval только по документам текущего workspace;
 - `KNOWLEDGE_BASE` — retrieval только по активной версии выбранной готовой базы;
-- `HYBRID` — единый RRF + reranker по обоим слоям.
+- `HYBRID` — единый RRF по обоим слоям с опциональным reranker.
 
 Workspace можно создавать, переименовывать и удалять через API и UI. При удалении
 очищаются пользовательские документы в MinIO, chunks, embeddings и диалоги.
@@ -227,9 +246,8 @@ Workspace можно создавать, переименовывать и уд�
 Каждое сообщение хранит `parent_message_id`. Новый вопрос можно продолжить от
 любого предыдущего ответа; в LLM и rewrite попадает только история выбранной
 ветки. В интерфейсе доступны карточки, стрелки, панорамирование, масштабирование
-и minimap. Списки диалогов, документов workspace и документов версии KB имеют
-собственную прокрутку, поэтому кнопки действий остаются доступными при любом
-числе элементов.
+и minimap. В боковой панели показываются последние диалоги с явным раскрытием
+полного списка; документы workspace и версии KB прокручиваются в своих панелях.
 
 <!-- BEGIN SERVER DEPLOYMENT -->
 ## Server deployment
@@ -258,9 +276,10 @@ make server-check
 ```
 
 Installation, updates, diagnostics, backup and shared-server safety are
-documented in [docs/deployment.md](docs/deployment.md).
+documented in [docs/deployment.md](docs/deployment.md). Exact first-release
+steps and the read-only inventory command are in
+[docs/server-release-runbook.md](docs/server-release-runbook.md).
 
-The current web container uses the Vite development server. A static
-production build and reverse proxy are planned before the internal
-pilot.
+The server web container serves a pinned, reproducible static build through
+Nginx and proxies `/api/` (including SSE) to the API container.
 <!-- END SERVER DEPLOYMENT -->

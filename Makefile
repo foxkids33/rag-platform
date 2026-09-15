@@ -35,12 +35,13 @@ FAILURE_OUTPUT ?= /evaluation/results/skala-v1-dev-failures.json
 FAILURE_MARKDOWN ?= /evaluation/results/skala-v1-dev-failures.md
 DEV_GATES ?= /evaluation/quality-gates.dev-baseline.json
 ACCEPTANCE_GATES ?= /evaluation/quality-gates.acceptance-baseline.json
+ACCEPTANCE_TARGET_GATES ?= /evaluation/quality-gates.acceptance-target.json
 COMPARE_BASELINE_ARG := $(if $(strip $(BASELINE)),--baseline "$(BASELINE)",)
 COMPARE_GATES_ARG := $(if $(strip $(GATES)),--gates "$(GATES)",)
 
 .PHONY: help local-env dev dev-docling dev-rerank dev-full down down-full logs ps ps-rerank
 .PHONY: local-build local-build-docling local-build-rerank local-build-full local-test
-.PHONY: evaluate evaluate-answers evaluate-dev evaluate-dev-check evaluate-acceptance evaluate-acceptance-check
+.PHONY: evaluate evaluate-answers evaluate-dev evaluate-dev-check evaluate-acceptance evaluate-acceptance-check evaluate-acceptance-target-check
 .PHONY: evaluate-splits-check evaluate-failures evaluate-compare
 .PHONY: api-test api-lint web-build smoke
 
@@ -58,6 +59,7 @@ help:
 	@echo "make evaluate-answers WORKSPACE_ID=<uuid> - include LLM answers"
 	@echo "make evaluate-dev WORKSPACE_ID=<uuid> - run the 72-case tuning split"
 	@echo "make evaluate-acceptance WORKSPACE_ID=<uuid> - run the 24-case holdout"
+	@echo "make evaluate-acceptance-target-check WORKSPACE_ID=<uuid> - check the quality target"
 	@echo "make evaluate-failures - classify the latest dev failures"
 	@echo "make evaluate-splits-check - validate the 72/24 dataset partition"
 	@echo "make evaluate-compare BASELINE=<json> CANDIDATE=<json> - detect regressions"
@@ -173,6 +175,12 @@ evaluate-acceptance-check: evaluate-acceptance
 		CANDIDATE=/evaluation/results/skala-v1-acceptance-latest.json \
 		GATES="$(ACCEPTANCE_GATES)" \
 		COMPARE_OUTPUT=/evaluation/results/skala-v1-acceptance-comparison.json
+
+evaluate-acceptance-target-check: evaluate-acceptance
+	$(MAKE) evaluate-compare \
+		CANDIDATE=/evaluation/results/skala-v1-acceptance-latest.json \
+		GATES="$(ACCEPTANCE_TARGET_GATES)" \
+		COMPARE_OUTPUT=/evaluation/results/skala-v1-acceptance-target-comparison.json
 
 evaluate-failures:
 	$(LOCAL_COMPOSE) exec api python -m app.evaluation.failures \

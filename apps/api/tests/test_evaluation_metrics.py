@@ -72,6 +72,7 @@ def test_fact_matching_keeps_numbers_exact() -> None:
 
     assert fact_coverage(("25 Гбит/с",), text) == 0.0
     assert fact_coverage(("250 Гбит/с",), text) == 1.0
+    assert fact_coverage(("2",), text) == 0.0
 
 
 def test_fact_matching_does_not_confuse_negated_term() -> None:
@@ -85,6 +86,11 @@ def test_fact_matching_keeps_latin_identifiers_exact() -> None:
 
     assert fact_coverage(("Kafka",), text) == 1.0
     assert fact_coverage(("Kafkax",), text) == 0.0
+    assert fact_coverage(("Kafka",), "Используется Kafkax.") == 0.0
+
+
+def test_fact_matching_treats_regular_hyphen_as_a_word_separator() -> None:
+    assert fact_coverage(("OpenID Connect",), "Client type: openid-connect") == 1.0
 
 
 def test_fact_matching_keeps_versions_and_dates_exact() -> None:
@@ -131,6 +137,27 @@ def test_answer_metrics_check_facts_values_forbidden_text_and_citations() -> Non
     assert aggregate.forbidden_fact_violation_rate == 0.0
     assert aggregate.context_fact_evaluated_cases == 1
     assert aggregate.context_fact_coverage == 1.0
+
+
+def test_answer_metrics_do_not_count_citation_index_as_numeric_fact() -> None:
+    case = EvaluationCase(
+        id="citation-is-not-fact",
+        question="Сколько узлов используется?",
+        required_facts=("2",),
+    )
+
+    result = evaluate_answer_case(
+        case,
+        AnswerObservation(
+            case_id=case.id,
+            text="Количество узлов не названо в ответе [2].",
+            actual_abstention=False,
+            citation_valid=True,
+            cited_source_text="Источник сообщает о двух узлах.",
+        ),
+    )
+
+    assert result.required_fact_coverage == 0.0
 
 
 def test_context_metrics_separate_document_presence_from_gold_chunk_facts() -> None:

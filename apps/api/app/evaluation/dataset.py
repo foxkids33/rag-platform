@@ -17,6 +17,8 @@ def _string_tuple(payload: dict[str, Any], key: str, line_number: int) -> tuple[
     value = payload.get(key, [])
     if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
         raise DatasetError(f"Line {line_number}: {key} must be a list of strings")
+    if key == "required_code_blocks":
+        return tuple(item for item in value if item)
     return tuple(item.strip() for item in value if item.strip())
 
 
@@ -68,6 +70,9 @@ def load_cases(path: str | Path) -> list[EvaluationCase]:
                 forbidden_facts=_string_tuple(payload, "forbidden_facts", line_number),
                 difficulty=payload.get("difficulty"),
                 notes=payload.get("notes"),
+                required_code_blocks=_string_tuple(payload, "required_code_blocks", line_number),
+                source_page_id=payload.get("source_page_id"),
+                source_version=payload.get("source_version"),
             )
         except ValueError as exc:
             raise DatasetError(f"Line {line_number}: {exc}") from exc

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 import sys
@@ -211,12 +212,13 @@ async def _preflight_documents(
     workspace_id: UUID,
     cases: list[EvaluationCase],
     corpus: dict[str, str],
-) -> None:
+) -> list[dict[str, Any]]:
     expected_filenames = {
         filename for case in cases for filename in case.expected_filenames
     } | set(corpus)
-    if not expected_filenames:
-        return
+    pinned = [case for case in cases if case.source_page_id is not None]
+    if not expected_filenames and not pinned:
+        return []
 
     response = await client.get(f"/workspaces/{workspace_id}/documents")
     response.raise_for_status()
@@ -245,8 +247,20 @@ async def _preflight_documents(
             ):
                 reason = "SHA-256 mismatch"
             problems.append(f"{reason}: {filename}")
+    for case in pinned:
+        candidates = [item for item in payload if item.get("source_type") == "CONFLUENCE"
+                      and item.get("external_id") == case.source_page_id]
+        if len(candidates) != 1 or not all(
+            item.get("external_version") == case.source_version
+            and item.get("status") == "READY" and item.get("search_enabled") is True
+            and (not case.expected_filenames or item.get("filename") in case.expected_filenames)
+            for item in candidates
+        ):
+            problems.append(f"source version/identity mismatch: {case.id} (page {case.source_page_id} v{case.source_version})")
     if problems:
         raise DatasetError("Document preflight failed:\n- " + "\n- ".join(problems))
+    fields = ("id", "filename", "sha256", "source_type", "external_id", "external_version", "status", "search_enabled")
+    return sorted(({key: item.get(key) for key in fields} for item in payload), key=lambda item: str(item["id"]))
 
 
 async def evaluate_case(
@@ -260,6 +274,7 @@ async def evaluate_case(
     include_answers: bool,
     answer_temperature: float,
     query_selection_weight: float,
+    answer_max_tokens: int | None = None,
 ) -> dict[str, Any]:
     search_started = perf_counter()
     search_response = await client.post(
@@ -285,6 +300,7 @@ async def evaluate_case(
     answer_text: str | None = None
     answer_latency_ms: float | None = None
     generation_temperature: float | None = None
+    finish_reason: str | None = None
     answer_sources: list[dict[str, Any]] = []
     cited_source_indices: list[int] = []
     answer_metrics: AnswerCaseMetrics | None = None
@@ -300,6 +316,7 @@ async def evaluate_case(
                 "rerank": rerank,
                 "temperature": answer_temperature,
                 "query_selection_weight": query_selection_weight,
+                **({"max_tokens": answer_max_tokens} if answer_max_tokens is not None else {}),
             },
         )
         answer_response.raise_for_status()
@@ -310,6 +327,7 @@ async def evaluate_case(
         citation_valid = answer_payload.get("citation_valid")
         answer_text = answer_payload.get("answer")
         generation_temperature = answer_payload.get("generation_temperature")
+        finish_reason = answer_payload.get("finish_reason")
         answer_sources = answer_payload.get("sources", [])
         cited_source_indices = [
             int(value) for value in answer_payload.get("cited_source_indices", [])
@@ -382,6 +400,7 @@ async def evaluate_case(
             "citation_valid": citation_valid,
             "cited_source_indices": cited_source_indices,
             "generation_temperature": generation_temperature,
+            "finish_reason": finish_reason,
             "text": answer_text,
             "sources": answer_sources,
         },
@@ -404,7 +423,7 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
         timeout=timeout,
         headers=headers,
     ) as client:
-        await _preflight_documents(
+        source_documents = await _preflight_documents(
             client,
             args.workspace_id,
             cases,
@@ -423,6 +442,7 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
                     include_answers=args.answers,
                     answer_temperature=args.answer_temperature,
                     query_selection_weight=args.query_selection_weight,
+                    answer_max_tokens=args.answer_max_tokens,
                 )
             except (httpx.HTTPError, KeyError, TypeError, ValueError) as exc:
                 errors.append({"case_id": case.id, "error": str(exc)})
@@ -432,6 +452,9 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
             else:
                 case_results.append(result)
                 print("  ok", flush=True)
+        final_documents = await _preflight_documents(client, args.workspace_id, cases, _load_corpus(args.corpus))
+        if final_documents != source_documents:
+            raise DatasetError("Workspace corpus changed during evaluation; results are not comparable")
 
     aggregate = _aggregate_case_results(case_results)
     rerank_summary = _rerank_summary(case_results, args.rerank)
@@ -450,6 +473,7 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
             "base_url": args.base_url,
             "workspace_id": str(args.workspace_id),
             "dataset": str(args.dataset),
+            "dataset_sha256": hashlib.sha256(args.dataset.read_bytes()).hexdigest(),
             "case_ids": str(args.case_ids) if args.case_ids else None,
             "corpus": str(args.corpus) if args.corpus else None,
             "limit": args.limit,
@@ -457,6 +481,7 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
             "rerank": args.rerank,
             "answers": args.answers,
             "answer_temperature": args.answer_temperature,
+            "answer_max_tokens": args.answer_max_tokens,
             "query_selection_weight": args.query_selection_weight,
             "case_details_included": not args.omit_case_details,
         },
@@ -465,6 +490,7 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
         "failed_case_count": len(errors),
         "aggregate": aggregate,
         "execution": {"rerank": rerank_summary},
+        "source_documents": source_documents,
         "latency": _latency_summary(case_results),
         "breakdown": _breakdowns(case_results),
         "errors": errors,
@@ -488,6 +514,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--limit", type=int, default=10)
     parser.add_argument("--mode", choices=("hybrid", "semantic", "lexical"), default="hybrid")
     parser.add_argument("--timeout", type=float, default=180.0)
+    parser.add_argument("--answer-max-tokens", type=int, help="Optional answer token budget (64..4096); omit to retain API default")
     parser.add_argument(
         "--answer-temperature",
         type=float,
@@ -518,6 +545,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
+    if args.answer_max_tokens is not None and not 64 <= args.answer_max_tokens <= 4096:
+        parser.error("--answer-max-tokens must be between 64 and 4096")
     if args.limit < 1 or args.limit > 20:
         parser.error("--limit must be between 1 and 20")
     if args.answer_temperature < 0.0 or args.answer_temperature > 2.0:

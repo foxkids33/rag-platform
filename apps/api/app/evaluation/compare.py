@@ -28,6 +28,8 @@ HIGHER_IS_BETTER = (
     "aggregate.answer.citation_fact_coverage",
     "aggregate.answer.citation_source_coverage",
     "aggregate.answer.citation_validity_rate",
+    "aggregate.answer.code_block_coverage",
+    "aggregate.answer.code_order_accuracy",
     "execution.rerank.application_rate",
 )
 LOWER_IS_BETTER = (

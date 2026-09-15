@@ -6,7 +6,7 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-rag}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-rag}
     ports:
-      - "5433:5432"
+      - "127.0.0.1:${POSTGRES_HOST_PORT:-5433}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -19,7 +19,7 @@ services:
     image: redis:8-alpine
     command: ["redis-server", "--appendonly", "yes"]
     ports:
-      - "6379:6379"
+      - "127.0.0.1:${REDIS_HOST_PORT:-6379}:6379"
     volumes:
       - redis_data:/data
     healthcheck:
@@ -35,8 +35,8 @@ services:
       MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-minio}
       MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-minio123}
     ports:
-      - "9000:9000"
-      - "9001:9001"
+      - "127.0.0.1:${MINIO_API_HOST_PORT:-9000}:9000"
+      - "127.0.0.1:${MINIO_CONSOLE_HOST_PORT:-9001}:9001"
     volumes:
       - minio_data:/data
 
@@ -49,11 +49,13 @@ services:
       DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://rag:rag@postgres:5432/rag}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
       MINIO_ENDPOINT: ${MINIO_ENDPOINT:-minio:9000}
+      WEB_ORIGIN: ${WEB_ORIGIN:-http://localhost:5173}
       # The reranker overlay explicitly switches this to true.
       RERANK_ENABLED: "false"
     ports:
-      - "8000:8000"
+      - "127.0.0.1:${API_HOST_PORT:-8000}:8000"
     volumes:
+      - ../apps/api/app:/app/app:ro
       - ../evaluation:/evaluation
     depends_on:
       postgres:
@@ -63,6 +65,12 @@ services:
       minio:
         condition: service_started
     command: ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"]
+    healthcheck:
+      test: ["CMD", "/app/.venv/bin/python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health', timeout=5)"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
 
   worker:
     build:
@@ -73,6 +81,8 @@ services:
       DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://rag:rag@postgres:5432/rag}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
       MINIO_ENDPOINT: ${MINIO_ENDPOINT:-minio:9000}
+    volumes:
+      - ../apps/worker/app:/app/app:ro
     depends_on:
       postgres:
         condition: service_healthy
@@ -80,15 +90,18 @@ services:
         condition: service_healthy
       minio:
         condition: service_started
+      api:
+        condition: service_healthy
     command: ["/app/.venv/bin/python", "-m", "app.main"]
 
   web:
     build:
       context: ../apps/web
+      target: dev
     environment:
-      VITE_API_BASE_URL: http://localhost:8000
+      VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://localhost:8000}
     ports:
-      - "5173:5173"
+      - "127.0.0.1:${WEB_HOST_PORT:-5173}:5173"
     volumes:
       - ../apps/web:/app
       - web_node_modules:/app/node_modules

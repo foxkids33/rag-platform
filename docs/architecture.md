@@ -15,35 +15,38 @@ A workspace stores an explicit source mode:
 isolated. Every returned source carries provenance identifying either the workspace
 document or the knowledge-base name and version.
 
-## Planned online RAG path
+## Online RAG path
 
 ```text
 question
   -> optional conversation-aware rewrite
   -> dense retrieval (pgvector)
   -> lexical retrieval (PostgreSQL FTS)
+  -> punctuation-tolerant exact identifier retrieval
   -> RRF fusion
-  -> deterministic exact/domain-term boosts
   -> cross-encoder reranker
   -> parent/neighbor expansion
   -> context packing
   -> vLLM generation
-  -> citations + SSE
+  -> citation audit
+  -> validated JSON or buffered SSE
 ```
 
 The default fast path has no mandatory planner LLM call before retrieval.
 
-## Planned ingestion path
+## Ingestion path
 
 ```text
 upload/import
   -> object storage
-  -> ingestion job
+  -> durable PostgreSQL ingestion job (Redis wake-up is best effort)
+  -> lease, heartbeat and stale-job recovery
   -> parser (Docling where appropriate)
   -> hierarchical parent/child chunking
   -> SHA-256 deduplication
   -> embeddings
   -> PostgreSQL + pgvector
+  -> durable object-deletion outbox
   -> optional graph extraction
 ```
 
@@ -93,9 +96,10 @@ auto-layout canvas with arrows, pan/zoom controls and a minimap.
 ## Remaining roadmap
 
 ```text
-Neo4j entity/relation extraction per KB version
+Confluence page/group ACL propagation
+  -> Neo4j entity/relation extraction per KB version
   -> GraphRAG + deep query planning
-  -> answer verification and evaluation datasets
+  -> semantic answer verification
   -> Langfuse traces, metrics and feedback
-  -> authentication, roles and production hardening
+  -> frontend OIDC login flow and broader production hardening
 ```

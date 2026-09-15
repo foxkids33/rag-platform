@@ -1,6 +1,8 @@
 from functools import lru_cache
+from typing import Literal
+from urllib.parse import urlsplit
 
-from pydantic import Field, model_validator
+from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 OIDC_ASYMMETRIC_ALGORITHMS = {
@@ -51,6 +53,18 @@ class Settings(BaseSettings):
     minio_secure: bool = False
     upload_max_mb: int = 100
 
+    confluence_enabled: bool = False
+    confluence_deployment: Literal["cloud", "data_center"] = "cloud"
+    confluence_base_url: str = ""
+    confluence_auth_mode: Literal["basic", "bearer"] = "basic"
+    confluence_email: str = ""
+    confluence_api_token: SecretStr = SecretStr("")
+    confluence_access_token: SecretStr = SecretStr("")
+    confluence_timeout_seconds: float = Field(default=30.0, gt=0, le=180)
+    confluence_verify_ssl: bool = True
+    confluence_allow_insecure_http: bool = False
+    confluence_max_pages_per_import: int = Field(default=500, ge=1, le=500)
+
     @property
     def upload_max_bytes(self) -> int:
         return self.upload_max_mb * 1024 * 1024
@@ -73,6 +87,7 @@ class Settings(BaseSettings):
     rag_source_similarity_threshold: float = 0.78
     rag_max_sources_per_document: int = 3
     rag_query_selection_weight: float = Field(default=0.30, ge=0.0, le=1.0)
+    rag_answer_candidate_limit: int = Field(default=20, ge=1, le=20)
     rag_strong_evidence_score: float = 0.50
     rag_limited_evidence_score: float = 0.15
     embedding_base_url: str = "http://embedding:8080"
@@ -90,6 +105,13 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_authentication(self) -> "Settings":
+        protected_environment = self.app_env.casefold() in {
+            "server",
+            "production",
+            "prod",
+        }
+        if protected_environment and not self.auth_enabled:
+            raise ValueError("Authentication must be enabled outside local development")
         if self.auth_enabled:
             required = {
                 "OIDC_ISSUER": self.oidc_issuer,
@@ -114,6 +136,19 @@ class Settings(BaseSettings):
             raise ValueError("Authentication settings must not be empty: " + ", ".join(empty))
         if self.oidc_algorithm not in OIDC_ASYMMETRIC_ALGORITHMS:
             raise ValueError("OIDC_ALGORITHM must be an approved asymmetric algorithm")
+        if self.confluence_enabled:
+            parsed = urlsplit(self.confluence_base_url.strip())
+            if not parsed.scheme or not parsed.netloc or parsed.username or parsed.password:
+                raise ValueError("CONFLUENCE_BASE_URL must be an absolute URL without credentials")
+            if parsed.query or parsed.fragment:
+                raise ValueError("CONFLUENCE_BASE_URL must not contain a query or fragment")
+            if parsed.scheme != "https" and not (
+                parsed.scheme == "http" and self.confluence_allow_insecure_http
+            ):
+                raise ValueError(
+                    "CONFLUENCE_BASE_URL must use HTTPS; explicitly set "
+                    "CONFLUENCE_ALLOW_INSECURE_HTTP=true for an internal HTTP deployment"
+                )
         return self
 
 

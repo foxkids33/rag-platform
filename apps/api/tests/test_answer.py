@@ -5,6 +5,7 @@ from app.api.routes import answer as answer_route
 from app.api.routes.answer import (
     INSUFFICIENT_EVIDENCE_ANSWER,
     PreparedAnswer,
+    _answer_candidate_limit,
     _messages,
 )
 from app.api.routes.search import SearchResponse, SearchResult
@@ -114,6 +115,12 @@ def _prepared_answer() -> PreparedAnswer:
     )
 
 
+def test_answer_candidate_pool_is_larger_than_selected_source_limit() -> None:
+    assert _answer_candidate_limit(8, 5, 20) == 20
+    assert _answer_candidate_limit(20, 5, 10) == 20
+    assert _answer_candidate_limit(3, 2, 4) == 4
+
+
 def test_clean_context_text_removes_pdf_noise() -> None:
     value = """
 ОГЛАВЛЕНИЕ
@@ -124,6 +131,33 @@ info@example.com
 Полезный факт о системе.
 """
     assert clean_context_text(value) == "Полезный факт о системе."
+
+
+def test_context_preserves_verbatim_commands_and_configuration() -> None:
+    value = 'Проверка:\n\n```bash\ncurl -I https://example.test \\\n  --header "X:  two spaces"\n\n\n  value: true\n```'
+    assert clean_context_text(value) == value
+    assert 'curl https://example.test' in clean_context_text('curl https://example.test')
+
+
+def test_technical_context_never_slices_code_or_claims_a_full_procedure() -> None:
+    from app.services.context_builder import focused_context_excerpt
+
+    value = 'Сначала сделайте резервную копию.\n\n```bash\n' + 'command --exact-value\n' * 80 + '```\n\nПроверьте результат.'
+    excerpt = focused_context_excerpt(value, 'command', 200)
+    assert len(excerpt) <= 200
+    assert '```' not in excerpt
+    assert 'Фрагмент инструкции' in excerpt
+    assert 'резервную копию' in excerpt
+
+
+def test_technical_context_fences_are_balanced_at_every_budget_boundary() -> None:
+    from app.services.context_builder import focused_context_excerpt
+
+    value = 'Предусловия\n\n```bash\n  echo exact\n```\n\n' + 'Продолжение\n' * 50
+    for budget in range(90, 200):
+        excerpt = focused_context_excerpt(value, 'echo', budget)
+        assert len(excerpt) <= budget
+        assert excerpt.count('```') % 2 == 0
 
 
 def test_build_context_numbers_sources_and_respects_budget() -> None:
@@ -153,6 +187,120 @@ def test_build_context_numbers_sources_and_respects_budget() -> None:
     assert context.char_count <= 900
 
 
+def test_build_context_never_exceeds_budget_for_long_source_header() -> None:
+    result = _result(text="Подтверждённый полезный факт. " * 20, rank=1).model_copy(
+        update={"heading_breadcrumb": "Очень длинный заголовок " * 40}
+    )
+
+    context = build_context(
+        "Какой полезный факт подтверждён?",
+        [result],
+        max_context_chars=200,
+        max_source_chars=100,
+        max_sources=1,
+    )
+
+    assert context.char_count <= 200
+    assert len(context.text) <= 200
+
+
+def test_build_context_rejects_strong_semantic_noise_when_exact_id_is_absent() -> None:
+    context = build_context(
+        "Что означает BLUE-KB-942?",
+        [_result(text="Общее описание похожей базы знаний без нужного кода.", rank=1)],
+        max_context_chars=2000,
+        max_source_chars=1000,
+        max_sources=1,
+    )
+
+    assert context.evidence_status == "insufficient"
+    assert context.sources == []
+    assert context.required_anchor_count == 1
+    assert context.matched_anchor_count == 0
+
+
+def test_build_context_matches_exact_id_across_case_and_punctuation() -> None:
+    context = build_context(
+        "Что означает BLUE-KB-942?",
+        [_result(text="Код blue_kb.942 относится к целевому продукту.", rank=1)],
+        max_context_chars=2000,
+        max_source_chars=1000,
+        max_sources=1,
+    )
+
+    assert context.sources
+    assert context.required_anchor_count == 1
+    assert context.matched_anchor_count == 1
+
+
+def test_build_context_requires_every_exact_identifier() -> None:
+    context = build_context(
+        "Сравни BLUE-KB-942 и RED-KB-777",
+        [_result(text="Подтверждён только код BLUE-KB-942 в этой записи.", rank=1)],
+        max_context_chars=2000,
+        max_source_chars=1000,
+        max_sources=1,
+    )
+
+    assert context.evidence_status == "insufficient"
+    assert context.sources == []
+    assert context.required_anchor_count == 2
+    assert context.matched_anchor_count == 1
+
+
+def test_build_context_rejects_stale_document_output_as_live_user_state() -> None:
+    context = build_context(
+        "Какова текущая загрузка CPU каждого узла моего кластера прямо сейчас?",
+        [_result(text="MDS 1 CPU 0.2%; MDS 2 CPU 0.8%", rank=1)],
+        max_context_chars=2000,
+        max_source_chars=1000,
+        max_sources=1,
+    )
+
+    assert context.evidence_status == "insufficient"
+    assert context.sources == []
+
+
+def test_build_context_does_not_match_exact_id_inside_longer_identifier() -> None:
+    context = build_context(
+        "Что означает BLUE-KB-942?",
+        [_result(text="Код BLUE-KB-9421 относится к другому продукту.", rank=1)],
+        max_context_chars=2000,
+        max_source_chars=1000,
+        max_sources=1,
+    )
+
+    assert context.evidence_status == "insufficient"
+    assert context.matched_anchor_count == 0
+
+
+def test_build_context_keeps_exact_match_ahead_of_reranked_noise() -> None:
+    exact = _result(
+        text=(
+            "Код blue_kb.942 обозначает целевой регламент восстановления и "
+            "содержит проверенную процедуру для дежурной команды."
+        ),
+        rank=2,
+        filename="exact.txt",
+    ).model_copy(update={"exact_score": 1.0, "rerank_score": 0.2})
+    noise = _result(
+        text="Общий текст о другом регламенте без запрошенного идентификатора.",
+        rank=1,
+        filename="noise.txt",
+    ).model_copy(update={"rerank_score": 0.99})
+
+    context = build_context(
+        "Что означает BLUE-KB-942?",
+        [noise, exact],
+        max_context_chars=2000,
+        max_source_chars=1000,
+        max_sources=1,
+    )
+
+    assert context.sources[0].filename == "exact.txt"
+    assert context.matched_anchor_count == 1
+
+
 def test_messages_require_grounded_citations() -> None:
     context = build_context(
         "Что такое МБД.Х?",
@@ -171,8 +319,25 @@ def test_messages_require_grounded_citations() -> None:
     assert "Частичный подтверждённый ответ не заменяй полным отказом" in messages[0]["content"]
     assert "одного точного числа, даты или версии" in messages[0]["content"]
     assert "Не переноси характеристики" in messages[0]["content"]
+    assert "не останавливайся на первом найденном факте" in messages[0]["content"]
+    assert "называй конкретные" in messages[0]["content"]
     assert "[1]" in messages[1]["content"]
     assert "Что такое МБД.Х?" in messages[1]["content"]
+
+
+def test_messages_require_a_fenced_block_for_one_requested_command() -> None:
+    context = build_context(
+        "Какой командой посмотреть настройки?",
+        [_result(text="```shell\ncommand --show\n```", rank=1)],
+        max_context_chars=2000,
+        max_source_chars=1000,
+        max_sources=1,
+    )
+
+    messages = _messages("Какой командой посмотреть настройки?", context)
+
+    assert "даже если команда одна" in messages[-1]["content"]
+    assert "Не заменяй команды перечнем пакетов" in messages[-1]["content"]
 
 
 def test_chat_completions_url_supports_base_and_v1_urls() -> None:
@@ -212,6 +377,62 @@ def test_messages_include_bounded_conversation_history() -> None:
     assert "Какие у неё преимущества?" in messages[-1]["content"]
 
 
+def test_followup_rewrite_cannot_drop_exact_identifier(monkeypatch) -> None:
+    async def chat(*_args, **_kwargs):
+        return LLMOutput(
+            text="Какая версия продукта?",
+            model="rewrite-test",
+            finish_reason="stop",
+        )
+
+    monkeypatch.setattr(answer_route.llm, "chat", chat)
+    question = "А какая версия BLUE-KB-942?"
+    history = [HistoryMessage(role="assistant", content="Речь шла о продукте.")]
+
+    rewritten = asyncio.run(
+        answer_route._standalone_retrieval_query(question, history)
+    )
+
+    assert rewritten == question
+
+
+def test_followup_rewrite_cannot_invent_exact_identifier(monkeypatch) -> None:
+    async def chat(*_args, **_kwargs):
+        return LLMOutput(
+            text="Что известно о RED-KB-777?",
+            model="rewrite-test",
+            finish_reason="stop",
+        )
+
+    monkeypatch.setattr(answer_route.llm, "chat", chat)
+    question = "Расскажи подробнее"
+    history = [HistoryMessage(role="user", content="Что такое BLUE-KB-942?")]
+
+    rewritten = asyncio.run(
+        answer_route._standalone_retrieval_query(question, history)
+    )
+
+    assert rewritten == question
+
+
+def test_followup_rewrite_can_restore_identifier_from_history(monkeypatch) -> None:
+    async def chat(*_args, **_kwargs):
+        return LLMOutput(
+            text="Какая версия у BLUE-KB-942?",
+            model="rewrite-test",
+            finish_reason="stop",
+        )
+
+    monkeypatch.setattr(answer_route.llm, "chat", chat)
+    history = [HistoryMessage(role="user", content="Что такое BLUE-KB-942?")]
+
+    rewritten = asyncio.run(
+        answer_route._standalone_retrieval_query("А какая версия?", history)
+    )
+
+    assert rewritten == "Какая версия у BLUE-KB-942?"
+
+
 def test_non_stream_answer_exposes_model_abstention(monkeypatch) -> None:
     prepared = _prepared_answer()
     persisted: dict = {}
@@ -248,6 +469,44 @@ def test_non_stream_answer_exposes_model_abstention(monkeypatch) -> None:
     assert response.abstained is True
     assert response.abstention_reason == "model_reported_insufficient_context"
     assert response.citation_valid is True
+    assert persisted["abstained"] is True
+
+
+def test_non_stream_answer_fails_closed_on_missing_citation(monkeypatch) -> None:
+    prepared = _prepared_answer()
+    persisted: dict = {}
+
+    async def prepare(*_args, **_kwargs):
+        return prepared
+
+    async def chat(*_args, **_kwargs):
+        return LLMOutput(
+            text=f"{ANSWER_MARKER} Неподтверждённый ответ без ссылки.",
+            model="test-model",
+            finish_reason="stop",
+        )
+
+    async def persist(*_args, **kwargs):
+        persisted.update(kwargs)
+        return None, None
+
+    monkeypatch.setattr(answer_route, "_prepare_answer", prepare)
+    monkeypatch.setattr(answer_route.llm, "chat", chat)
+    monkeypatch.setattr(answer_route, "_persist_exchange", persist)
+
+    response = asyncio.run(
+        answer_route.answer(
+            uuid.uuid4(),
+            answer_route.AnswerRequest(question="Вопрос"),
+            None,
+            None,
+        )
+    )
+
+    assert response.answer == INSUFFICIENT_EVIDENCE_ANSWER
+    assert response.abstained is True
+    assert response.abstention_reason == "citation_validation_failed"
+    assert response.citation_valid is False
     assert persisted["abstained"] is True
 
 
@@ -335,6 +594,49 @@ def test_stream_answer_preserves_cited_partial_answer(monkeypatch) -> None:
     assert '"abstained": false' in body
     assert '"cited_source_indices": [1]' in body
     assert persisted["abstained"] is False
+
+
+def test_stream_answer_never_emits_content_with_invalid_citation(monkeypatch) -> None:
+    prepared = _prepared_answer()
+    persisted: dict = {}
+
+    async def prepare(*_args, **_kwargs):
+        return prepared
+
+    async def persist_user(*_args, **_kwargs):
+        return None
+
+    async def persist_assistant(*_args, **kwargs):
+        persisted.update(kwargs)
+
+    async def stream_chat(*_args, **_kwargs):
+        yield f"{ANSWER_MARKER} Опасный неподтверждённый ответ "
+        yield "с выдуманной ссылкой [99]."
+
+    monkeypatch.setattr(answer_route, "_prepare_answer", prepare)
+    monkeypatch.setattr(answer_route, "_persist_stream_user", persist_user)
+    monkeypatch.setattr(answer_route, "_persist_stream_assistant", persist_assistant)
+    monkeypatch.setattr(answer_route.llm, "stream_chat", stream_chat)
+
+    async def collect() -> str:
+        response = await answer_route.answer_stream(
+            uuid.uuid4(),
+            answer_route.AnswerRequest(question="Вопрос"),
+            None,
+            None,
+        )
+        chunks = []
+        async for chunk in response.body_iterator:
+            chunks.append(chunk.decode() if isinstance(chunk, bytes) else chunk)
+        return "".join(chunks)
+
+    body = asyncio.run(collect())
+
+    assert "Опасный неподтверждённый ответ" not in body
+    assert INSUFFICIENT_EVIDENCE_ANSWER in body
+    assert '"abstention_reason": "citation_validation_failed"' in body
+    assert '"citation_valid": false' in body
+    assert persisted["abstained"] is True
 
 
 def test_stream_answer_hides_trailing_marker_and_keeps_contextual_abstention(

@@ -46,7 +46,8 @@ project_name="${project_name#\"}"
 project_name="${project_name%\"}"
 project_name="${project_name#\'}"
 project_name="${project_name%\'}"
-project_name="${project_name:-rag-platform}"
+project_name="${project_name:-rag-kbr-v01}"
+export RAG_SERVICE_ENV_FILE="${RAG_SERVICE_ENV_FILE:-$ENV_FILE}"
 
 if [[ ! "$project_name" =~ ^[a-z0-9][a-z0-9_-]*$ ]]; then
   echo "ERROR: invalid Compose project name: $project_name" >&2

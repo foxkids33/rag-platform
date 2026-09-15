@@ -3,7 +3,6 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, datetime
 
-from anyio import to_thread
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, select
@@ -14,7 +13,10 @@ from app.core.config import settings
 from app.core.security import Principal, get_current_principal
 from app.db.models import ChatSession, Document, KnowledgeBase, KnowledgeBaseVersion, Workspace
 from app.db.session import get_db
-from app.services.storage import StorageError, storage
+from app.services.object_cleanup import (
+    schedule_object_deletions,
+    try_delete_scheduled_objects,
+)
 from app.services.workspace_sources import (
     WorkspaceSourceMode,
     default_source_mode,
@@ -196,9 +198,18 @@ async def delete_workspace(
     db: AsyncSession = Depends(get_db),
     principal: Principal = Depends(get_current_principal),
 ) -> Response:
-    workspace = await workspace_for_principal(db, workspace_id, principal)
+    await workspace_for_principal(db, workspace_id, principal)
+    workspace = await db.scalar(
+        select(Workspace).where(Workspace.id == workspace_id).with_for_update()
+    )
+    if workspace is None:
+        raise HTTPException(status_code=404, detail="Workspace not found")
 
-    result = await db.execute(select(Document).where(Document.workspace_id == workspace_id))
+    result = await db.execute(
+        select(Document)
+        .where(Document.workspace_id == workspace_id)
+        .with_for_update()
+    )
     documents = list(result.scalars())
     if any(document.status in {"QUEUED", "PROCESSING"} for document in documents):
         raise HTTPException(
@@ -206,15 +217,10 @@ async def delete_workspace(
             detail="Workspace cannot be deleted while document ingestion is running",
         )
 
-    for document in documents:
-        try:
-            await to_thread.run_sync(storage.delete, document.object_key)
-        except StorageError as exc:
-            raise HTTPException(
-                status_code=503,
-                detail="Object storage is unavailable; workspace was not deleted",
-            ) from exc
-
+    object_keys = await schedule_object_deletions(
+        db, (document.object_key for document in documents)
+    )
     await db.delete(workspace)
     await db.commit()
+    await try_delete_scheduled_objects(db, object_keys)
     return Response(status_code=status.HTTP_204_NO_CONTENT)

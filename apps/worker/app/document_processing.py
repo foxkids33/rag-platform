@@ -26,10 +26,58 @@ class ParsedChunk:
 
 
 def parse_document(filename: str, data: bytes) -> list[ParsedChunk]:
+    if filename.endswith(".confluence.json"):
+        return _parse_confluence(data)
     extension = Path(filename).suffix.lower()
     if extension in DOCLING_EXTENSIONS:
         return _parse_with_docling(filename, data)
     return _parse_plain_text(filename, data)
+
+
+def _parse_confluence(data: bytes) -> list[ParsedChunk]:
+    from app.confluence_processing import read_envelope, storage_blocks
+
+    page = read_envelope(data)
+    blocks, diagnostics = storage_blocks(
+        page["storage_html"], page["title"], page.get("ancestors", [])
+    )
+    records: list[dict[str, Any]] = []
+    group: list[str] = []
+    heading: str | None = None
+    breadcrumb: str | None = None
+
+    def flush() -> None:
+        if not group:
+            return
+        value = "\n\n".join(group)
+        records.append({
+            "text": value,
+            "search_text": f"{breadcrumb or page['title']}\n\n{value}",
+            "heading": heading,
+            "heading_breadcrumb": breadcrumb,
+            "page_start": None,
+            "page_end": None,
+            "metadata": {
+                "parser": "confluence_storage_v1",
+                "source_page_id": page.get("id"),
+                "source_version": page.get("version"),
+                "source_url": page.get("source_url"),
+                "source_space": page.get("space_key"),
+                "labels": page.get("labels", []),
+                "oversized_atomic_block": len(value) > settings.chunk_max_chars,
+                **diagnostics,
+            },
+        })
+        group.clear()
+
+    for block in blocks:
+        length = sum(len(item) + 2 for item in group) + len(block.text)
+        if group and (block.breadcrumb != breadcrumb or length > settings.chunk_max_chars):
+            flush()
+        heading, breadcrumb = block.heading, block.breadcrumb
+        group.append(block.text)
+    flush()
+    return _build_parent_groups(records)
 
 
 def _parse_plain_text(filename: str, data: bytes) -> list[ParsedChunk]:

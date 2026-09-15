@@ -5,9 +5,16 @@ import json
 import uuid
 
 import httpx
+import pytest
 
+from app.evaluation.dataset import DatasetError
 from app.evaluation.models import EvaluationCase
-from app.evaluation.runner import _aggregate_case_results, _rerank_summary, evaluate_case
+from app.evaluation.runner import (
+    _aggregate_case_results,
+    _preflight_documents,
+    _rerank_summary,
+    evaluate_case,
+)
 
 
 def _result_stub(*, expected_abstention: bool, abstention_correct: bool) -> dict:
@@ -53,6 +60,37 @@ def test_rerank_summary_exposes_requested_but_not_applied_runs() -> None:
     assert summary["requested"] is True
     assert summary["application_rate"] == 0.0
     assert summary["not_applied_cases"] == 1
+
+
+@pytest.mark.parametrize('version,status,enabled,valid', [('7', 'READY', True, True), ('6', 'READY', True, False), ('7', 'QUEUED', True, False), ('7', 'READY', False, False)])
+def test_preflight_pins_confluence_version(version, status, enabled, valid):
+    case = EvaluationCase(id='pinned', question='Which command?', expected_filenames=('page.confluence.json',), source_page_id='42', source_version='7')
+    async def check():
+        transport = httpx.MockTransport(lambda _: httpx.Response(200, json=[{'id':'doc', 'filename':'page.confluence.json', 'source_type':'CONFLUENCE', 'external_id':'42', 'external_version':version, 'status':status, 'search_enabled':enabled}]))
+        async with httpx.AsyncClient(base_url='http://test/api/v1', transport=transport) as client:
+            return await _preflight_documents(client, uuid.uuid4(), [case], {})
+    if valid:
+        assert asyncio.run(check())[0]['external_version'] == '7'
+    else:
+        with pytest.raises(DatasetError):
+            asyncio.run(check())
+
+
+@pytest.mark.parametrize('max_tokens', [None, 4096])
+def test_answer_budget_is_optional_and_finish_reason_is_recorded(max_tokens):
+    def handler(request):
+        if request.url.path.endswith('/search'):
+            return httpx.Response(200, json={'results': []})
+        payload = json.loads(request.content)
+        if max_tokens is None:
+            assert 'max_tokens' not in payload
+        else:
+            assert payload['max_tokens'] == max_tokens
+        return httpx.Response(200, json={'abstained': False, 'answer': 'partial', 'finish_reason': 'length'})
+    async def check():
+        async with httpx.AsyncClient(base_url='http://test/api/v1', transport=httpx.MockTransport(handler)) as client:
+            return await evaluate_case(client, uuid.uuid4(), EvaluationCase(id='budget', question='Question'), limit=10, mode='hybrid', rerank=False, include_answers=True, answer_temperature=0, query_selection_weight=0.3, answer_max_tokens=max_tokens)
+    assert asyncio.run(check())['answer']['finish_reason'] == 'length'
 
 
 def test_evaluate_case_uses_filenames_as_stable_gold_keys() -> None:

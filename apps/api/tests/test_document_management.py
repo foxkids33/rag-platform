@@ -34,8 +34,13 @@ class FakeSession:
             return self.workspace
         return self.document
 
-    async def scalar(self, _query):
-        return self.workspace
+    async def scalar(self, query):
+        entity = query.column_descriptions[0].get("entity")
+        if entity is Workspace:
+            return self.workspace
+        if entity is Document:
+            return self.document
+        return None
 
     async def commit(self) -> None:
         self.committed = True
@@ -122,11 +127,23 @@ def test_non_ready_document_cannot_be_enabled_for_search() -> None:
     assert db.committed is False
 
 
-def test_delete_removes_object_before_database_row(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_delete_persists_cleanup_outbox_before_removing_database_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     document = _document()
     db = FakeSession(document)
     removed: list[str] = []
-    monkeypatch.setattr(documents.storage, "delete", removed.append)
+
+    async def schedule(_db, keys):
+        values = list(keys)
+        removed.extend(values)
+        return values
+
+    async def cleanup(_db, _keys):
+        return None
+
+    monkeypatch.setattr(documents, "schedule_object_deletions", schedule)
+    monkeypatch.setattr(documents, "try_delete_scheduled_objects", cleanup)
 
     response = asyncio.run(
         documents.delete_workspace_document(
@@ -147,7 +164,12 @@ def test_processing_document_cannot_be_deleted(monkeypatch: pytest.MonkeyPatch) 
     document = _document(status="PROCESSING")
     db = FakeSession(document)
     removed: list[str] = []
-    monkeypatch.setattr(documents.storage, "delete", removed.append)
+
+    async def schedule(_db, keys):
+        removed.extend(keys)
+        return list(keys)
+
+    monkeypatch.setattr(documents, "schedule_object_deletions", schedule)
 
     with pytest.raises(HTTPException) as exc_info:
         asyncio.run(

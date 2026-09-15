@@ -1,0 +1,8 @@
+window.__RAG_RUNTIME_CONFIG__ = Object.freeze({
+  authEnabled: "${AUTH_ENABLED}" === "true",
+  oidcAuthority: "${OIDC_ISSUER}",
+  oidcClientId: "${OIDC_CLIENT_ID}",
+  oidcScopes: "${OIDC_SCOPES}",
+  oidcRedirectUri: "${OIDC_REDIRECT_URI}",
+  oidcPostLogoutRedirectUri: "${OIDC_POST_LOGOUT_REDIRECT_URI}"
+});

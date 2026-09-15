@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -11,6 +10,7 @@ CITATION_RE = re.compile(r"\[(\d{1,3})\]")
 
 class QualityResultLike(Protocol):
     rerank_score: float | None
+    exact_score: float | None
     dense_score: float | None
     lexical_score: float | None
     rrf_score: float
@@ -30,17 +30,25 @@ def _clamp(value: float) -> float:
 def source_quality_score(result: QualityResultLike) -> float:
     """Return a comparable 0..1 score for context selection and quality gates.
 
-    Reranker scores are preferred. Dense cosine similarity is already exposed as
-    a similarity-like value. Lexical and RRF scores are mapped monotonically so
-    they remain useful when reranking is disabled without pretending to be
-    calibrated probabilities.
+    Reranker scores are preferred unless a deterministic exact identifier match
+    is stronger. Dense cosine similarity is already exposed as a similarity-like
+    value. PostgreSQL ``ts_rank_cd`` is only meaningful within one lexical result
+    list, so lexical-only candidates use their RRF rank contribution instead of
+    being compared directly with dense similarities.
     """
+    exact_score = getattr(result, "exact_score", None)
     if result.rerank_score is not None:
-        return _clamp(float(result.rerank_score))
-    if result.dense_score is not None:
-        return _clamp(float(result.dense_score))
-    if result.lexical_score is not None:
-        return _clamp(1.0 - math.exp(-30.0 * max(0.0, float(result.lexical_score))))
+        scores = [float(result.rerank_score)]
+        if exact_score is not None:
+            scores.append(float(exact_score))
+        return _clamp(max(scores))
+    direct_scores = [
+        float(score)
+        for score in (exact_score, result.dense_score)
+        if score is not None
+    ]
+    if direct_scores:
+        return _clamp(max(direct_scores))
     return _clamp(max(0.0, float(result.rrf_score)) * 25.0)
 
 

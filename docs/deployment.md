@@ -4,31 +4,30 @@ This document describes the internal server deployment of RAG Platform.
 
 ## Deployment identity
 
-- Directory: `/opt/rag-platform`
-- Compose project: `rag-platform`
+- Directory: `/opt/rag-kbr-v01`
+- Compose project: `rag-kbr-v01`
 - Compose file: `deploy/docker-compose.server.yml`
 - Environment file: `.env`
 - Web host port: `15173`
-- API host port: `18000`
 
 The real server `.env` file is not stored in Git.
 
 ## Services
 
-The deployment contains eight services:
+The baseline deployment contains seven services:
 
 - `postgres`
 - `redis`
 - `minio`
 - `embedding`
-- `reranker`
 - `api`
 - `worker`
 - `web`
 
-Only API and web publish ports on the host.
+The optional `reranker` service appears only with the explicit `rerank` profile.
+Only web publishes a loopback port on the host.
 
-PostgreSQL, Redis, MinIO, embedding and reranker are available only
+API, PostgreSQL, Redis, MinIO, embedding and reranker are available only
 inside the Compose network.
 
 ## Port mapping
@@ -36,56 +35,48 @@ inside the Compose network.
 Default loopback configuration:
 
 ```text
-127.0.0.1:15173 -> web:5173
-127.0.0.1:18000 -> api:8000
+127.0.0.1:15173 -> web:80
 ```
 
-Direct internal-network access:
-
-```text
-<server-ip>:15173 -> web:5173
-<server-ip>:18000 -> api:8000
-```
-
-The deployment must not occupy host ports:
-
-```text
-5173
-8000
-9000
-```
-
-Container ports with these numbers are allowed. A container port does
-not occupy the same host port unless it is explicitly published.
+The existing reverse proxy is the only entry point and forwards the external
+HTTPS virtual host to this loopback port. Other applications may use 5173,
+8000, 9000 or any other ports; the read-only preflight only requires the chosen
+`RAG_WEB_HOST_PORT` to be free.
 
 ## Environment setup
 
 Create the server environment file:
 
 ```bash
-cd /opt/rag-platform
+cd /opt/rag-kbr-v01
 cp .env.server.example .env
 chmod 600 .env
 ```
 
 Replace all placeholder passwords, tokens and endpoints.
+`APP_ENV=server` now refuses to start the API with `AUTH_ENABLED=false`.
+The browser UI performs OIDC Authorization Code + PKCE. Register a public SPA
+client without a client secret and configure the exact external callback and
+post-logout URLs. Runtime OIDC values are generated when the web container
+starts and are not embedded in the frontend build.
 
 Required project identity:
 
 ```dotenv
-COMPOSE_PROJECT_NAME=rag-platform
+COMPOSE_PROJECT_NAME=rag-kbr-v01
 ENVIRONMENT=server
 ```
 
-For direct access from the internal network:
+For access through the existing reverse proxy:
 
 ```dotenv
-RAG_BIND_HOST=<server-ip>
-RAG_API_HOST_PORT=18000
+RAG_BIND_HOST=127.0.0.1
 RAG_WEB_HOST_PORT=15173
-WEB_ORIGIN=http://<server-ip>:15173
-VITE_API_BASE_URL=http://<server-ip>:18000
+WEB_ORIGIN=https://rag.example.com
 ```
+
+The static web container proxies browser requests under `/api/` to the internal
+API service. Operators use `compose-server.sh exec` rather than a public API port.
 
 Never commit `.env`.
 
@@ -112,7 +103,7 @@ project name.
 ## Initial deployment
 
 ```bash
-cd /opt/rag-platform
+cd /opt/rag-kbr-v01
 
 scripts/deploy/compose-server.sh config
 scripts/deploy/compose-server.sh build
@@ -138,7 +129,7 @@ rsync -az \
   --exclude='.ruff_cache/' \
   --exclude='*.pyc' \
   ./ \
-  root@<server-ip>:/opt/rag-platform/
+  root@<server-ip>:/opt/rag-kbr-v01/
 ```
 
 Do not add `--delete` without reviewing server-only files.
@@ -146,7 +137,7 @@ Do not add `--delete` without reviewing server-only files.
 Then run on the server:
 
 ```bash
-cd /opt/rag-platform
+cd /opt/rag-kbr-v01
 
 scripts/deploy/compose-server.sh config
 scripts/deploy/compose-server.sh up -d --build
@@ -194,12 +185,12 @@ scripts/deploy/check-server.sh
 The check validates:
 
 - Docker availability;
-- all eight configured services;
+- all seven baseline services and reranker only when its profile is active;
 - running containers;
 - healthchecks;
 - published ports;
-- reserved host ports;
-- API and web endpoints.
+- the single expected web loopback binding and absence of unexpected published ports;
+- web and API health through the web proxy.
 
 ## Server reboot
 
@@ -212,7 +203,7 @@ restart: unless-stopped
 After a coordinated server reboot:
 
 ```bash
-cd /opt/rag-platform
+cd /opt/rag-kbr-v01
 scripts/deploy/compose-server.sh ps
 scripts/deploy/check-server.sh
 ```
@@ -223,7 +214,7 @@ reboot.
 ## PostgreSQL backup
 
 ```bash
-backup_dir="/opt/rag-platform-backups/$(date +%Y%m%d-%H%M%S)"
+backup_dir="/opt/rag-kbr-v01-backups/$(date +%Y%m%d-%H%M%S)"
 install -d -m 700 "$backup_dir"
 
 scripts/deploy/compose-server.sh exec -T postgres \
@@ -239,7 +230,7 @@ Use the same `backup_dir`:
 
 ```bash
 docker run --rm \
-  -v rag-platform_minio_data:/data:ro \
+  -v rag-kbr-v01_minio_data:/data:ro \
   -v "$backup_dir:/backup" \
   alpine:3.20 \
   tar -C /data -czf /backup/minio-data.tar.gz .
@@ -281,9 +272,10 @@ scripts/deploy/compose-server.sh down -v
 
 The `-v` option deletes persistent project volumes.
 
-## Current limitation
+## Web runtime
 
-The current web container uses the Vite development server.
+The server image builds the locked frontend dependencies with `npm ci`, serves
+the static assets through Nginx, and disables proxy buffering for SSE requests.
 
-It is acceptable for the server baseline, but it must be replaced with
-a static production build and reverse proxy before the internal pilot.
+For the first deployment, frozen KBR import and the isolated BGE-M3 A/B project,
+follow [server-release-runbook.md](server-release-runbook.md).
