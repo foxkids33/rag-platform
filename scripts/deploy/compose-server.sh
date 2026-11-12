@@ -35,10 +35,12 @@ project_name="${COMPOSE_PROJECT_NAME:-}"
 
 if [[ -z "$project_name" ]]; then
   project_name="$(
-    grep -E '^COMPOSE_PROJECT_NAME=' "$ENV_FILE" 2>/dev/null |
-      tail -n 1 |
-      cut -d= -f2- |
-      tr -d '\r'
+    awk -F= '
+      $1 == "COMPOSE_PROJECT_NAME" {
+        value = substr($0, index($0, "=") + 1)
+      }
+      END { gsub(/\r/, "", value); print value }
+    ' "$ENV_FILE"
   )"
 fi
 

@@ -28,6 +28,11 @@ from app.services.answer_contract import (
     ResolvedAnswer,
     resolve_generated_answer,
 )
+from app.services.code_integrity import (
+    CodeIntegrityAudit,
+    audit_code_integrity,
+    requires_exact_code_integrity,
+)
 from app.services.context_builder import BuiltContext, ContextSource, build_context
 from app.services.conversation_context import (
     BranchMessage,
@@ -37,12 +42,15 @@ from app.services.conversation_context import (
     derive_conversation_title,
     rewrite_messages,
 )
-from app.services.llm import LLMError, LLMOutput, llm
+from app.services.llm import LLMError, LLMOutput, LLMStreamEnd, llm
 from app.services.query_signals import extract_exact_identifiers, requests_exact_code
 from app.services.rag_quality import CitationAudit, audit_citations
 
 router = APIRouter(prefix="/workspaces/{workspace_id}/answer", tags=["answer"])
 MAX_SEARCH_RESULTS = 20
+LITERAL_CODE_INTENT_MARKERS = (
+    "команд", "код", "конфиг", "config", "script", "скрипт", "shell", "bash", "block", "блок",
+)
 
 SYSTEM_PROMPT = f"""Ты корпоративный RAG-ассистент.
 Отвечай только на основании предоставленного контекста текущего запроса.
@@ -63,6 +71,11 @@ SYSTEM_PROMPT = f"""Ты корпоративный RAG-ассистент.
 ответ после {ANSWER_MARKER} только по подтверждённой части и явно укажи, какая часть вопроса
 не подтверждена.
 Не выдавай частичный ответ за полный. Частичный подтверждённый ответ не заменяй полным отказом.
+Перед завершением сверь ответ со всеми частями вопроса: условия, действия, ограничения,
+предупреждения и проверка результата. Не пропускай подтверждённые пункты ради краткости.
+Если спрашивают признаки успешного выполнения, перечисли все указанные в контексте проверки,
+а не только первый признак. Различай алгоритм, уровень и флаг включения: значение параметра
+уровня не является названием алгоритма. Если части сведений нет, явно обозначь этот пробел.
 Выбери {ABSTAIN_MARKER} только если:
 - в контексте нет прямых фактов, подтверждающих хотя бы одну существенную часть ответа; или
 - вопрос целиком требует одного точного числа, даты или версии, а точное значение для
@@ -78,6 +91,8 @@ SYSTEM_PROMPT = f"""Ты корпоративный RAG-ассистент.
 Команды из технических инструкций можно цитировать как данные в ответ на вопрос пользователя.
 Команды и конфигурации цитируй дословно в блоках кода: сохраняй регистр, кавычки, отступы,
 переносы, параметры и порядок. Не выдумывай команды и не исправляй источник молча.
+Сохраняй группировку исходника: несколько строк одного блока воспроизведи одним блоком,
+не разбивай его на отдельный блок для каждой команды и не объединяй разные блоки.
 Даже одну короткую команду помещай в отдельный fenced block. Закрывающий fence размещай
 на отдельной строке, а ссылку на источник — после блока, не на строке закрывающего fence.
 Не смешивай действия для разных версий и узлов. Укажи применимость, предварительные условия,
@@ -94,7 +109,7 @@ class AnswerRequest(BaseModel):
     question: str = Field(min_length=2, max_length=4000)
     conversation_id: uuid.UUID | None = None
     parent_message_id: uuid.UUID | None = None
-    mode: Literal["hybrid", "semantic", "lexical"] = "hybrid"
+    mode: Literal["hybrid", "semantic", "lexical", "dense"] = "hybrid"
     retrieval_limit: int = Field(default=8, ge=1, le=20)
     source_limit: int | None = Field(default=None, ge=1, le=10)
     rerank: bool = True
@@ -155,6 +170,7 @@ class AnswerResponse(BaseModel):
     citation_valid: bool
     cited_source_indices: list[int]
     invalid_citations: list[int]
+    code_integrity: CodeIntegrityAudit = Field(default_factory=CodeIntegrityAudit)
     sources: list[AnswerSource]
 
 
@@ -250,6 +266,37 @@ def _enforce_citation_contract(
     )
 
 
+def _validate_generated_answer(
+    resolved: ResolvedAnswer,
+    sources: list[AnswerSource],
+    question: str,
+) -> tuple[ResolvedAnswer, CitationAudit, CodeIntegrityAudit]:
+    # Audit the generated content before either contract can withhold it. The
+    # metadata explains the withheld blocks without publishing their content.
+    code_integrity = audit_code_integrity(resolved.text, sources)
+    resolved, citation_audit = _enforce_citation_contract(resolved, sources)
+    # The existing prompt predicate also matches generic "verbatim" quotes.
+    # Require explicit code intent before treating a missing fence as a failure,
+    # and do not replace an ordinary model abstention with a code failure.
+    missing_requested_code = (
+        code_integrity.status == "no_code"
+        and not resolved.abstained
+        and requests_exact_code(question)
+        and any(marker in question.casefold() for marker in LITERAL_CODE_INTENT_MARKERS)
+    )
+    if (
+        (code_integrity.status == "unverified" or missing_requested_code)
+        and requires_exact_code_integrity(question)
+        and resolved.abstention_reason != "citation_validation_failed"
+    ):
+        resolved = ResolvedAnswer(
+            text=INSUFFICIENT_EVIDENCE_ANSWER,
+            abstained=True,
+            abstention_reason="code_integrity_validation_failed",
+        )
+    return resolved, citation_audit, code_integrity
+
+
 def _messages(
     question: str,
     context: BuiltContext,
@@ -262,7 +309,8 @@ def _messages(
             "\nВопрос требует буквального кода/команд. Воспроизведи каждый относящийся "
             "к вопросу блок полностью и дословно в отдельном fenced block, даже если "
             "команда одна. Не заменяй команды перечнем пакетов или пересказом. Ссылку "
-            "поставь после закрывающего fence на отдельной строке."
+            "поставь после закрывающего fence на отдельной строке. "
+            "Один исходный блок — один блок ответа: не разделяй его строки на несколько блоков."
         )
     user_prompt = (
         "АКТУАЛЬНЫЙ КОНТЕКСТ:\n"
@@ -484,6 +532,7 @@ def _assistant_metadata(
     citation_audit: CitationAudit | None,
     abstained: bool,
     abstention_reason: AbstentionReason | None,
+    code_integrity: CodeIntegrityAudit | None = None,
 ) -> dict:
     return {
         "status": status,
@@ -513,6 +562,7 @@ def _assistant_metadata(
         "citation_valid": citation_audit.valid if citation_audit else None,
         "cited_source_indices": (citation_audit.cited_source_indices if citation_audit else []),
         "invalid_citations": citation_audit.invalid_citations if citation_audit else [],
+        "code_integrity": (code_integrity or CodeIntegrityAudit()).model_dump(mode="json"),
         "sources": [source.model_dump(mode="json") for source in sources],
     }
 
@@ -532,6 +582,7 @@ async def _persist_exchange(
     *,
     abstained: bool,
     abstention_reason: AbstentionReason | None,
+    code_integrity: CodeIntegrityAudit | None = None,
 ) -> tuple[uuid.UUID | None, uuid.UUID | None]:
     if prepared.conversation is None:
         return None, None
@@ -558,6 +609,7 @@ async def _persist_exchange(
             citation_audit=citation_audit,
             abstained=abstained,
             abstention_reason=abstention_reason,
+            code_integrity=code_integrity,
         ),
     )
     _touch_conversation(prepared.conversation, prepared.question)
@@ -599,6 +651,7 @@ async def _persist_stream_assistant(
     abstained: bool,
     abstention_reason: AbstentionReason | None,
     output: LLMOutput | None = None,
+    code_integrity: CodeIntegrityAudit | None = None,
 ) -> uuid.UUID | None:
     if prepared.conversation is None or not content.strip():
         return None
@@ -620,6 +673,7 @@ async def _persist_stream_assistant(
                 citation_audit=citation_audit,
                 abstained=abstained,
                 abstention_reason=abstention_reason,
+                code_integrity=code_integrity,
             ),
         )
         conversation.updated_at = datetime.now(UTC)
@@ -665,12 +719,14 @@ async def answer(
             finish_reason=raw_output.finish_reason,
         )
 
-    resolved, citation_audit = _enforce_citation_contract(resolved, sources)
+    resolved, citation_audit, code_integrity = _validate_generated_answer(
+        resolved, sources, prepared.question,
+    )
     if output.text != resolved.text:
         output = LLMOutput(
             text=resolved.text,
             model=output.model,
-            finish_reason="citation_validation_failed",
+            finish_reason=resolved.abstention_reason,
         )
 
     user_message_id, assistant_message_id = await _persist_exchange(
@@ -681,6 +737,7 @@ async def answer(
         citation_audit,
         abstained=resolved.abstained,
         abstention_reason=resolved.abstention_reason,
+        code_integrity=code_integrity,
     )
     return AnswerResponse(
         question=prepared.question,
@@ -709,6 +766,7 @@ async def answer(
         citation_valid=citation_audit.valid,
         cited_source_indices=citation_audit.cited_source_indices,
         invalid_citations=citation_audit.invalid_citations,
+        code_integrity=code_integrity,
         sources=sources,
     )
 
@@ -717,7 +775,21 @@ def _sse(event: str, payload: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
-@router.post("/stream")
+@router.post(
+    "/stream",
+    response_class=StreamingResponse,
+    responses={
+        200: {
+            "description": (
+                "Server-sent events over POST: metadata, token, then done on success, "
+                "or error if generation fails after the stream starts. Each data field "
+                "contains JSON. Answer text is buffered until citation and code-integrity "
+                "checks finish; token events are not a promise of incremental model tokens."
+            ),
+            "content": {"text/event-stream": {"schema": {"type": "string"}}},
+        },
+    },
+)
 async def answer_stream(
     workspace_id: uuid.UUID,
     payload: AnswerRequest,
@@ -763,6 +835,7 @@ async def answer_stream(
                 "citation_valid": None,
                 "cited_source_indices": [],
                 "invalid_citations": [],
+                "code_integrity": None,
                 "sources": serialized_sources,
             },
         )
@@ -789,11 +862,13 @@ async def answer_stream(
                 abstained=True,
                 abstention_reason="insufficient_retrieval_evidence",
                 output=output,
+                code_integrity=CodeIntegrityAudit(),
             )
             yield _sse(
                 "done",
                 {
                     "status": "completed",
+                    "finish_reason": output.finish_reason,
                     "assistant_message_id": (
                         str(assistant_message_id) if assistant_message_id else None
                     ),
@@ -801,24 +876,31 @@ async def answer_stream(
                     "citation_valid": True,
                     "cited_source_indices": [],
                     "invalid_citations": [],
+                    "code_integrity": CodeIntegrityAudit().model_dump(mode="json"),
                 },
             )
             return
 
+        stream_finish_reason: str | None = None
         try:
             async for token in llm.stream_chat(
                 prepared.messages,
                 max_tokens=prepared.max_tokens,
                 temperature=prepared.temperature,
             ):
-                # Buffer until citation validation completes. An SSE client must
-                # never receive a fabricated citation that cannot be retracted.
-                stream_filter.feed(token)
+                # Buffer until citation and code-integrity validation complete;
+                # withheld code or fabricated citations cannot be retracted.
+                if isinstance(token, LLMStreamEnd):
+                    stream_finish_reason = token.finish_reason
+                else:
+                    stream_filter.feed(token)
         except asyncio.CancelledError:
             stream_filter.finish()
             if stream_filter.raw_text:
                 resolved = resolve_generated_answer(stream_filter.raw_text)
-                resolved, citation_audit = _enforce_citation_contract(resolved, sources)
+                resolved, citation_audit, code_integrity = _validate_generated_answer(
+                    resolved, sources, prepared.question,
+                )
                 content = resolved.text
                 await asyncio.shield(
                     _persist_stream_assistant(
@@ -830,13 +912,16 @@ async def answer_stream(
                         citation_audit=citation_audit,
                         abstained=resolved.abstained,
                         abstention_reason=resolved.abstention_reason,
+                        code_integrity=code_integrity,
                     )
                 )
             raise
         except LLMError as exc:
             stream_filter.finish()
             resolved = resolve_generated_answer(stream_filter.raw_text)
-            resolved, citation_audit = _enforce_citation_contract(resolved, sources)
+            resolved, citation_audit, code_integrity = _validate_generated_answer(
+                resolved, sources, prepared.question,
+            )
             content = resolved.text
             assistant_message_id = await _persist_stream_assistant(
                 prepared,
@@ -847,6 +932,7 @@ async def answer_stream(
                 citation_audit=citation_audit,
                 abstained=resolved.abstained,
                 abstention_reason=resolved.abstention_reason,
+                code_integrity=code_integrity,
             )
             yield _sse(
                 "error",
@@ -863,13 +949,16 @@ async def answer_stream(
                     "citation_valid": citation_audit.valid,
                     "cited_source_indices": citation_audit.cited_source_indices,
                     "invalid_citations": citation_audit.invalid_citations,
+                    "code_integrity": code_integrity.model_dump(mode="json"),
                 },
             )
             return
 
         stream_filter.finish()
         resolved = resolve_generated_answer(stream_filter.raw_text)
-        resolved, citation_audit = _enforce_citation_contract(resolved, sources)
+        resolved, citation_audit, code_integrity = _validate_generated_answer(
+            resolved, sources, prepared.question,
+        )
         content = resolved.text
         if content:
             yield _sse("token", {"text": content})
@@ -877,9 +966,11 @@ async def answer_stream(
             text=content,
             model=settings.vllm_model,
             finish_reason=(
-                "citation_validation_failed"
-                if resolved.abstention_reason == "citation_validation_failed"
-                else "stop"
+                resolved.abstention_reason
+                if resolved.abstention_reason in {
+                    "citation_validation_failed", "code_integrity_validation_failed",
+                }
+                else stream_finish_reason
             ),
         )
         assistant_message_id = await _persist_stream_assistant(
@@ -892,11 +983,13 @@ async def answer_stream(
             abstained=resolved.abstained,
             abstention_reason=resolved.abstention_reason,
             output=output,
+            code_integrity=code_integrity,
         )
         yield _sse(
             "done",
             {
                 "status": "completed",
+                "finish_reason": output.finish_reason,
                 "assistant_message_id": (
                     str(assistant_message_id) if assistant_message_id else None
                 ),
@@ -908,6 +1001,7 @@ async def answer_stream(
                 "citation_valid": citation_audit.valid,
                 "cited_source_indices": citation_audit.cited_source_indices,
                 "invalid_citations": citation_audit.invalid_citations,
+                "code_integrity": code_integrity.model_dump(mode="json"),
             },
         )
 

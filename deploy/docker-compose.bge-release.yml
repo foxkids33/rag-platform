@@ -1,0 +1,11 @@
+# Promote the already indexed BGE project, not the MiniLM database.
+# Stop only the MiniLM web container before starting this web service.
+services:
+  api:
+    environment:
+      EMBEDDING_SCHEMA_INITIALIZATION_ALLOWED: "false"
+    command: ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"]
+  web:
+    profiles: !reset []
+    ports: !override
+      - "${RAG_BIND_HOST:-127.0.0.1}:${RAG_WEB_HOST_PORT:-15173}:80"

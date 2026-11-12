@@ -15,6 +15,7 @@ def test_load_cases_supports_stable_filenames(tmp_path) -> None:
                 "id": "fact-001",
                 "question": "Какой срок хранения?",
                 "expected_filenames": ["policy.txt"],
+                "accepted_citation_filenames": ["reviewed-policy-copy.txt"],
                 "question_type": "exact_value",
                 "required_facts": ["30 дней"],
             },
@@ -28,6 +29,7 @@ def test_load_cases_supports_stable_filenames(tmp_path) -> None:
 
     assert len(cases) == 1
     assert cases[0].expected_filenames == ("policy.txt",)
+    assert cases[0].accepted_citation_filenames == ("reviewed-policy-copy.txt",)
     assert cases[0].required_facts == ("30 дней",)
 
 

@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.access import workspace_for_principal
+from app.core.access import principal_can_access_knowledge_base, workspace_for_principal
 from app.core.config import settings
 from app.core.security import Principal, get_current_principal
 from app.db.models import KnowledgeBase, KnowledgeBaseVersion
@@ -69,7 +69,7 @@ QUERY_STOP_WORDS = {
 class SearchRequest(BaseModel):
     query: str = Field(min_length=2, max_length=2000)
     limit: int = Field(default=8, ge=1, le=20)
-    mode: Literal["hybrid", "semantic", "lexical"] = "hybrid"
+    mode: Literal["hybrid", "semantic", "lexical", "dense"] = "hybrid"
     rerank: bool = True
 
 
@@ -292,7 +292,7 @@ async def search(
     active_version: KnowledgeBaseVersion | None = None
     if workspace.base_knowledge_base_id is not None:
         knowledge_base = await db.get(KnowledgeBase, workspace.base_knowledge_base_id)
-        if knowledge_base is not None and knowledge_base.tenant_id != principal.tenant_id:
+        if knowledge_base is not None and not principal_can_access_knowledge_base(principal, knowledge_base):
             knowledge_base = None
         if knowledge_base is not None and knowledge_base.active_version_id is not None:
             active_version = await db.get(KnowledgeBaseVersion, knowledge_base.active_version_id)
@@ -301,7 +301,7 @@ async def search(
     if len(query) < 2:
         raise HTTPException(status_code=400, detail="Query is too short")
 
-    use_dense = payload.mode in {"hybrid", "semantic"}
+    use_dense = payload.mode in {"hybrid", "semantic", "dense"}
     use_lexical = payload.mode in {"hybrid", "lexical"}
 
     if use_dense:
@@ -313,7 +313,8 @@ async def search(
         query_vector = [0.0] * settings.embedding_dim
 
     candidate_limit = _candidate_limit(payload.limit)
-    exact_identifiers = extract_exact_identifiers(query)
+    # Preserve historical semantic+exact behavior; dense is the pure model A/B.
+    exact_identifiers = [] if payload.mode == "dense" else extract_exact_identifiers(query)
     lexical_query = build_disjunctive_lexical_query(query)
     rerank_requested = payload.rerank and settings.rerank_enabled
     result_limit = (

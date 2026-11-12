@@ -1,0 +1,22 @@
+[Unit]
+Description=RAG outbound Confluence connector
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rag-connector
+Group=rag-connector
+WorkingDirectory=/opt/rag-confluence-connector
+EnvironmentFile=/etc/rag-confluence-connector/connector.env
+ExecStart=/opt/rag-confluence-connector/.venv/bin/python -m confluence_connector
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/rag-confluence-connector
+
+[Install]
+WantedBy=multi-user.target

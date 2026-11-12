@@ -18,7 +18,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.access import workspace_for_principal
 from app.core.config import settings
-from app.core.security import Principal, get_current_principal
+from app.core.integration_access import confluence_principal as get_current_principal
+from app.core.security import Principal
 from app.db.models import Document, IngestionJob
 from app.db.session import get_db
 from app.services.confluence import (

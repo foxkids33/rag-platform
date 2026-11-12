@@ -39,7 +39,38 @@ RERANK_ENABLED=false
 
 Перед загрузкой документов схема отдельной БД должна содержать `document_chunks.embedding vector(1024)`, а API и worker должны быть запущены с `EMBEDDING_DIM=1024`. Изменять тип колонки в БД релизного стенда запрещено.
 
-Готовый wrapper `scripts/deploy/compose-bge.sh` объединяет release Compose с `deploy/docker-compose.bge-m3.yml`, берёт секреты из основного `.env`, а не-секретные A/B overrides — из `deploy/bge-m3.env`. GPU image задаётся только после server inventory; пустой placeholder намеренно блокирует сборку.
+`initialize_embedding_schema` теперь всегда запрещает смену размерности непустой
+таблицы, даже без `--require-empty`. Для записи требуется
+`EMBEDDING_SCHEMA_INITIALIZATION_ALLOWED=true` (задано только в API BGE-профиля),
+а запрошенная размерность должна совпадать с `EMBEDDING_DIM`. Проверка пустоты и
+DDL выполняются под блокировкой таблицы в одной транзакции, ожидание блокировки
+ограничено 5 секундами. Повторный старт с уже правильной размерностью не меняет
+данные. `--dry-run` возвращает JSON с `write_performed=false`.
+Предел 2000 относится к используемому HNSW `vector_cosine_ops`, см.
+[pgvector HNSW](https://github.com/pgvector/pgvector#hnsw).
+
+Wrapper `scripts/deploy/compose-bge.sh` объединяет release Compose с
+`deploy/docker-compose.bge-m3.yml` и читает overrides из `deploy/bge-m3.env`
+(этот файл исключён из Git). Задать `BGE_PYTORCH_IMAGE`, `BGE_GPU_DEVICE_ID`
+и `BGE_DATABASE_URL` после инвентаризации. URL должен использовать **только**
+`postgres:5432` и credentials собственной БД стенда, согласованные с
+`POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB` основного env-файла.
+Redis/MinIO всегда адресуются к сервисам отдельного проекта. Wrapper отклоняет
+совпадение с реальным именем release project, внешнюю БД и placeholders.
+Публикация портов отключена даже при явном запуске web.
+
+```bash
+cp deploy/bge-m3.env.example deploy/bge-m3.env
+# Заполнить три BGE_* настройки, не менять серверный рабочий индекс.
+bash scripts/deploy/compose-bge.sh config --services
+bash scripts/deploy/compose-bge.sh build embedding api worker
+bash scripts/deploy/compose-bge.sh up -d postgres redis minio embedding api worker
+bash scripts/deploy/compose-bge.sh logs --tail 60 embedding api
+```
+
+GPU ID выбирается явно через `device_ids`. Это не квота VRAM: запускать только
+при достаточном запасе памяти выбранной карты. Установка драйвера, изменение
+NVIDIA runtime и перезапуск существующего vLLM в этот сценарий не входят.
 
 ## 3. Контракт GPU-сервиса
 
@@ -81,10 +112,42 @@ Baseline и candidate запускаются на одинаковых доку�
 
 Порядок сравнений:
 
-1. MiniLM hybrid без reranker против BGE-M3 dense без reranker.
+1. MiniLM `dense` без reranker против BGE-M3 `dense` без reranker на одинаковых чанках.
 2. MiniLM hybrid против BGE-M3 hybrid с теми же RRF-весами.
 3. Только для победившего embedding-профиля — отдельный reranker A/B.
 4. Late chunking — отдельный индекс и отдельный эксперимент после выбора embedding baseline.
+
+Новый режим `dense` исключает lexical/exact каналы. Исторический `semantic`
+сохраняет exact identifier retrieval и не подходит для чистого сравнения моделей.
+В обоих прогонах зафиксировать snapshot run/hash, версии parser/chunking, способ
+формирования текста для embedding и набор вопросов. Не сравнивать свежий импорт
+одного стенда со старой версией страницы на другом. Старые отчёты rc1 являются
+ориентиром, а не новым контролируемым baseline.
+
+API BGE доступен из собственного контейнера по `http://localhost:8000`.
+Каталог `evaluation` смонтирован в него как `/evaluation`, snapshot — `/snapshots/kbr`.
+Создать отдельный workspace и импортировать тот же snapshot штатной командой
+`app.operations.import_confluence_snapshot` (по умолчанию она лишь проверяет,
+запись включается `--apply`). Дождаться `READY` для всех документов.
+UUID workspace у MiniLM и BGE обычно различаются.
+
+Пример candidate-прогона после импорта (UUID заменить на workspace стенда BGE):
+
+```bash
+bash scripts/deploy/compose-bge.sh exec -T api \
+  python -m app.evaluation.runner \
+  --base-url http://localhost:8000 \
+  --workspace-id '<BGE_WORKSPACE_UUID>' \
+  --dataset /evaluation/results/kbr.v1.prepared-v2.jsonl \
+  --mode dense --no-rerank \
+  --output /evaluation/results/bge-m3-dense.json
+```
+
+Повторить с `--mode hybrid` и отдельным output. Для end-to-end прогона добавить
+`--answers --answer-temperature 0 --answer-max-tokens 800`, сохраняя ту же LLM
+и настройки выбора контекста у baseline и candidate. Подготовленный dataset
+является локальным артефактом и должен присутствовать на сервере; он содержит
+корпоративный материал и не должен попадать в публичный Git.
 
 ## 6. Критерий переключения
 

@@ -79,6 +79,19 @@ def test_server_environment_cannot_disable_authentication() -> None:
         Settings(_env_file=None, app_env="server", auth_enabled=False)
 
 
+def test_internal_pilot_can_explicitly_skip_oidc_but_production_cannot() -> None:
+    pilot = Settings(
+        _env_file=None, app_env="server", auth_enabled=False,
+        auth_allow_unauthenticated_pilot=True,
+    )
+    assert not pilot.auth_enabled
+    with pytest.raises(ValueError, match="must be enabled"):
+        Settings(
+            _env_file=None, app_env="production", auth_enabled=False,
+            auth_allow_unauthenticated_pilot=True,
+        )
+
+
 def test_confluence_base_url_rejects_query_and_fragment() -> None:
     with pytest.raises(ValueError, match="query or fragment"):
         Settings(

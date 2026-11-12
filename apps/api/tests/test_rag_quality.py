@@ -3,6 +3,8 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass, field
 
+import pytest
+
 from app.services.context_builder import build_context
 from app.services.rag_quality import audit_citations, source_quality_score
 
@@ -49,6 +51,150 @@ def test_context_abstains_when_best_evidence_is_too_weak() -> None:
     assert context.evidence_status == "insufficient"
     assert context.sources == []
     assert context.rejected_low_score == 1
+
+
+def test_large_confluence_parent_cannot_displace_short_leaf_evidence() -> None:
+    config = "Compression Server configuration:\n```ini\ncompression_level=3\n```"
+    parent = config + "\n\n" + "Общие параметры развёртывания сервиса. " * 235
+    fact = "Compression Server подключается, если для корзины включено сжатие. Алгоритм сжатия — ZSTD."
+    candidates = [
+        Candidate(text=config, parent_text=parent, document_id=uuid.uuid4(),
+                  retrieval_rank=1, rerank_score=0.9, filename="deployment.confluence.json"),
+        Candidate(text=fact, parent_text="Несвязанный родитель без нужного факта. " * 80,
+                  document_id=uuid.uuid4(), retrieval_rank=2, rerank_score=0.8,
+                  filename="architecture.confluence.json"),
+    ]
+    context = build_context(
+        "При каком условии подключается Compression Server и какой алгоритм используется?",
+        candidates, max_context_chars=4000, max_source_chars=2400, max_sources=5,
+    )
+    assert len(context.sources) == 2
+    assert fact in context.text
+    assert context.char_count <= 4000
+    assert context.char_count == len(context.text)
+    assert all(source.excerpt.count("```") % 2 == 0 for source in context.sources)
+
+
+def test_selected_confluence_leaf_expands_with_spare_space() -> None:
+    leaf = "После восстановления NS проверьте Uptime и состояние процесса."
+    parent = leaf + "\n\n" + "Затем выполните тестовые запросы к корзине и проверьте результат. " * 8
+    context = build_context(
+        "Как проверить восстановление NS?",
+        [Candidate(text=leaf, parent_text=parent, document_id=uuid.uuid4(),
+                   retrieval_rank=1, rerank_score=0.9, filename="restore.confluence.json")],
+        max_context_chars=2000, max_source_chars=200, max_sources=5,
+    )
+    assert context.sources[0].excerpt == parent.strip()
+    assert context.char_count <= 2000
+
+
+@pytest.mark.parametrize("tail_in_leaf", [False, True])
+def test_verification_tail_survives_large_parent_without_evicting_other_sources(tail_in_leaf) -> None:
+    prefix = "NS: порядок восстановления.\n\n" + "".join(
+        f"Подготовка сервера к восстановлению, шаг {step}.\n" for step in range(40)
+    )
+    prefix += "\n```sh\nservice-check --prepare\n```\n\n"
+    checks = "После запуска NS проверьте рост Uptime и выполните тестовые запросы в корзину."
+    complete = prefix + checks
+    parent = complete + "\n\n```text\n" + "Большое приложение.\n" * 800 + "```"
+    primary = Candidate(
+        text=complete if tail_in_leaf else prefix, parent_text=parent,
+        document_id=uuid.uuid4(), retrieval_rank=1, rerank_score=0.95,
+        filename="restore.confluence.json",
+    )
+    other = [Candidate(
+        text="".join(f"Документ{index} Настройка{index} Сервис{index} Контроль{index}, пункт {step}.\n"
+                     for step in range(30)),
+        document_id=uuid.uuid4(), retrieval_rank=index + 2, rerank_score=0.8,
+        filename=f"other-{index}.confluence.json",
+    ) for index in range(4)]
+    context = build_context(
+        "Какие проверки нужны после восстановления NS?", [primary, *other],
+        max_context_chars=7000, max_source_chars=2400, max_sources=5,
+    )
+    assert checks in context.text
+    assert len(context.sources) == 5
+    assert context.char_count == len(context.text) <= 7000
+    assert all(source.excerpt.count("```") % 2 == 0 for source in context.sources)
+
+
+def test_verification_query_selects_late_checks_when_context_budget_is_dense() -> None:
+    preparation = "\n\n".join(
+        f"Шаг {step}: подготовка сервера и восстановление служебных данных NS."
+        for step in range(55)
+    )
+    checks = (
+        "Проверяем, что сервис NS успешно запустился.\n\n"
+        "```shell\n"
+        "ostor-ctl agent-status | grep 0800000000000b18\n"
+        "```\n\n"
+        "Если Uptime стабильно растет, выполняем тестовые запросы в корзину."
+    )
+    primary = Candidate(
+        text=preparation + "\n\n" + checks,
+        document_id=uuid.uuid4(),
+        retrieval_rank=1,
+        rerank_score=0.95,
+        filename="restore-ns.confluence.json",
+    )
+    dense_others = [
+        Candidate(
+            text="\n\n".join(
+                f"Смежная инструкция {index}, подробный пункт {step}."
+                for step in range(80)
+            ),
+            document_id=uuid.uuid4(),
+            retrieval_rank=index + 2,
+            rerank_score=0.80 - index / 100,
+            filename=f"dense-{index}.confluence.json",
+        )
+        for index in range(4)
+    ]
+
+    context = build_context(
+        "По каким признакам после восстановления NS проверяют успешный запуск?",
+        [primary, *dense_others],
+        max_context_chars=12000,
+        max_source_chars=2200,
+        max_sources=5,
+        source_similarity_threshold=1.1,
+    )
+
+    assert len(context.sources) == 5
+    assert "Uptime стабильно растет" in context.sources[0].excerpt
+    assert "тестовые запросы в корзину" in context.sources[0].excerpt
+    assert context.char_count == len(context.text) <= 12000
+    assert all(source.excerpt.count("```") % 2 == 0 for source in context.sources)
+
+
+def test_truncated_parent_is_not_used_to_invent_a_continuation() -> None:
+    leaf = "Проверка NS доступна только после завершения процедуры восстановления."
+    candidate = Candidate(text=leaf, parent_text=leaf + "\nНеполная инструкция.",
+                          document_id=uuid.uuid4(), retrieval_rank=1, rerank_score=0.9,
+                          filename="restore.confluence.json")
+    candidate.parent_text_truncated = True
+    context = build_context("Проверка NS", [candidate], max_context_chars=3000,
+                            max_source_chars=1000, max_sources=5)
+    assert context.sources[0].excerpt == leaf
+
+
+def test_large_indivisible_code_block_uses_spare_space_after_short_evidence() -> None:
+    code = "```sh\n" + "command --show\n" * 120 + "```"
+    fact = "Проверка результата включает состояние процесса и тестовый запрос к корзине."
+    context = build_context(
+        "Какие команды и проверки нужны?",
+        [
+            Candidate(text=code, document_id=uuid.uuid4(), retrieval_rank=1,
+                      rerank_score=0.9, filename="commands.confluence.json"),
+            Candidate(text=fact, document_id=uuid.uuid4(), retrieval_rank=2,
+                      rerank_score=0.8, filename="checks.confluence.json"),
+        ],
+        max_context_chars=3000, max_source_chars=1000, max_sources=5,
+    )
+    assert len(context.sources) == 2
+    assert fact in context.text and code in context.text
+    assert context.char_count <= 3000
+    assert [source.index for source in context.sources] == [1, 2]
 
 
 def test_context_removes_duplicates_and_limits_one_document() -> None:

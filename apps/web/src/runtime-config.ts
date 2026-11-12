@@ -1,5 +1,6 @@
 export type RuntimeConfig = {
   authEnabled: boolean;
+  authMode: "oidc" | "password";
   oidcAuthority: string;
   oidcClientId: string;
   oidcScopes: string;
@@ -18,6 +19,7 @@ const enabled = raw.authEnabled === true || String(raw.authEnabled).toLowerCase(
 
 export const runtimeConfig: RuntimeConfig = Object.freeze({
   authEnabled: enabled,
+  authMode: raw.authMode === "password" ? "password" : "oidc",
   oidcAuthority: String(raw.oidcAuthority ?? "").replace(/\/$/, ""),
   oidcClientId: String(raw.oidcClientId ?? ""),
   oidcScopes: String(raw.oidcScopes || "openid profile email"),

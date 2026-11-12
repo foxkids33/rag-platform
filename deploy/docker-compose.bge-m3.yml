@@ -26,15 +26,21 @@ services:
         reservations:
           devices:
             - driver: nvidia
-              count: 1
+              device_ids: ["${BGE_GPU_DEVICE_ID:?Select an available GPU ID after server inventory}"]
               capabilities: [gpu]
 
   api:
     environment:
+      DATABASE_URL: ${BGE_DATABASE_URL:?Set the isolated postgres service URL}
+      EMBEDDING_SCHEMA_INITIALIZATION_ALLOWED: "true"
+      REDIS_URL: redis://redis:6379/0
+      MINIO_ENDPOINT: minio:9000
       EMBEDDING_MODEL: BAAI/bge-m3
       EMBEDDING_DIM: 1024
       EMBEDDING_BASE_URL: http://embedding:8080
       RERANK_ENABLED: "false"
+    volumes:
+      - ../evaluation:/evaluation
     command:
       - sh
       - -c
@@ -45,9 +51,13 @@ services:
 
   worker:
     environment:
+      DATABASE_URL: ${BGE_DATABASE_URL:?Set the isolated postgres service URL}
+      REDIS_URL: redis://redis:6379/0
+      MINIO_ENDPOINT: minio:9000
       EMBEDDING_MODEL: BAAI/bge-m3
       EMBEDDING_DIM: 1024
       EMBEDDING_BASE_URL: http://embedding:8080
 
   web:
     profiles: ["bge-ui"]
+    ports: !reset []

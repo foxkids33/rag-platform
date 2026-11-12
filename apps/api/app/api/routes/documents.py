@@ -23,15 +23,20 @@ from app.services.object_cleanup import (
 )
 from app.services.queue import ingestion_queue
 from app.services.storage import StorageError, storage
+from app.services.upload_validation import ALLOWED_EXTENSIONS, validated_content_type
+from app.services.upload_quota import check_upload_quota, upload_limit_bytes
 
 router = APIRouter(prefix="/workspaces/{workspace_id}/documents", tags=["documents"])
 
-ALLOWED_EXTENSIONS = {".txt", ".md", ".csv", ".json", ".html", ".htm", ".xml", ".pdf", ".docx"}
 READ_CHUNK_SIZE = 1024 * 1024
 
 
 class DocumentUpdate(BaseModel):
     search_enabled: bool
+
+
+class DocumentUploadError(BaseModel):
+    detail: str
 
 
 class DocumentOut(BaseModel):
@@ -60,17 +65,17 @@ def _safe_filename(filename: str) -> str:
     return name[:500] or "document"
 
 
-async def _hash_and_measure(file: UploadFile) -> tuple[str, int]:
+async def _hash_and_measure(file: UploadFile, max_bytes: int | None = None) -> tuple[str, int]:
     digest = hashlib.sha256()
     total_size = 0
 
     while chunk := await file.read(READ_CHUNK_SIZE):
         digest.update(chunk)
         total_size += len(chunk)
-        if total_size > settings.upload_max_bytes:
+        if total_size > (max_bytes if max_bytes is not None else settings.upload_max_bytes):
             raise HTTPException(
                 status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-                detail=f"File exceeds the {settings.upload_max_mb} MB upload limit",
+                detail="File exceeds the upload size limit",
             )
 
     await file.seek(0)
@@ -93,7 +98,23 @@ async def list_workspace_documents(
     return list(result.scalars())
 
 
-@router.post("", response_model=DocumentOut, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "",
+    response_model=DocumentOut,
+    status_code=status.HTTP_201_CREATED,
+    responses={
+        code: {"model": DocumentUploadError, "description": description}
+        for code, description in {
+            400: "The uploaded file is empty or has no filename",
+            401: "A valid OIDC bearer token is required when authentication is enabled",
+            404: "The workspace was not found or is not accessible",
+            409: "The same file content is already present in this workspace",
+            413: "The file exceeds the configured upload size limit",
+            415: "The filename extension is not supported",
+            503: "Object storage or identity-provider signing keys are unavailable",
+        }.items()
+    },
+)
 async def upload_workspace_document(
     workspace_id: uuid.UUID,
     file: UploadFile = File(...),
@@ -114,9 +135,13 @@ async def upload_workspace_document(
             detail=f"Unsupported file type. Allowed extensions: {allowed}",
         )
 
-    sha256, size = await _hash_and_measure(file)
+    sha256, size = await _hash_and_measure(file, upload_limit_bytes(principal, extension))
     if size == 0:
         raise HTTPException(status_code=400, detail="Uploaded file is empty")
+    header = await file.read(1024)
+    await file.seek(0)
+    content_type = validated_content_type(safe_filename, header, file.content_type)
+    await check_upload_quota(db, principal, workspace_id, size)
     await db.execute(
         text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
         {"lock_key": f"workspace-upload:{workspace_id}:{sha256}"},
@@ -133,7 +158,6 @@ async def upload_workspace_document(
     document_id = uuid.uuid4()
     job_id = uuid.uuid4()
     object_key = f"workspaces/{workspace_id}/documents/{document_id}/{safe_filename}"
-    content_type = file.content_type or "application/octet-stream"
 
     uploaded = False
     committed = False
@@ -158,6 +182,7 @@ async def upload_workspace_document(
             filename=safe_filename,
             object_key=object_key,
             mime_type=content_type,
+            size_bytes=size,
             sha256=sha256,
             status="QUEUED",
             search_enabled=True,

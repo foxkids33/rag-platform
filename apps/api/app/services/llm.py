@@ -20,6 +20,11 @@ class LLMOutput:
     finish_reason: str | None
 
 
+@dataclass(frozen=True)
+class LLMStreamEnd:
+    finish_reason: str
+
+
 def chat_completions_url(base_url: str) -> str:
     normalized = base_url.rstrip("/")
     if normalized.endswith("/v1"):
@@ -54,13 +59,16 @@ class LLMClient:
     ) -> dict:
         if not settings.vllm_model:
             raise LLMError("VLLM_MODEL is not configured")
-        return {
+        payload = {
             "model": settings.vllm_model,
             "messages": messages,
             "temperature": temperature,
             "max_tokens": max_tokens,
             "stream": stream,
         }
+        if settings.llm_enable_thinking is not None:
+            payload["chat_template_kwargs"] = {"enable_thinking": settings.llm_enable_thinking}
+        return payload
 
     async def chat(
         self,
@@ -107,7 +115,7 @@ class LLMClient:
         *,
         max_tokens: int,
         temperature: float,
-    ) -> AsyncIterator[str]:
+    ) -> AsyncIterator[str | LLMStreamEnd]:
         payload = self._payload(
             messages,
             max_tokens=max_tokens,
@@ -130,11 +138,18 @@ class LLMClient:
                         break
                     try:
                         event = json.loads(raw_data)
-                        delta = event["choices"][0]["delta"].get("content")
-                    except (ValueError, KeyError, IndexError, TypeError) as exc:
+                        choices = event["choices"]
+                        if not choices:  # Optional usage-only event.
+                            continue
+                        choice = choices[0]
+                        delta = (choice.get("delta") or {}).get("content")
+                        finish_reason = choice.get("finish_reason")
+                    except (ValueError, KeyError, IndexError, TypeError, AttributeError) as exc:
                         raise LLMError("LLM returned an invalid stream event") from exc
                     if isinstance(delta, str) and delta:
                         yield delta
+                    if isinstance(finish_reason, str):
+                        yield LLMStreamEnd(finish_reason)
         except httpx.HTTPError as exc:
             raise LLMError(f"LLM service is unavailable: {exc}") from exc
 

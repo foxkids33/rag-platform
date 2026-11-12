@@ -1,3 +1,7 @@
+from io import BytesIO
+from zipfile import ZipFile
+
+from app.document_processing import parse_document
 from app.text_processing import extract_text, normalize_exact_text, split_into_chunks
 
 
@@ -40,3 +44,27 @@ def test_plain_document_builds_parent_child_chunks(monkeypatch):
     assert all(chunk.parent_text for chunk in chunks)
     assert all(chunk.metadata["chunking"] == "parent_child_v1" for chunk in chunks)
     assert all(chunk.metadata["parser"] == "plain_text_v2" for chunk in chunks)
+
+
+def test_docx_uses_lightweight_openxml_parser_and_preserves_headings_and_tables():
+    document_xml = b'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+    <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+      <w:body>
+        <w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>Runbook</w:t></w:r></w:p>
+        <w:p><w:r><w:t>Recovery code BLUE-KB-942</w:t></w:r></w:p>
+        <w:tbl><w:tr><w:tc><w:p><w:r><w:t>Host</w:t></w:r></w:p></w:tc>
+          <w:tc><w:p><w:r><w:t>Status</w:t></w:r></w:p></w:tc></w:tr></w:tbl>
+      </w:body>
+    </w:document>'''
+    archive = BytesIO()
+    with ZipFile(archive, "w") as docx:
+        docx.writestr("word/document.xml", document_xml)
+
+    chunks = parse_document("runbook.docx", archive.getvalue())
+
+    assert chunks
+    assert all(chunk.metadata["parser"] == "docx_xml_v1" for chunk in chunks)
+    assert all(chunk.heading_breadcrumb == "Runbook" for chunk in chunks)
+    combined = "\n".join(chunk.text for chunk in chunks)
+    assert "Recovery code BLUE-KB-942" in combined
+    assert "Host | Status" in combined

@@ -22,6 +22,7 @@ from app.services.workspace_sources import (
     default_source_mode,
     includes_knowledge_base,
 )
+from app.services.upload_quota import check_workspace_quota
 
 router = APIRouter(prefix="/workspaces", tags=["workspaces"])
 
@@ -138,6 +139,7 @@ async def create_workspace(
     db: AsyncSession = Depends(get_db),
     principal: Principal = Depends(get_current_principal),
 ) -> WorkspaceOut:
+    await check_workspace_quota(db, principal)
     knowledge_base = await _knowledge_base(db, payload.base_knowledge_base_id, principal)
     source_mode = payload.source_mode or default_source_mode(knowledge_base is not None)
     _validate_source_configuration(source_mode, payload.base_knowledge_base_id)

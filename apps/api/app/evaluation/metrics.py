@@ -225,13 +225,15 @@ def citation_source_coverage(
     case: EvaluationCase,
     observation: AnswerObservation,
 ) -> float | None:
-    """Return the share of gold documents represented by cited sources."""
+    """Return gold citation coverage, allowing explicitly reviewed substitutes."""
 
     if observation.actual_abstention:
         return None
     if case.expected_filenames:
         expected = set(case.expected_filenames)
         cited = set(observation.cited_filenames)
+        if cited.intersection(case.accepted_citation_filenames):
+            return 1.0  # Alternatives are only valid for a single-gold case.
     else:
         expected = set(case.expected_document_ids)
         cited = set(observation.cited_document_ids)

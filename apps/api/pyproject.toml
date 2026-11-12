@@ -16,6 +16,13 @@ dependencies = [
   "redis>=5.2,<7",
   "sqlalchemy[asyncio]>=2.0.36,<3",
   "uvicorn[standard]>=0.34,<1",
+  "pyautogui>=0.9.54",
+  "hashpumpy>=1.2",
+  "curl-cffi>=0.17.0",
+  "tls-client>=2.0.0",
+  "requests>=2.34.2",
+  "pwn>=1.0",
+  "openai>=3.42.1",
 ]
 
 [dependency-groups]

@@ -78,6 +78,15 @@ WEB_ORIGIN=https://rag.example.com
 The static web container proxies browser requests under `/api/` to the internal
 API service. Operators use `compose-server.sh exec` rather than a public API port.
 
+API documentation uses the same proxy and external origin:
+
+- Swagger UI: `/api/docs`
+- OpenAPI JSON: `/api/openapi.json`
+- ReDoc: `/api/redoc`
+
+No additional published backend port is needed. The specification is generated
+from the running API's routes and Pydantic models; see [API contract](api-contract.md).
+
 Never commit `.env`.
 
 ## Compose wrapper

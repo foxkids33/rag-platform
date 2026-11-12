@@ -1,0 +1,5 @@
+# First-release regression checks; run the full v2 suite before promotion.
+kbr-003
+kbr-016
+kbr-026
+kbr-027

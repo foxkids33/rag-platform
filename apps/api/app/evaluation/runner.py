@@ -512,7 +512,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--base-url", default="http://localhost:8000")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--limit", type=int, default=10)
-    parser.add_argument("--mode", choices=("hybrid", "semantic", "lexical"), default="hybrid")
+    parser.add_argument("--mode", choices=("hybrid", "semantic", "lexical", "dense"), default="hybrid")
     parser.add_argument("--timeout", type=float, default=180.0)
     parser.add_argument("--answer-max-tokens", type=int, help="Optional answer token budget (64..4096); omit to retain API default")
     parser.add_argument(

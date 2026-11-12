@@ -63,6 +63,9 @@ def load_cases(path: str | Path) -> list[EvaluationCase]:
                 question=question,
                 expected_document_ids=_string_tuple(payload, "expected_document_ids", line_number),
                 expected_filenames=_string_tuple(payload, "expected_filenames", line_number),
+                accepted_citation_filenames=_string_tuple(
+                    payload, "accepted_citation_filenames", line_number,
+                ),
                 expected_abstention=expected_abstention,
                 question_type=payload.get("question_type"),
                 expected_answer=payload.get("expected_answer"),

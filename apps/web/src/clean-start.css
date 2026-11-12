@@ -1,0 +1,19 @@
+.clean-start { display: grid; place-items: center; flex: 1; padding: 48px 20px; overflow: auto; }
+.clean-start-card { width: min(560px, 100%); padding: 36px; border: 1px solid var(--border, #dde5e1); border-radius: 18px; background: var(--surface, #fff); box-shadow: 0 12px 40px #123b2b08; }
+.clean-start-mark { width: 48px; height: 48px; display: grid; place-items: center; background: #e7f1ed; color: #206d54; border-radius: 12px; font-size: 25px; font-weight: 650; margin-bottom: 23px; }
+.clean-start-kicker { display: block; color: #577667; font-size: 11px; text-transform: uppercase; letter-spacing: 1.2px; margin-bottom: 12px; }
+.clean-start-card h1 { font-size: clamp(25px, 4vw, 34px); font-weight: 600; letter-spacing: -.8px; margin: 0 0 15px; }
+.clean-start-card > p { color: #63776c; line-height: 1.9; font-size: 13px; }
+.clean-start-steps { padding: 17px 0; margin: 15px 0 20px; list-style: none; display: grid; gap: 15px; font-size: 12px; color: #405b4d; border-bottom: 1px solid #e3ebe5; }
+.clean-start-steps li { display: flex; gap: 14px; align-items: center; }
+.clean-start-steps span { color: #84a18d; font-family: ui-monospace, monospace; }
+.clean-start-card label { font-size: 12px; color: #486454; display: block; margin-bottom: 9px; }
+.clean-start-card input { display: block; width: 100%; padding: 13px 14px; border: 1px solid #cbd9cf; border-radius: 7px; background: #fff; color: #233e2d; font: inherit; font-size: 13px; }
+.clean-start-card input:focus-visible, .clean-start-card button:focus-visible { outline: 3px solid #70a48b; outline-offset: 3px; }
+.clean-start-card form > button { background: #195e46; color: white; border: 0; border-radius: 7px; padding: 13px 18px; margin-top: 13px; width: 100%; font-size: 12px; font-weight: 550; cursor: pointer; }
+.clean-start-card form > button:disabled { opacity: .55; cursor: default; }
+.clean-start-card > .clean-start-note { font-size: 11px; line-height: 1.9; margin: 22px 0 0; color: #7a8b80; }
+.clean-start-error { margin-top: 20px; padding: 14px; background: #fcf0ed; border: 1px solid #f1d6cf; border-radius: 7px; font-size: 12px; color: #914e3b; }
+.clean-start-error p { margin: 0 0 12px; }
+.clean-start-error button { background: white; border: 1px solid #e1b7a9; border-radius: 5px; padding: 8px 12px; color: inherit; cursor: pointer; }
+@media (max-width: 600px) { .clean-start { padding: 24px 16px; } .clean-start-card { padding: 26px 22px; } }

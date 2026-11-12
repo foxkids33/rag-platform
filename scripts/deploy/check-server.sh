@@ -325,6 +325,7 @@ echo "===== SECURITY SETTINGS ====="
 
 app_env="$(read_env_value APP_ENV '')"
 auth_enabled="$(read_env_value AUTH_ENABLED false)"
+pilot_allowed="$(read_env_value AUTH_ALLOW_UNAUTHENTICATED_PILOT false)"
 oidc_client_id="$(read_env_value OIDC_CLIENT_ID '')"
 oidc_redirect_uri="$(read_env_value OIDC_REDIRECT_URI '')"
 oidc_logout_uri="$(read_env_value OIDC_POST_LOGOUT_REDIRECT_URI '')"
@@ -333,28 +334,34 @@ if [[ "$app_env" == "server" ]]; then
 else
   fail "APP_ENV must be server"
 fi
-if [[ "${auth_enabled,,}" == "true" ]]; then
+if [[ "${auth_enabled,,}" != "true" && "${pilot_allowed,,}" == "true" ]]; then
+  info "explicit internal pilot: browser OIDC is disabled"
+elif [[ "${auth_enabled,,}" == "true" ]]; then
   ok "authentication is enabled"
 else
   fail "AUTH_ENABLED must be true on the shared server"
 fi
-if [[ -n "$oidc_client_id" ]]; then
-  ok "OIDC public SPA client is configured"
-else
-  fail "OIDC_CLIENT_ID must be configured for the browser UI"
-fi
-if [[ "$oidc_redirect_uri" == https://* ]]; then
-  ok "OIDC redirect URI uses HTTPS"
-else
-  fail "OIDC_REDIRECT_URI must be an external HTTPS callback"
-fi
-if [[ "$oidc_logout_uri" == https://* ]]; then
-  ok "OIDC post-logout URI uses HTTPS"
-else
-  fail "OIDC_POST_LOGOUT_REDIRECT_URI must use external HTTPS"
+if [[ "${auth_enabled,,}" == "true" ]]; then
+  if [[ -n "$oidc_client_id" ]]; then
+    ok "OIDC public SPA client is configured"
+  else
+    fail "OIDC_CLIENT_ID must be configured for the browser UI"
+  fi
+  if [[ "$oidc_redirect_uri" == https://* ]]; then
+    ok "OIDC redirect URI uses HTTPS"
+  else
+    fail "OIDC_REDIRECT_URI must be an external HTTPS callback"
+  fi
+  if [[ "$oidc_logout_uri" == https://* ]]; then
+    ok "OIDC post-logout URI uses HTTPS"
+  else
+    fail "OIDC_POST_LOGOUT_REDIRECT_URI must use external HTTPS"
+  fi
 fi
 if [[ "$bind_host" == "127.0.0.1" || "$bind_host" == "::1" ]]; then
   ok "web port is bound to loopback for the reverse proxy"
+elif [[ "${pilot_allowed,,}" == "true" && "${auth_enabled,,}" != "true" ]]; then
+  info "pilot uses the configured web binding $bind_host:$web_host_port"
 else
   fail "RAG_BIND_HOST must be a loopback address on the shared server"
 fi

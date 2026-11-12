@@ -24,12 +24,15 @@ async def system_info(
         },
         "embedding_model": settings.embedding_model,
         "embedding_dimension": settings.embedding_dim,
+        # The provider's configured API model ID may be a serving alias.
+        "generation_model": settings.vllm_model,
         "rerank_model": settings.rerank_model,
         "features": {
             "knowledge_bases": True,
             "workspace_overlay": True,
             "user_documents_only": True,
             "hybrid_retrieval": True,
+            "code_integrity": True,
             "reranking": settings.rerank_enabled,
             "advanced_search": False,
             "conversation_graph": True,

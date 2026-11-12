@@ -23,7 +23,7 @@ async def dispose_database_pool_after_test():
 
 
 @pytest.mark.asyncio
-async def test_exact_identifier_channel_executes_against_postgres() -> None:
+async def test_exact_identifier_channel_executes_against_postgres(monkeypatch) -> None:
     workspace_id = uuid.uuid4()
     document_id = uuid.uuid4()
     chunk_id = uuid.uuid4()
@@ -117,6 +117,21 @@ async def test_exact_identifier_channel_executes_against_postgres() -> None:
             assert all(
                 item.chunk_id != longer_identifier_chunk_id for item in response.results
             )
+            from app.api.routes import search as search_route
+
+            async def embed_query(_query):
+                return [1.0] + [0.0] * 383
+
+            monkeypatch.setattr(search_route.embeddings, "embed_query", embed_query)
+            dense = await search(
+                workspace_id,
+                SearchRequest(query="Что означает BLUE-KB-942?", mode="dense", rerank=False),
+                db, principal,
+            )
+            # These chunks have exact text but no vectors: they must not leak
+            # into a pure dense model comparison.
+            assert dense.exact_identifiers == []
+            assert dense.results == []
         finally:
             await db.execute(delete(Workspace).where(Workspace.id == workspace_id))
             await db.commit()

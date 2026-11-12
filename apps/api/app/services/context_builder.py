@@ -16,6 +16,7 @@ from app.services.rag_quality import evidence_status, source_quality_score
 PAGE_MARKER_RE = re.compile(r"^\s*\d{1,4}\s+из\s+\d{1,4}\s*$", re.IGNORECASE)
 STANDALONE_PAGE_RE = re.compile(r"^\s*\d{1,4}\s*$")
 DOT_LEADER_RE = re.compile(r"\.{4,}")
+CODE_FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
 URL_OR_EMAIL_RE = re.compile(
     r"(?:https?://|www\.|\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,})",
     re.IGNORECASE,
@@ -73,6 +74,15 @@ BREADCRUMB_SIGNAL_WEIGHT = 0.15
 RERANK_QUERY_SELECTION_MAX_WEIGHT = 0.10
 SOFT_CYRILLIC_PREFIX_CHARS = 5
 QUERY_RELEVANCE_RESERVED_SOURCES = 2
+VERIFICATION_QUERY_RE = re.compile(
+    r"\b(?:провер\w*|признак\w*|убед\w*|подтверд\w*|успеш\w*|результат\w*)\b",
+    re.IGNORECASE,
+)
+EXACT_TRANSCRIPTION_MARKERS = (
+    "дословно",
+    "сохрани порядок",
+    "точно как",
+)
 
 
 class SearchResultLike(Protocol):
@@ -142,16 +152,26 @@ class BuiltContext:
     matched_anchor_count: int = 0
 
 
+def _closes_code_fence(line: str, opening: str) -> bool:
+    marker = CODE_FENCE_RE.fullmatch(line)
+    return bool(
+        marker
+        and marker[1][0] == opening[0]
+        and len(marker[1]) >= len(opening)
+        and not marker[2].strip()
+    )
+
+
 def clean_context_text(value: str) -> str:
     cleaned_lines: list[str] = []
     previous_line: str | None = None
     fence: str | None = None
 
     for raw_line in value.replace("\x0c", "\n").splitlines():
-        marker = re.match(r"^(`{3,}|~{3,})", raw_line)
+        marker = CODE_FENCE_RE.fullmatch(raw_line)
         if fence is not None:
             cleaned_lines.append(raw_line)
-            if raw_line.rstrip() == fence:
+            if _closes_code_fence(raw_line, fence):
                 fence = None
             continue
         if marker:
@@ -195,16 +215,106 @@ def _technical_excerpt(value: str, max_chars: int) -> str:
     opening_offset = 0
     offset = 0
     for line in value[:end].splitlines(keepends=True):
-        marker = re.match(r"^(`{3,}|~{3,})", line)
+        marker = CODE_FENCE_RE.fullmatch(line.removesuffix("\n"))
         if opened is None and marker:
             opened, opening_offset = marker[1], offset
-        elif opened is not None and line.strip() == opened:
+        elif opened is not None and _closes_code_fence(line.removesuffix("\n"), opened):
             opened = None
         offset += len(line)
     if opened is not None:
         end = opening_offset
     prefix = value[:end].rstrip()
     return (prefix + "\n\n" if prefix else "") + notice
+
+
+def _technical_units(value: str) -> list[str]:
+    """Split prose and fenced blocks without ever cutting a fence in half."""
+    units: list[str] = []
+    current: list[str] = []
+    fence: str | None = None
+
+    def flush() -> None:
+        if current and (unit := "\n".join(current).strip()):
+            units.append(unit)
+        current.clear()
+
+    for line in value.splitlines():
+        marker = CODE_FENCE_RE.fullmatch(line)
+        if fence is not None:
+            current.append(line)
+            if _closes_code_fence(line, fence):
+                fence = None
+                flush()
+            continue
+        if marker:
+            flush()
+            fence = marker[1]
+            current.append(line)
+            continue
+        if line.strip():
+            current.append(line)
+        else:
+            flush()
+    flush()
+    return units
+
+
+def _focused_technical_excerpt(value: str, query: str, max_chars: int) -> str | None:
+    """Select a contiguous verification passage while preserving code fences."""
+    lowered_query = query.casefold()
+    if not VERIFICATION_QUERY_RE.search(query) or any(
+        marker in lowered_query for marker in EXACT_TRANSCRIPTION_MARKERS
+    ):
+        return None
+
+    units = _technical_units(value)
+    if not units:
+        return None
+    signal_weights, anchors = _query_signal_weights(query)
+    exact_identifiers = extract_exact_identifiers(query)
+
+    def unit_score(unit: str) -> tuple[float, int]:
+        tokens = {
+            _normalise_signal_token(raw_token)
+            for raw_token in WORD_RE.findall(unit)
+        }
+        matched_weight = 0.0
+        for token, weight in signal_weights.items():
+            if token in tokens or (
+                token not in anchors
+                and any(_soft_lexical_match(token, content_token) for content_token in tokens)
+            ):
+                matched_weight += weight
+        matched_weight += 5.0 * sum(
+            contains_exact_identifier(unit, identifier)
+            for identifier in exact_identifiers
+        )
+        return matched_weight, -len(unit)
+
+    best_index = max(range(len(units)), key=lambda index: unit_score(units[index]))
+    if unit_score(units[best_index])[0] <= 0.0 or len(units[best_index]) > max_chars:
+        return None
+
+    left = right = best_index
+    excerpt = units[best_index]
+    # The following verification result usually completes the preceding check,
+    # so prefer the right neighbour before adding setup from the left.
+    while left > 0 or right + 1 < len(units):
+        added = False
+        for next_left, next_right in (
+            (left, right + 1),
+            (left - 1, right),
+        ):
+            if next_left < 0 or next_right >= len(units):
+                continue
+            candidate = "\n\n".join(units[next_left : next_right + 1])
+            if len(candidate) <= max_chars:
+                left, right, excerpt = next_left, next_right, candidate
+                added = True
+                break
+        if not added:
+            break
+    return excerpt if len(excerpt) >= 40 else None
 
 
 def _query_terms(query: str) -> set[str]:
@@ -351,7 +461,9 @@ def focused_context_excerpt(value: str, query: str, max_chars: int) -> str:
     cleaned = clean_context_text(value)
     if len(cleaned) <= max_chars:
         return cleaned
-    if re.search(r"(?m)^(`{3,}|~{3,})", cleaned):
+    if re.search(r"(?m)^ {0,3}(`{3,}|~{3,})", cleaned):
+        if focused := _focused_technical_excerpt(cleaned, query, max_chars):
+            return focused
         return _technical_excerpt(cleaned, max_chars)
 
     terms = _query_terms(query)
@@ -525,6 +637,7 @@ def build_context(
     selected_terms: list[set[str]] = []
     document_counts: dict[uuid.UUID, int] = {}
     used_chars = 0
+    expansion_texts: dict[uuid.UUID, tuple[str, str | None]] = {}
     rejected_low_score = 0
     rejected_duplicate = 0
     rejected_document_cap = 0
@@ -584,13 +697,11 @@ def build_context(
             ),
         ]
 
-    for (
-        result,
-        quality_score,
-        query_relevance_score,
-        selection_score,
-        _,
-    ) in ranked_candidates:
+    # A fenced block may be indivisible and larger than its fair share. Retry
+    # such candidates after compact evidence, using only the remaining budget.
+    selection_candidates = [(candidate, False) for candidate in ranked_candidates]
+    for candidate, deferred in selection_candidates:
+        result, quality_score, query_relevance_score, selection_score, _ = candidate
         if len(sources) >= max_sources:
             break
         if quality_score < score_floor:
@@ -600,18 +711,36 @@ def build_context(
             rejected_document_cap += 1
             continue
 
+        # Parent-deduped Markdown results may be prose leaves whose commands
+        # live in a sibling code chunk. Use the same bounded, leaf-first
+        # expansion as Confluence, not an unconditional large-parent fallback.
+        technical = result.filename.endswith(".confluence.json") or (
+            result.filename.lower().endswith((".md", ".markdown"))
+            and any(
+                re.search(r"(?m)^ {0,3}(`{3,}|~{3,})", value)
+                for value in (result.text, result.parent_text or "")
+            )
+        )
         source_text = result.text
-        if len(source_text.strip()) < 240 and result.parent_text:
+        if not technical and len(source_text.strip()) < 240 and result.parent_text:
             source_text = result.parent_text
 
-        technical = result.filename.endswith(".confluence.json")
-        if technical and result.parent_text and not getattr(result, "parent_text_truncated", False):
-            source_text = result.parent_text
+        # Select compact evidence first. A parent section must not consume the
+        # budget before other relevant leaf chunks have had a chance to enter.
         source_budget = max_source_chars
         if technical:
-            source_budget = max(max_source_chars, min(10000, max_context_chars - 1000))
+            source_budget = min(
+                10000,
+                max(0, max_context_chars // max(1, min(max_sources, len(candidates))) - 300),
+            )
+            if deferred:
+                source_budget = min(10000, max(0, max_context_chars - used_chars - 300))
 
         excerpt = focused_context_excerpt(source_text, question, source_budget)
+        if technical and not excerpt.split("[Фрагмент инструкции:", 1)[0].strip():
+            if not deferred:
+                selection_candidates.append((candidate, True))
+            continue  # A truncation notice alone is not evidence.
         if len(excerpt) < 40:
             rejected_low_score += 1
             continue
@@ -667,6 +796,42 @@ def build_context(
         selected_terms.append(_content_terms(source.excerpt))
         document_counts[result.document_id] = document_counts.get(result.document_id, 0) + 1
         used_chars += len(block) + separator_chars
+        if technical:
+            expansion_texts[source.chunk_id] = (
+                result.text,
+                result.parent_text
+                if result.parent_text and not getattr(result, "parent_text_truncated", False)
+                else None,
+            )
+
+    # Expand in evidence-priority order: first this leaf, then its parent. Lower
+    # priority continuations must not consume the leading instruction's tail.
+    # Keep ordered prefixes and complete fences; never evict other selected evidence.
+    for index, source in enumerate(sources):
+        for expansion_level in (0, 1):
+            options = expansion_texts.get(source.chunk_id)
+            if not options or not options[expansion_level]:
+                continue
+            full_text = clean_context_text(options[expansion_level])
+            prefix = source.excerpt.split("[Фрагмент инструкции:", 1)[0].rstrip()
+            if not prefix or prefix not in full_text:
+                continue
+            budget = min(10000, max_context_chars - used_chars + len(source.excerpt))
+            expanded = _technical_excerpt(full_text, budget)
+            expanded_content = expanded.split("[Фрагмент инструкции:", 1)[0].rstrip()
+            if prefix not in expanded_content or len(expanded_content) <= len(prefix):
+                continue
+            if any(
+                other.document_id == source.document_id
+                and other.chunk_id != source.chunk_id
+                and other.excerpt == expanded
+                for other in sources
+            ):
+                continue
+            used_chars += len(expanded) - len(source.excerpt)
+            source = replace(source, excerpt=expanded)
+            sources[index] = source
+            blocks[index] = f"{_source_header(source)}\n{source.excerpt}"
 
     if not sources:
         status = "insufficient"

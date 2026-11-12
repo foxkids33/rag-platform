@@ -23,6 +23,8 @@ class EvaluationCase:
     required_code_blocks: tuple[str, ...] = ()
     source_page_id: str | None = None
     source_version: str | None = None
+    # Reviewed substitutes for the sole gold citation, never retrieval golds.
+    accepted_citation_filenames: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.id.strip():
@@ -49,6 +51,12 @@ class EvaluationCase:
 
         if self.expected_abstention and (self.expected_document_ids or self.expected_filenames):
             raise ValueError("An abstention case must not define expected documents")
+
+        if self.accepted_citation_filenames:
+            if len(self.expected_filenames) != 1 or self.expected_abstention:
+                raise ValueError("Citation alternatives require exactly one gold filename")
+            if len(set(self.accepted_citation_filenames)) != len(self.accepted_citation_filenames):
+                raise ValueError("accepted_citation_filenames must not contain duplicates")
 
 
 @dataclass(frozen=True, slots=True)

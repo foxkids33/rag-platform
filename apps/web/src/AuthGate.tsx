@@ -1,7 +1,9 @@
-import { ReactNode, useCallback, useEffect, useMemo, useState } from "react";
+import { Fragment, ReactNode, useCallback, useEffect, useMemo, useState } from "react";
 import { User, UserManager, WebStorageStateStore } from "oidc-client-ts";
 import { setApiAccessToken } from "./api";
 import { runtimeConfig } from "./runtime-config";
+import { PasswordAuthGate } from "./PasswordAuthGate";
+import { AuthUserProvider } from "./auth-context";
 
 type AuthState = "loading" | "authenticated" | "unauthenticated" | "error";
 
@@ -15,7 +17,7 @@ function returnPath(user: User): string {
   return requested.startsWith("/") && !requested.startsWith("//") ? requested : "/";
 }
 
-export function AuthGate({ children }: { children: ReactNode }) {
+function OidcAuthGate({ children }: { children: ReactNode }) {
   const [state, setState] = useState<AuthState>(runtimeConfig.authEnabled ? "loading" : "authenticated");
   const [user, setUser] = useState<User | null>(null);
   const [error, setError] = useState("");
@@ -132,11 +134,20 @@ export function AuthGate({ children }: { children: ReactNode }) {
   const displayName = String(user?.profile.name || user?.profile.preferred_username || user?.profile.email || "Пользователь");
   return (
     <>
-      {children}
+      <AuthUserProvider user={{ subject: user?.profile.sub || "", roles: Array.isArray(user?.profile.roles) ? user.profile.roles.filter((role): role is string => typeof role === "string") : [] }}>
+        <Fragment key={user?.profile.sub}>{children}</Fragment>
+      </AuthUserProvider>
       <aside className="auth-session" title={displayName}>
         <span>{displayName}</span>
         <button type="button" onClick={() => void signOut()}>Выйти</button>
       </aside>
     </>
   );
+}
+
+export function AuthGate({ children }: { children: ReactNode }) {
+  if (!runtimeConfig.authEnabled) return <>{children}</>;
+  return runtimeConfig.authMode === "password"
+    ? <PasswordAuthGate>{children}</PasswordAuthGate>
+    : <OidcAuthGate>{children}</OidcAuthGate>;
 }

@@ -1,15 +1,23 @@
 from __future__ import annotations
 
+import re
 import uuid
-from dataclasses import dataclass, replace
+import xml.etree.ElementTree as ET
+from collections.abc import Iterable
+from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
+from zipfile import BadZipFile, ZipFile
+
+from defusedxml import ElementTree as SafeET
+from defusedxml.common import DefusedXmlException
 
 from app.config import settings
-from app.text_processing import extract_text, split_into_chunks
+from app.text_processing import _decode, extract_text, split_into_chunks
 
-DOCLING_EXTENSIONS = {".pdf", ".docx"}
+TEXT_EXTENSIONS = {".txt", ".md", ".markdown", ".csv", ".json", ".html", ".htm", ".xml"}
+WORD_NAMESPACE = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,12 +34,120 @@ class ParsedChunk:
 
 
 def parse_document(filename: str, data: bytes) -> list[ParsedChunk]:
+    if not data:
+        raise ValueError("Document is empty")
+    if len(data) > settings.parser_max_input_mb * 1024 * 1024:
+        raise ValueError("Document exceeds the parser input safety limit")
     if filename.endswith(".confluence.json"):
-        return _parse_confluence(data)
-    extension = Path(filename).suffix.lower()
-    if extension in DOCLING_EXTENSIONS:
-        return _parse_with_docling(filename, data)
-    return _parse_plain_text(filename, data)
+        chunks = _parse_confluence(data)
+    else:
+        extension = Path(filename).suffix.lower()
+        if extension in {".md", ".markdown"}:
+            chunks = _parse_markdown(filename, data)
+        elif extension == ".docx":
+            chunks = _parse_docx(filename, data)
+        elif extension == ".pdf":
+            from app.media_processing import extract_pdf
+
+            chunks = _media_chunks(filename, extract_pdf(data), "pdf_cpu_v1")
+        elif extension in {".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff"}:
+            from app.media_processing import extract_image
+
+            chunks = _media_chunks(filename, extract_image(filename, data), "image_ocr_vision_v1")
+        elif extension in TEXT_EXTENSIONS:
+            chunks = _parse_plain_text(filename, data)
+        else:
+            raise ValueError("Unsupported document format")
+    if not chunks:
+        raise ValueError("Document produced no readable text")
+    if sum(len(chunk.text) for chunk in chunks) > settings.parser_max_text_chars:
+        raise ValueError("Document exceeds the extracted text safety limit")
+    return chunks
+
+
+def _media_chunks(filename: str, pages: Iterable[Any], parser: str) -> list[ParsedChunk]:
+    records = []
+    for page in pages:
+        heading = f"{filename} — страница {page.page_number}"
+        for child in split_into_chunks(page.text):
+            records.append({
+                "text": child, "search_text": f"{heading}\n\n{child}",
+                "heading": heading, "heading_breadcrumb": heading,
+                "page_start": page.page_number, "page_end": page.page_number,
+                "metadata": {
+                    "parser": parser,
+                    "format": Path(filename).suffix.lower().lstrip("."),
+                    **page.metadata,
+                },
+            })
+    return _build_parent_groups(records)
+
+
+def _parse_markdown(filename: str, data: bytes) -> list[ParsedChunk]:
+    """Normalize prose as before, preserving whole fenced code blocks verbatim.
+
+    Only line endings are normalized inside fences. Even an oversized or
+    unclosed fence stays in one child chunk; the latter is explicitly flagged.
+    """
+    source = _decode(data).replace("\r\n", "\n").replace("\r", "\n")
+    fence_pattern = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
+    blocks: list[tuple[str, bool, bool]] = []
+    prose: list[str] = []
+    code: list[str] = []
+    opening: str | None = None
+
+    for line in source.splitlines(keepends=True):
+        match = fence_pattern.fullmatch(line.removesuffix("\n"))
+        if opening is None:
+            if match and not (match[1][0] == "`" and "`" in match[2]):
+                if prose:
+                    blocks.append(("".join(prose), False, True))
+                    prose.clear()
+                opening = match[1]
+                code.append(line)
+            else:
+                prose.append(line)
+        else:
+            code.append(line)
+            if (
+                match
+                and match[1][0] == opening[0]
+                and len(match[1]) >= len(opening)
+                and not match[2].strip()
+            ):
+                blocks.append(("".join(code), True, True))
+                code.clear()
+                opening = None
+
+    if code:
+        blocks.append(("".join(code), True, False))
+    if prose:
+        blocks.append(("".join(prose), False, True))
+    if not any(is_code for _, is_code, _ in blocks):
+        return _parse_plain_text(filename, data)
+
+    records: list[dict[str, Any]] = []
+    for block, is_code, closed in blocks:
+        # Fences never pass through the whitespace-normalizing text reader or
+        # character splitter. Prose keeps the existing extraction behavior.
+        children = [block] if is_code else split_into_chunks(extract_text(filename, block.encode("utf-8")))
+        for child in children:
+            records.append({
+                "text": child,
+                "search_text": child,
+                "heading": None,
+                "heading_breadcrumb": None,
+                "page_start": None,
+                "page_end": None,
+                "metadata": {
+                    "parser": "markdown_fenced_v1",
+                    "format": Path(filename).suffix.lower().lstrip("."),
+                    "block_kind": "code" if is_code else "prose",
+                    "oversized_atomic_block": is_code and len(child) > settings.chunk_max_chars,
+                    "warnings": ["unclosed_code_fence"] if is_code and not closed else [],
+                },
+            })
+    return _build_parent_groups(records)
 
 
 def _parse_confluence(data: bytes) -> list[ParsedChunk]:
@@ -80,6 +196,134 @@ def _parse_confluence(data: bytes) -> list[ParsedChunk]:
     return _build_parent_groups(records)
 
 
+def _parse_docx(filename: str, data: bytes) -> list[ParsedChunk]:
+    """Parse DOCX deterministically without initializing OCR/Torch models.
+
+    DOCX is an OpenXML archive, so text, headings and tables can be extracted
+    directly. This keeps office documents lightweight and avoids Docling's PDF
+    vision pipeline (and its native compiler requirement) for a non-visual
+    format.
+    """
+
+    try:
+        with ZipFile(BytesIO(data)) as archive:
+            entries = archive.infolist()
+            if len(entries) > 2000 or sum(item.file_size for item in entries) > 100 * 1024 * 1024:
+                raise ValueError("DOCX archive exceeds the safe expansion limit")
+            if any(item.flag_bits & 1 for item in entries):
+                raise ValueError("Encrypted DOCX archives are not supported")
+            info = archive.getinfo("word/document.xml")
+            if info.file_size > 10 * 1024 * 1024:
+                raise ValueError("DOCX document.xml exceeds the safe parsing limit")
+            source = archive.read(info)
+    except (BadZipFile, KeyError, OSError) as exc:
+        raise ValueError("DOCX archive is invalid or missing word/document.xml") from exc
+
+    if b"<!DOCTYPE" in source.upper() or b"<!ENTITY" in source.upper():
+        raise ValueError("DOCX XML contains a forbidden declaration")
+    try:
+        root = SafeET.fromstring(source, forbid_dtd=True, forbid_entities=True, forbid_external=True)
+    except (ET.ParseError, DefusedXmlException) as exc:
+        raise ValueError("DOCX document.xml is invalid or contains a forbidden declaration") from exc
+
+    body = root.find(f"{WORD_NAMESPACE}body")
+    if body is None:
+        return []
+
+    heading_stack: list[str] = []
+    blocks: list[tuple[str, list[str], str]] = []
+    for element in body:
+        kind = element.tag.rsplit("}", 1)[-1]
+        if kind == "p":
+            text = _docx_text(element)
+            if not text:
+                continue
+            level = _docx_heading_level(element)
+            if level is not None:
+                heading_stack = heading_stack[: max(0, level - 1)]
+                while len(heading_stack) < level - 1:
+                    heading_stack.append("")
+                heading_stack.append(text)
+                continue
+            blocks.append((text, [item for item in heading_stack if item], "paragraph"))
+        elif kind == "tbl":
+            rows: list[str] = []
+            for row in element.findall(f"{WORD_NAMESPACE}tr"):
+                cells = [
+                    _docx_text(cell)
+                    for cell in row.findall(f"{WORD_NAMESPACE}tc")
+                ]
+                cells = [cell for cell in cells if cell]
+                if cells:
+                    rows.append(" | ".join(cells))
+            if rows:
+                blocks.append(("\n".join(rows), [item for item in heading_stack if item], "table"))
+
+    records: list[dict[str, Any]] = []
+    group: list[str] = []
+    group_headings: list[str] = []
+    group_kinds: set[str] = set()
+
+    def flush() -> None:
+        if not group:
+            return
+        text = "\n\n".join(group)
+        breadcrumb = " > ".join(group_headings) if group_headings else None
+        records.append(
+            {
+                "text": text,
+                "search_text": f"{breadcrumb}\n\n{text}" if breadcrumb else text,
+                "heading": group_headings[-1] if group_headings else None,
+                "heading_breadcrumb": breadcrumb,
+                "page_start": None,
+                "page_end": None,
+                "metadata": {
+                    "parser": "docx_xml_v1",
+                    "format": Path(filename).suffix.lower().lstrip("."),
+                    "headings": list(group_headings),
+                    "block_kinds": sorted(group_kinds),
+                },
+            }
+        )
+        group.clear()
+        group_kinds.clear()
+
+    for text, headings, block_kind in blocks:
+        projected = sum(len(item) + 2 for item in group) + len(text)
+        if group and (headings != group_headings or projected > settings.chunk_max_chars):
+            flush()
+        group_headings = headings
+        group.append(text)
+        group_kinds.add(block_kind)
+    flush()
+    return _build_parent_groups(records)
+
+
+def _docx_text(element: ET.Element) -> str:
+    parts: list[str] = []
+    for child in element.iter():
+        name = child.tag.rsplit("}", 1)[-1]
+        if name == "t" and child.text:
+            parts.append(child.text)
+        elif name == "tab":
+            parts.append("\t")
+        elif name in {"br", "cr"}:
+            parts.append("\n")
+    return _clean_text("".join(parts))
+
+
+def _docx_heading_level(paragraph: ET.Element) -> int | None:
+    properties = paragraph.find(f"{WORD_NAMESPACE}pPr")
+    style = properties.find(f"{WORD_NAMESPACE}pStyle") if properties is not None else None
+    if style is None:
+        return None
+    value = style.get(f"{WORD_NAMESPACE}val", "")
+    match = re.search(r"(?:heading|заголовок)[ _-]?(\d+)$", value, flags=re.IGNORECASE)
+    if not match:
+        return None
+    return max(1, min(9, int(match.group(1))))
+
+
 def _parse_plain_text(filename: str, data: bytes) -> list[ParsedChunk]:
     text = extract_text(filename, data)
     if not text:
@@ -111,7 +355,9 @@ def _parse_with_docling(filename: str, data: bytes) -> list[ParsedChunk]:
         from docling.chunking import HybridChunker
         from docling.datamodel.base_models import DocumentStream
         from docling.document_converter import DocumentConverter
-        from docling_core.transforms.chunker.tokenizer.huggingface import HuggingFaceTokenizer
+        from docling_core.transforms.chunker.tokenizer.huggingface import (
+            HuggingFaceTokenizer,
+        )
     except ModuleNotFoundError as exc:
         raise RuntimeError(
             "PDF/DOCX parsing is not installed in the lightweight worker; "

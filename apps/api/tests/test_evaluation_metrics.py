@@ -75,6 +75,35 @@ def test_fact_matching_keeps_numbers_exact() -> None:
     assert fact_coverage(("2",), text) == 0.0
 
 
+def test_reviewed_count_aliases_do_not_change_other_exact_facts() -> None:
+    assert fact_coverage(("2||два||две", "3||три"), "Два узла БД и три узла кворума") == 1.0
+    assert fact_coverage(("2", "7.0"), "два узла, версия семь") == 0.0
+
+
+def test_reviewed_citation_alternative_does_not_change_retrieval_or_context_gold() -> None:
+    case = EvaluationCase(
+        id="tls", question="Команда диагностики?", expected_filenames=("tls.json",),
+        accepted_citation_filenames=("reviewed-copy.json",),
+    )
+    observation = AnswerObservation(
+        case_id="tls", text="Команда [1]", actual_abstention=False, citation_valid=True,
+        cited_source_text="Команда", cited_filenames=("reviewed-copy.json",),
+        context_filenames=("reviewed-copy.json",),
+    )
+    metrics = evaluate_answer_case(case, observation)
+    assert metrics.citation_source_coverage == 1.0
+    assert metrics.context_source_coverage == 0.0
+    assert recall_at_k(case.expected_filenames, observation.cited_filenames, 10) == 0.0
+    strict = EvaluationCase(id="tls", question=case.question, expected_filenames=case.expected_filenames)
+    assert evaluate_answer_case(strict, observation).citation_source_coverage == 0.0
+
+
+def test_citation_alternatives_reject_ambiguous_multi_gold_mapping() -> None:
+    with pytest.raises(ValueError, match="exactly one gold"):
+        EvaluationCase(id="tls", question="Q", expected_filenames=("a", "b"),
+                       accepted_citation_filenames=("copy",))
+
+
 def test_fact_matching_does_not_confuse_negated_term() -> None:
     text = "Система работает со структурированными данными."
 

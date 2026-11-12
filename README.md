@@ -1,5 +1,14 @@
 # RAG Platform
 
+## Чистая установка для Confluence
+
+Для собственного пустого экземпляра используйте [CLEAN_INSTALL.md](CLEAN_INSTALL.md)
+и [отдельный Compose-профиль](docs/confluence-clean-deployment.md). Он обращается
+к Confluence напрямую и не переносит данные существующего стенда. Коннектор
+сохранён для раздельных сетей. [Обзор пригодности для других команд](docs/REUSABILITY_REVIEW.md)
+и [проверки чистой поставки](docs/RAG_CLEAN_VALIDATION.md) описывают возможности
+и границы текущей версии.
+
 Новый RAG-проект, который объединяет удобный UI текущей системы с более быстрым и точным retrieval-пайплайном.
 
 ## Целевые пользовательские режимы
@@ -29,8 +38,9 @@ make dev
 
 `make dev` запускает лёгкий TXT/HTML/JSON stack и локальный embedding service;
 проверенный профиль первого релиза работает без reranker.
-Он не устанавливает многогигабайтные Torch/CUDA-зависимости Docling. Для
-PDF/DOCX используйте `make dev-docling`. Reranker включается только для явного
+Он не устанавливает многогигабайтные Torch/CUDA-зависимости Docling. DOCX
+обрабатывается лёгким OpenXML parser; для PDF используйте `make dev-docling`.
+Reranker включается только для явного
 A/B-прогона через `make dev-rerank`, а полный вариант с Docling и reranker —
 через `make dev-full`.
 
@@ -66,6 +76,8 @@ make logs
 
 - UI: `http://localhost:5173`
 - API: `http://localhost:8000`
+- Swagger: `http://localhost:8000/api/docs`
+- OpenAPI JSON: `http://localhost:8000/api/openapi.json`
 - API health: `http://localhost:8000/api/v1/health`
 - Current principal: `http://localhost:8000/api/v1/auth/me`
 - MinIO console: `http://localhost:9001`
@@ -73,6 +85,10 @@ make logs
 Локально аутентификация отключена и используется фиксированный admin principal.
 Перед публикацией API настройте корпоративный OIDC согласно
 [`docs/authentication.md`](docs/authentication.md).
+
+На сервере Swagger и OpenAPI доступны через тот же web-порт под `/api/`;
+отдельно публиковать порт backend не нужно. Форматы JSON/SSE и различие
+пользовательского и машинного токенов описаны в [контракте API](docs/api-contract.md).
 
 ## Разработка без Docker
 
@@ -220,11 +236,12 @@ API хранит все переданные модели фрагменты д�
 
 ## Confluence
 
-Страницы Confluence Cloud или Data Center можно импортировать по page ID либо
-по space key из UI и API. Повторная синхронизация идемпотентна и использует
-версию/хеш страницы; персональный token вводится в UI, передаётся только в запросе
-и хранится лишь в памяти вкладки. Настройка и
-важная граница ACL описаны в [`docs/confluence.md`](docs/confluence.md).
+Confluence подключается через outbound connector внутри корпоративной сети.
+Connector держит исходящий HTTPS long-poll к RAG, лениво загружает дерево страниц
+и передаёт только выбранные пользователем страницы. Токен Confluence остаётся на
+машине connector и никогда не попадает в UI или на RAG-сервер. Повторная
+синхронизация идемпотентна и использует версию/хеш страницы. Настройка, запуск и
+граница ACL описаны в [`docs/confluence-connector.md`](docs/confluence-connector.md).
 
 
 ## Workspace и режимы источников
@@ -283,3 +300,14 @@ steps and the read-only inventory command are in
 The server web container serves a pinned, reproducible static build through
 Nginx and proxies `/api/` (including SSE) to the API container.
 <!-- END SERVER DEPLOYMENT -->
+
+## Public source snapshot examples
+
+Deployment examples and the optional fixed-target VPN hook use reserved documentation addresses
+and `.example.invalid` hostnames. Replace these example targets for your own installation;
+keep the VPN hook restricted to the intended single `/32` destination. Local credentials,
+recorded documents, browser captures and generated presentation archives are excluded.
+Set `NGROK_CONFIG` and `PLAYWRIGHT_MODULE` explicitly when using the optional demo tools.
+
+The current dependency manifests are preserved, including recently added API dependencies.
+The offline publication checks do not replace full dependency, database or live integration validation.

@@ -9,10 +9,12 @@ from typing import Any
 
 import jwt
 from anyio import to_thread
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings, settings
+from app.db.session import get_db
 
 bearer = HTTPBearer(auto_error=False)
 
@@ -108,10 +110,16 @@ def local_principal() -> Principal:
 
 
 async def get_current_principal(
+    request: Request,
     credentials: HTTPAuthorizationCredentials | None = Depends(bearer),
+    db: AsyncSession = Depends(get_db),
 ) -> Principal:
     if not settings.auth_enabled:
         return local_principal()
+    if settings.auth_mode == "password":
+        from app.services.password_auth import authenticate_session
+
+        return await authenticate_session(request, db)
     if credentials is None or credentials.scheme.casefold() != "bearer":
         raise _unauthorized()
     if len(credentials.credentials) > 16_384:
@@ -136,3 +144,13 @@ def require_tenant_admin(principal: Principal) -> None:
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Tenant administrator role is required",
         )
+
+
+def is_password_principal(principal: Principal) -> bool:
+    return principal.claims.get("auth_mode") == "password"
+
+
+def require_knowledge_base_manager(principal: Principal) -> None:
+    """Local users may manage their own KB; all lookups still check ownership."""
+    if not is_password_principal(principal):
+        require_tenant_admin(principal)

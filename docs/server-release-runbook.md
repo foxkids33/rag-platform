@@ -87,7 +87,7 @@ First validate all files without writes:
 ./scripts/deploy/compose-server.sh exec -T api python -m app.operations.import_confluence_snapshot \
   --snapshot-root /snapshots/kbr \
   --workspace-id WORKSPACE_UUID \
-  --expected-source https://confluence.skala-r.ru \
+  --expected-source https://confluence.example.invalid \
   --expected-space KBR \
   --expected-pages 298
 ```

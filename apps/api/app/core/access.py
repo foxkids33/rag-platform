@@ -9,7 +9,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
-from app.core.security import Principal
+from app.core.security import Principal, is_password_principal
 from app.db.models import KnowledgeBase, Workspace
 
 
@@ -47,6 +47,14 @@ async def knowledge_base_for_principal(
             KnowledgeBase.tenant_id == principal.tenant_id,
         )
     )
-    if knowledge_base is None or knowledge_base.tenant_id != principal.tenant_id:
+    if knowledge_base is None or not principal_can_access_knowledge_base(principal, knowledge_base):
         raise HTTPException(status_code=404, detail="Knowledge base not found")
     return knowledge_base
+
+
+def principal_can_access_knowledge_base(principal: Principal, knowledge_base: KnowledgeBase) -> bool:
+    return knowledge_base.tenant_id == principal.tenant_id and (
+        not is_password_principal(principal)
+        or principal.has_role(settings.auth_admin_role)
+        or knowledge_base.owner_subject == principal.subject
+    )

@@ -49,7 +49,7 @@ type Props = {
   onError: (message: string) => void;
 };
 
-const ACCEPTED_FILES = ".txt,.md,.csv,.json,.html,.htm,.xml,.pdf,.docx";
+const ACCEPTED_FILES = ".txt,.md,.csv,.json,.html,.htm,.xml,.pdf,.docx,.png,.jpg,.jpeg,.webp,.tif,.tiff";
 const EDITABLE_STATUSES = new Set(["DRAFT", "INDEXING", "READY", "FAILED"]);
 
 async function readJson<T>(response: Response): Promise<T> {
@@ -112,14 +112,15 @@ export function KnowledgeBaseManager({
   const versionEditable = Boolean(selectedVersion && EDITABLE_STATUSES.has(selectedVersion.status));
   const versionBusy = Boolean(selectedVersion?.processing_document_count);
 
-  const loadVersions = async (knowledgeBaseId: string, preserveVersionId?: string) => {
+  const loadVersions = async (knowledgeBaseId: string, preserveVersionId?: string, signal?: AbortSignal) => {
     if (!knowledgeBaseId) {
       setVersions([]);
       setSelectedVersionId("");
       return [] as KnowledgeBaseVersion[];
     }
-    const response = await fetch(`${apiBaseUrl}/api/v1/knowledge-bases/${knowledgeBaseId}/versions`);
+    const response = await fetch(`${apiBaseUrl}/api/v1/knowledge-bases/${knowledgeBaseId}/versions`, { signal });
     const items = await readJson<KnowledgeBaseVersion[]>(response);
+    signal?.throwIfAborted();
     setVersions(items);
     const target = preserveVersionId && items.some((item) => item.id === preserveVersionId)
       ? preserveVersionId
@@ -128,15 +129,18 @@ export function KnowledgeBaseManager({
     return items;
   };
 
-  const loadDocuments = async (knowledgeBaseId: string, versionId: string) => {
+  const loadDocuments = async (knowledgeBaseId: string, versionId: string, signal?: AbortSignal) => {
     if (!knowledgeBaseId || !versionId) {
       setDocuments([]);
       return;
     }
     const response = await fetch(
       `${apiBaseUrl}/api/v1/knowledge-bases/${knowledgeBaseId}/versions/${versionId}/documents`,
+      { signal },
     );
-    setDocuments(await readJson<KnowledgeBaseDocument[]>(response));
+    const items = await readJson<KnowledgeBaseDocument[]>(response);
+    signal?.throwIfAborted();
+    setDocuments(items);
   };
 
   useEffect(() => {
@@ -154,28 +158,45 @@ export function KnowledgeBaseManager({
 
   useEffect(() => {
     if (!selectedKnowledgeBaseId) return;
-    void loadVersions(selectedKnowledgeBaseId).catch((reason) => {
+    const controller = new AbortController();
+    setVersions([]);
+    setSelectedVersionId("");
+    setDocuments([]);
+    void loadVersions(selectedKnowledgeBaseId, undefined, controller.signal).catch((reason) => {
+      if (controller.signal.aborted) return;
       onError(reason instanceof Error ? reason.message : "Не удалось загрузить версии базы");
     });
-  }, [selectedKnowledgeBaseId]);
+    return () => controller.abort();
+  }, [selectedKnowledgeBaseId, apiBaseUrl]);
 
   useEffect(() => {
-    if (!selectedKnowledgeBaseId || !selectedVersionId) {
+    if (!selectedKnowledgeBaseId || !selectedVersionId || !versions.some(
+      (version) => version.id === selectedVersionId && version.knowledge_base_id === selectedKnowledgeBaseId,
+    )) {
       setDocuments([]);
       return;
     }
+    if (action) return;
+    const controller = new AbortController();
+    let refreshing = false;
+    setDocuments([]);
     const refresh = async () => {
+      if (refreshing || controller.signal.aborted) return;
+      refreshing = true;
       try {
-        await loadDocuments(selectedKnowledgeBaseId, selectedVersionId);
-        await loadVersions(selectedKnowledgeBaseId, selectedVersionId);
+        await loadDocuments(selectedKnowledgeBaseId, selectedVersionId, controller.signal);
+        await loadVersions(selectedKnowledgeBaseId, selectedVersionId, controller.signal);
       } catch (reason) {
+        if (controller.signal.aborted) return;
         onError(reason instanceof Error ? reason.message : "Не удалось обновить версию базы");
+      } finally {
+        refreshing = false;
       }
     };
     void refresh();
     const timer = window.setInterval(() => void refresh(), 2500);
-    return () => window.clearInterval(timer);
-  }, [selectedKnowledgeBaseId, selectedVersionId]);
+    return () => { controller.abort(); window.clearInterval(timer); };
+  }, [selectedKnowledgeBaseId, selectedVersionId, action, apiBaseUrl]);
 
   const createKnowledgeBase = async () => {
     const name = window.prompt("Название новой базы знаний", "Новая база знаний")?.trim();
@@ -413,6 +434,7 @@ export function KnowledgeBaseManager({
           <label>Управление базой</label>
           <div className="workspace-selector-row">
             <select
+              aria-label="Управление базой знаний"
               value={selectedKnowledgeBaseId}
               onChange={(event) => setSelectedKnowledgeBaseId(event.target.value)}
               disabled={Boolean(action)}
@@ -459,6 +481,7 @@ export function KnowledgeBaseManager({
             <>
               <div className="workspace-selector-row">
                 <select
+                  aria-label="Версия базы знаний"
                   value={selectedVersionId}
                   onChange={(event) => setSelectedVersionId(event.target.value)}
                   disabled={Boolean(action)}

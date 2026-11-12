@@ -5,9 +5,15 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
+# Local CPU OCR; no SaaS OCR, external image fetches or GPU model downloads.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    tesseract-ocr tesseract-ocr-eng tesseract-ocr-rus fonts-dejavu-core \
+    && rm -rf /var/lib/apt/lists/*
+
 ARG WORKER_INSTALL_DOCLING=true
 RUN if [ "$WORKER_INSTALL_DOCLING" = "true" ]; then \
         apt-get update && apt-get install -y --no-install-recommends \
+        g++ \
         libxcb1 \
         libx11-6 \
         libxext6 \

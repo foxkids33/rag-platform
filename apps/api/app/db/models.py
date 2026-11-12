@@ -31,6 +31,7 @@ class KnowledgeBase(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     tenant_id: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    owner_subject: Mapped[str | None] = mapped_column(String(255), index=True)
     slug: Mapped[str] = mapped_column(String(120), nullable=False)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     description: Mapped[str | None] = mapped_column(Text)
@@ -44,6 +45,45 @@ class KnowledgeBase(Base):
     )
     graph_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class AuthUser(Base):
+    """Local accounts; a partial unique index permits exactly one administrator."""
+
+    __tablename__ = "auth_users"
+    __table_args__ = (
+        Index("uq_auth_users_single_admin", "is_admin", unique=True,
+              postgresql_where=sql_text("is_admin IS TRUE")),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    username: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    subject: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
+    tenant_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    display_name: Mapped[str] = mapped_column(String(120), nullable=False)
+    password_hash: Mapped[str] = mapped_column(String(512), nullable=False)
+    is_admin: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class AuthSession(Base):
+    __tablename__ = "auth_sessions"
+
+    token_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("auth_users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class AuthRateLimit(Base):
+    __tablename__ = "auth_rate_limits"
+
+    bucket_key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    window_started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False)
 
 
 class KnowledgeBaseVersion(Base):
@@ -105,7 +145,8 @@ class Document(Base):
         ),
         CheckConstraint(
             "source_type <> 'CONFLUENCE' OR "
-            "(workspace_id IS NOT NULL AND external_id IS NOT NULL)",
+            "((workspace_id IS NOT NULL OR knowledge_base_version_id IS NOT NULL) "
+            "AND external_id IS NOT NULL)",
             name="ck_documents_confluence_identity",
         ),
         Index(
@@ -115,6 +156,16 @@ class Document(Base):
             "external_id",
             unique=True,
             postgresql_where=sql_text("external_id IS NOT NULL"),
+        ),
+        Index(
+            "uq_documents_kb_external_source",
+            "knowledge_base_version_id",
+            "source_type",
+            "external_id",
+            unique=True,
+            postgresql_where=sql_text(
+                "knowledge_base_version_id IS NOT NULL AND external_id IS NOT NULL"
+            ),
         ),
         Index(
             "ix_documents_workspace_sha256",
@@ -136,6 +187,7 @@ class Document(Base):
     filename: Mapped[str] = mapped_column(String(500), nullable=False)
     object_key: Mapped[str] = mapped_column(String(1000), nullable=False)
     mime_type: Mapped[str | None] = mapped_column(String(255))
+    size_bytes: Mapped[int | None] = mapped_column(Integer)
     sha256: Mapped[str] = mapped_column(String(64), nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False)
     search_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
@@ -271,3 +323,72 @@ class ObjectDeletionJob(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
+
+
+class Connector(Base):
+    __tablename__ = "connectors"
+    __table_args__ = (
+        Index("ix_connectors_tenant_last_seen", "tenant_id", "last_seen_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    enabled: Mapped[bool] = mapped_column(
+        Boolean, default=True, server_default=sql_text("true"), nullable=False
+    )
+    credential_hash: Mapped[str | None] = mapped_column(String(64))
+    enrollment_hash: Mapped[str | None] = mapped_column(String(64))
+    enrollment_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    allowed_spaces: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
+    capabilities: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
+    version: Mapped[str | None] = mapped_column(String(100))
+    last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class ConnectorJob(Base):
+    __tablename__ = "connector_jobs"
+    __table_args__ = (
+        CheckConstraint(
+            "type IN ('LIST_SPACES', 'LIST_CHILDREN', 'LIST_SPACE_PAGES', 'IMPORT_PAGES')",
+            name="ck_connector_jobs_type",
+        ),
+        CheckConstraint(
+            "status IN ('QUEUED', 'LEASED', 'SUCCEEDED', 'FAILED', 'CANCELLED')",
+            name="ck_connector_jobs_status",
+        ),
+        Index("ix_connector_jobs_claim", "connector_id", "status", "created_at"),
+        Index("ix_connector_jobs_workspace", "workspace_id", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    connector_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("connectors.id", ondelete="CASCADE"), nullable=False
+    )
+    tenant_id: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    workspace_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False
+    )
+    requested_by: Mapped[str] = mapped_column(String(255), nullable=False)
+    type: Mapped[str] = mapped_column(String(32), nullable=False)
+    payload: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(32), default="QUEUED", server_default=sql_text("'QUEUED'"), nullable=False
+    )
+    result: Mapped[dict | None] = mapped_column(JSON)
+    error: Mapped[str | None] = mapped_column(Text)
+    attempts: Mapped[int] = mapped_column(
+        Integer, default=0, server_default=sql_text("0"), nullable=False
+    )
+    lease_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    leased_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    deadline_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

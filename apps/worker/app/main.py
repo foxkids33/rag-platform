@@ -14,8 +14,9 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from app.config import settings
-from app.document_processing import ParsedChunk, parse_document
+from app.document_processing import ParsedChunk
 from app.embeddings import embeddings
+from app.parser_process import parse_document_isolated as parse_document
 from app.storage import storage
 from app.text_processing import normalize_exact_text
 

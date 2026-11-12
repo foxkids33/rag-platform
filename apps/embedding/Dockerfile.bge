@@ -8,7 +8,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-RUN python -m pip install --no-cache-dir \
+ARG PYTHON_EXECUTABLE=python
+RUN "${PYTHON_EXECUTABLE}" -m pip install --no-cache-dir \
     "FlagEmbedding==1.4.2" \
     "fastapi>=0.141,<0.142" \
     "numpy>=2.0,<3" \

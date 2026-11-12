@@ -13,7 +13,13 @@ import { readSseEvents } from "./sse";
 import { KnowledgeBaseManager } from "./KnowledgeBaseManager";
 import { ConversationGraph } from "./ConversationGraph";
 import { ConfluenceImportPanel } from "./ConfluenceImportPanel";
+import { RetrievalInspector } from "./RetrievalInspector";
+import { CodeIntegrity, CodeIntegrityPanel } from "./CodeIntegrityPanel";
+import { splitFencedCode } from "./fenced-code";
+import { CleanStart } from "./CleanStart";
 import { apiFetch as fetch } from "./api";
+import { useCanUseConfluence } from "./auth-context";
+import "./evidence-ui.css";
 
 type WorkspaceSourceMode = "USER_DOCUMENTS" | "KNOWLEDGE_BASE" | "HYBRID";
 
@@ -56,6 +62,7 @@ type ConversationSummary = {
 };
 
 type StoredMessageMetadata = {
+  finish_reason?: string | null;
   status?: "complete" | "streaming" | "stopped" | "error";
   model?: string;
   generation_temperature?: number;
@@ -78,6 +85,7 @@ type StoredMessageMetadata = {
   citation_valid?: boolean | null;
   cited_source_indices?: number[];
   invalid_citations?: number[];
+  code_integrity?: CodeIntegrity | null;
   sources?: AnswerSource[];
 };
 
@@ -139,6 +147,7 @@ type AnswerSource = {
 };
 
 type StreamMetadata = {
+  finish_reason?: string | null;
   question: string;
   retrieval_query: string;
   conversation_id: string | null;
@@ -164,10 +173,12 @@ type StreamMetadata = {
   citation_valid: boolean | null;
   cited_source_indices: number[];
   invalid_citations: number[];
+  code_integrity?: CodeIntegrity | null;
   sources: AnswerSource[];
 };
 
 type StreamDone = {
+  finish_reason?: string | null;
   assistant_message_id?: string | null;
   citation_valid?: boolean;
   cited_source_indices?: number[];
@@ -181,6 +192,7 @@ type StreamDone = {
   selected_source_count?: number;
   required_anchor_count?: number;
   matched_anchor_count?: number;
+  code_integrity?: CodeIntegrity | null;
 };
 
 type ChatMessage = {
@@ -194,14 +206,16 @@ type ChatMessage = {
 };
 
 type StreamStage = "idle" | "retrieving" | "generating";
-type ViewMode = "chat" | "documents" | "confluence" | "knowledge" | "graph";
+type ViewMode = "chat" | "documents" | "confluence" | "knowledge" | "graph" | "retrieval";
 type AbstentionReason =
   | "insufficient_retrieval_evidence"
   | "model_reported_insufficient_context"
-  | "citation_validation_failed";
+  | "citation_validation_failed"
+  | "code_integrity_validation_failed";
 
 const API = import.meta.env.VITE_API_BASE_URL || "";
-const ACCEPTED_FILES = ".txt,.md,.csv,.json,.html,.htm,.xml,.pdf,.docx";
+const CLEAN_INSTALL = import.meta.env.VITE_CLEAN_INSTALL === "true";
+const ACCEPTED_FILES = ".txt,.md,.csv,.json,.html,.htm,.xml,.pdf,.docx,.png,.jpg,.jpeg,.webp,.tif,.tiff";
 const SUGGESTED_QUESTIONS = [
   "Кратко опиши назначение продукта",
   "Какие ключевые компоненты входят в решение?",
@@ -209,11 +223,39 @@ const SUGGESTED_QUESTIONS = [
 ];
 
 const COLLAPSED_CONVERSATION_COUNT = 6;
-const VIEW_MODES = new Set<ViewMode>(["chat", "documents", "confluence", "knowledge", "graph"]);
+const VIEW_MODES = new Set<ViewMode>(["chat", "documents", "confluence", "knowledge", "graph", "retrieval"]);
+
+type DemoDeepLink = { workspaceId: string; conversationId: string | null };
+
+export function readDemoDeepLink(search: string): DemoDeepLink | null {
+  const params = new URLSearchParams(search);
+  const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  const workspace = params.get("workspace") || "";
+  if (params.getAll("workspace").length !== 1 || !uuid.test(workspace)) return null;
+  const conversation = params.get("conversation") || "";
+  return {
+    workspaceId: workspace.toLowerCase(),
+    conversationId: params.getAll("conversation").length === 1 && uuid.test(conversation)
+      ? conversation.toLowerCase()
+      : null,
+  };
+}
+
+export function selectInitialConversation(
+  items: Pick<ConversationSummary, "id" | "workspace_id">[],
+  workspaceId: string,
+  link: DemoDeepLink | null,
+): string {
+  const scoped = items.filter((item) => item.workspace_id === workspaceId);
+  const requested = link?.workspaceId === workspaceId
+    ? scoped.find((item) => item.id === link.conversationId)
+    : undefined;
+  return requested?.id || scoped[0]?.id || "";
+}
 
 function initialViewMode(): ViewMode {
   const candidate = window.location.hash.replace(/^#/, "") as ViewMode;
-  return VIEW_MODES.has(candidate) ? candidate : "chat";
+  return VIEW_MODES.has(candidate) ? candidate : CLEAN_INSTALL ? "confluence" : "chat";
 }
 
 async function readJson<T>(response: Response): Promise<T> {
@@ -283,6 +325,23 @@ function WorkspaceDocumentList({
   onToggle,
   onDelete,
 }: WorkspaceDocumentListProps) {
+  const [query, setQuery] = useState("");
+  const [filter, setFilter] = useState("all");
+  const [limit, setLimit] = useState(50);
+  const filtered = useMemo(() => {
+    const needle = query.trim().toLocaleLowerCase("ru");
+    return documents.filter((document) => {
+      const matchesText = `${document.title || ""} ${document.filename} ${document.external_id || ""}`
+        .toLocaleLowerCase("ru").includes(needle);
+      const matchesStatus = filter === "all"
+        || (filter === "ready" && document.status === "READY" && document.search_enabled)
+        || (filter === "processing" && ["QUEUED", "PROCESSING"].includes(document.status))
+        || (filter === "failed" && document.status === "FAILED")
+        || (filter === "excluded" && document.status === "READY" && !document.search_enabled);
+      return matchesText && matchesStatus;
+    });
+  }, [documents, query, filter]);
+
   if (documents.length === 0) {
     return (
       <div className="resource-empty">
@@ -294,8 +353,26 @@ function WorkspaceDocumentList({
   }
 
   return (
+    <>
+    <div className="document-filters">
+      <input
+        type="search"
+        aria-label="Поиск документов"
+        placeholder="Название, файл или ID страницы…"
+        value={query}
+        onChange={(event) => { setQuery(event.target.value); setLimit(50); }}
+      />
+      <select aria-label="Статус документов" value={filter} onChange={(event) => { setFilter(event.target.value); setLimit(50); }}>
+        <option value="all">Все статусы</option>
+        <option value="ready">В поиске</option>
+        <option value="processing">В обработке</option>
+        <option value="failed">С ошибкой</option>
+        <option value="excluded">Исключены</option>
+      </select>
+    </div>
+    <div className="document-filter-summary" role="status">Найдено: {filtered.length} из {documents.length}</div>
     <div className="resource-document-list">
-      {documents.map((document) => {
+      {filtered.slice(0, limit).map((document) => {
         const busy = document.status === "QUEUED" || document.status === "PROCESSING";
         const actionPending = actionId === document.id;
         const excluded = document.status === "READY" && !document.search_enabled;
@@ -308,7 +385,7 @@ function WorkspaceDocumentList({
             </div>
             <div className="resource-document-copy">
               <strong title={title}>
-                {document.source_url ? (
+                {document.source_url && /^https?:\/\//i.test(document.source_url) ? (
                   <a className="document-source-link" href={document.source_url} target="_blank" rel="noreferrer">
                     {title}
                   </a>
@@ -348,7 +425,20 @@ function WorkspaceDocumentList({
           </article>
         );
       })}
+      {filtered.length === 0 && (
+        <div className="resource-empty">
+          <strong>Ничего не найдено</strong>
+          <small>Попробуйте другое название или статус.</small>
+          <button type="button" className="text-button" onClick={() => { setQuery(""); setFilter("all"); setLimit(50); }}>Сбросить фильтры</button>
+        </div>
+      )}
     </div>
+    {filtered.length > limit && (
+      <button type="button" className="chat-history-more" onClick={() => setLimit((current) => current + 50)}>
+        Показать ещё {Math.min(50, filtered.length - limit)} из {filtered.length - limit}
+      </button>
+    )}
+    </>
   );
 }
 
@@ -361,18 +451,18 @@ function citedSources(message: ChatMessage): AnswerSource[] {
   return (message.sources ?? []).filter((source) => citedIndices.has(source.index));
 }
 
-function renderAnswerText(message: ChatMessage): ReactNode[] {
-  return message.content.split(/(\[\d+\])/g).map((part, index) => {
+function renderCitations(message: ChatMessage, content: string, prefix: string): ReactNode[] {
+  return content.split(/(\[\d+\])/g).map((part, index) => {
     const match = part.match(/^\[(\d+)\]$/);
-    if (!match) return <span key={`${message.id}-text-${index}`}>{part}</span>;
+    if (!match) return <span key={`${message.id}-${prefix}-text-${index}`}>{part}</span>;
 
     const sourceIndex = Number(match[1]);
     const exists = message.sources?.some((source) => source.index === sourceIndex);
-    if (!exists) return <span key={`${message.id}-citation-${index}`}>{part}</span>;
+    if (!exists) return <span key={`${message.id}-${prefix}-citation-${index}`}>{part}</span>;
 
     return (
       <a
-        key={`${message.id}-citation-${index}`}
+        key={`${message.id}-${prefix}-citation-${index}`}
         className="inline-citation"
         href={`#${message.id}-source-${sourceIndex}`}
         aria-label={`Перейти к источнику ${sourceIndex}`}
@@ -381,6 +471,28 @@ function renderAnswerText(message: ChatMessage): ReactNode[] {
       </a>
     );
   });
+}
+
+function renderAnswerText(message: ChatMessage): ReactNode[] {
+  const nodes: ReactNode[] = [];
+  // Render fenced code as literal text: citations inside commands are never turned into links.
+  splitFencedCode(message.content).forEach((segment, index) => {
+    if (segment.type === "text") {
+      nodes.push(...renderCitations(message, segment.content, `text-${index}`));
+      return;
+    }
+    const audit = message.metadata?.code_integrity?.blocks.find((block) => block.index === segment.index);
+    nodes.push(
+      <div className="answer-code" key={`${message.id}-code-${segment.index}`}>
+        <div className="answer-code-heading">
+          <span>{segment.language || "Код"} <small>· блок {segment.index}</small></span>
+          {audit && <span className={`answer-code-audit ${audit.status}`}>{audit.status === "exact_match" ? "✓ Совпадает с источником" : "Дословность не подтверждена"}</span>}
+        </div>
+        <pre><code>{segment.content}</code></pre>
+      </div>,
+    );
+  });
+  return nodes;
 }
 
 function newMessageId(prefix: string): string {
@@ -401,6 +513,7 @@ function storedMessageToChat(message: StoredMessage): ChatMessage {
         user_message_id: null,
         parent_message_id: message.parent_message_id,
         model: message.metadata.model,
+        finish_reason: message.metadata.finish_reason,
         generation_temperature: message.metadata.generation_temperature ?? 0,
         query_selection_weight: message.metadata.query_selection_weight ?? 0.3,
         retrieval_mode: message.metadata.retrieval_mode || "hybrid",
@@ -420,6 +533,7 @@ function storedMessageToChat(message: StoredMessage): ChatMessage {
         citation_valid: message.metadata.citation_valid ?? null,
         cited_source_indices: message.metadata.cited_source_indices || [],
         invalid_citations: message.metadata.invalid_citations || [],
+        code_integrity: message.metadata.code_integrity,
         sources: sources || [],
       } satisfies StreamMetadata
     : undefined;
@@ -437,14 +551,20 @@ function storedMessageToChat(message: StoredMessage): ChatMessage {
 
 
 export function App() {
+  const canUseConfluence = useCanUseConfluence();
   const bootstrapped = useRef(false);
   const fileInput = useRef<HTMLInputElement>(null);
+  const attachmentInput = useRef<HTMLInputElement>(null);
   const chatEnd = useRef<HTMLDivElement>(null);
   const activeRequest = useRef<AbortController | null>(null);
+  const workspaceIdRef = useRef("");
+  const conversationLoadId = useRef(0);
+  const pendingDemoLink = useRef(CLEAN_INSTALL ? null : readDemoDeepLink(window.location.search));
 
   const [health, setHealth] = useState("Подключение…");
   const [knowledgeBases, setKnowledgeBases] = useState<KnowledgeBase[]>([]);
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
+  const [workspaceLoading, setWorkspaceLoading] = useState(true);
   const [selectedWorkspaceId, setSelectedWorkspaceId] = useState("");
   const [documents, setDocuments] = useState<DocumentRecord[]>([]);
   const [conversations, setConversations] = useState<ConversationSummary[]>([]);
@@ -457,13 +577,23 @@ export function App() {
   const [dragging, setDragging] = useState(false);
   const [documentActionId, setDocumentActionId] = useState<string | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
-  const [viewMode, setViewMode] = useState<ViewMode>(initialViewMode);
+  const [viewMode, setViewMode] = useState<ViewMode>(() => {
+    const initial = initialViewMode();
+    return initial === "confluence" && !canUseConfluence ? "documents" : initial;
+  });
   const [branchParentId, setBranchParentId] = useState<string | null>(null);
   const [question, setQuestion] = useState("");
+  const [answerMaxTokens, setAnswerMaxTokens] = useState(2048);
   const [streamStage, setStreamStage] = useState<StreamStage>("idle");
   const [error, setError] = useState("");
+  const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
+
+  useEffect(() => {
+    workspaceIdRef.current = selectedWorkspaceId;
+  }, [selectedWorkspaceId]);
 
   const selectViewMode = (mode: ViewMode) => {
+    if (mode === "confluence" && !canUseConfluence) mode = "documents";
     setViewMode(mode);
     window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}#${mode}`);
   };
@@ -527,6 +657,7 @@ export function App() {
     conversationId: string,
     focusAssistantId?: string | null,
   ) => {
+    const loadId = ++conversationLoadId.current;
     if (!workspaceId || !conversationId) {
       setMessages([]);
       setBranchParentId(null);
@@ -538,6 +669,10 @@ export function App() {
         `${API}/api/v1/workspaces/${workspaceId}/conversations/${conversationId}`,
       );
       const detail = await readJson<ConversationDetail>(response);
+      if (loadId !== conversationLoadId.current || workspaceIdRef.current !== workspaceId) return;
+      if (detail.id !== conversationId || detail.workspace_id !== workspaceId) {
+        throw new Error("Диалог не относится к выбранной рабочей области");
+      }
       const mapped = detail.messages.map(storedMessageToChat);
       setMessages(mapped);
       const focused = focusAssistantId
@@ -546,9 +681,10 @@ export function App() {
       const latestAssistant = [...mapped].reverse().find((message) => message.role === "assistant");
       setBranchParentId(focused?.id || latestAssistant?.id || null);
     } catch (reason) {
+      if (loadId !== conversationLoadId.current || workspaceIdRef.current !== workspaceId) return;
       setError(reason instanceof Error ? reason.message : "Не удалось загрузить диалог");
     } finally {
-      setConversationLoading(false);
+      if (loadId === conversationLoadId.current) setConversationLoading(false);
     }
   }, []);
 
@@ -558,8 +694,9 @@ export function App() {
       return [] as ConversationSummary[];
     }
     const response = await fetch(`${API}/api/v1/workspaces/${workspaceId}/conversations`);
-    const items = await readJson<ConversationSummary[]>(response);
-    setConversations(items);
+    const items = (await readJson<ConversationSummary[]>(response))
+      .filter((item) => item.workspace_id === workspaceId);
+    if (workspaceIdRef.current === workspaceId) setConversations(items);
     return items;
   }, []);
 
@@ -570,8 +707,10 @@ export function App() {
     }
     try {
       const response = await fetch(`${API}/api/v1/workspaces/${workspaceId}/documents`);
-      setDocuments(await readJson<DocumentRecord[]>(response));
+      const items = await readJson<DocumentRecord[]>(response);
+      if (workspaceIdRef.current === workspaceId) setDocuments(items);
     } catch (reason) {
+      if (workspaceIdRef.current !== workspaceId) return;
       setError(reason instanceof Error ? reason.message : "Не удалось получить документы");
     }
   }, []);
@@ -607,7 +746,7 @@ export function App() {
         const kbItems = await readJson<KnowledgeBase[]>(kbResponse);
         let workspaceItems = await readJson<Workspace[]>(workspaceResponse);
 
-        if (workspaceItems.length === 0) {
+        if (workspaceItems.length === 0 && !CLEAN_INSTALL) {
           const createResponse = await fetch(`${API}/api/v1/workspaces`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -622,10 +761,18 @@ export function App() {
 
         setKnowledgeBases(kbItems);
         setWorkspaces(workspaceItems);
-        setSelectedWorkspaceId(workspaceItems[0].id);
+        const linkedWorkspace = workspaceItems.find(
+          (item) => item.id === pendingDemoLink.current?.workspaceId,
+        );
+        if (!linkedWorkspace) pendingDemoLink.current = null;
+        const initialWorkspace = linkedWorkspace || workspaceItems[0];
+        workspaceIdRef.current = initialWorkspace?.id || "";
+        setSelectedWorkspaceId(initialWorkspace?.id || "");
       } catch (reason) {
         setHealth("API недоступен");
         setError(reason instanceof Error ? reason.message : "Ошибка запуска интерфейса");
+      } finally {
+        setWorkspaceLoading(false);
       }
     };
 
@@ -647,7 +794,10 @@ export function App() {
       try {
         const items = await refreshConversations(selectedWorkspaceId);
         if (cancelled) return;
-        const targetId = items[0]?.id || "";
+        const targetId = selectInitialConversation(items, selectedWorkspaceId, pendingDemoLink.current);
+        if (pendingDemoLink.current?.workspaceId === selectedWorkspaceId) {
+          pendingDemoLink.current = null;
+        }
         setSelectedConversationId(targetId);
         if (targetId) {
           await loadConversation(selectedWorkspaceId, targetId);
@@ -673,6 +823,13 @@ export function App() {
   useEffect(() => () => activeRequest.current?.abort(), []);
 
   const switchWorkspace = (workspaceId: string) => {
+    // A demonstration link is a one-time initial selection, not a navigation override.
+    pendingDemoLink.current = null;
+    setMobileSidebarOpen(false);
+    workspaceIdRef.current = workspaceId;
+    conversationLoadId.current++;
+    setConversationLoading(false);
+    setDocuments([]);
     activeRequest.current?.abort();
     activeRequest.current = null;
     setStreamStage("idle");
@@ -700,10 +857,15 @@ export function App() {
         },
       );
       const conversation = await readJson<ConversationSummary>(response);
+      if (workspaceIdRef.current !== selectedWorkspaceId) return null;
+      conversationLoadId.current++;
+      setConversationLoading(false);
       setConversations((current) => [conversation, ...current]);
       setSelectedConversationId(conversation.id);
       setMessages([]);
       setBranchParentId(null);
+      selectViewMode("chat");
+      setMobileSidebarOpen(false);
       return conversation;
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "Не удалось создать диалог");
@@ -714,7 +876,10 @@ export function App() {
   };
 
   const switchConversation = async (conversationId: string) => {
-    if (!selectedWorkspaceId || conversationId === selectedConversationId || isStreaming) return;
+    if (!selectedWorkspaceId || isStreaming) return;
+    selectViewMode("chat");
+    setMobileSidebarOpen(false);
+    if (conversationId === selectedConversationId) return;
     activeRequest.current?.abort();
     activeRequest.current = null;
     setStreamStage("idle");
@@ -767,8 +932,7 @@ export function App() {
     return readJson<Workspace>(response);
   };
 
-  const createWorkspace = async () => {
-    const name = window.prompt("Название рабочей области", "Новая рабочая область")?.trim();
+  const createNamedWorkspace = async (name: string) => {
     if (!name || workspaceActionId) return;
 
     setWorkspaceActionId("new");
@@ -777,11 +941,17 @@ export function App() {
       const workspace = await createWorkspaceRecord(name);
       setWorkspaces((current) => [workspace, ...current]);
       switchWorkspace(workspace.id);
+      if (CLEAN_INSTALL && canUseConfluence) selectViewMode("confluence");
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "Не удалось создать workspace");
     } finally {
       setWorkspaceActionId(null);
     }
+  };
+
+  const createWorkspace = async () => {
+    const name = window.prompt("Название рабочей области", "Новая рабочая область")?.trim();
+    if (name) await createNamedWorkspace(name);
   };
 
   const patchWorkspace = async (changes: Record<string, unknown>): Promise<Workspace | null> => {
@@ -826,12 +996,12 @@ export function App() {
       const response = await fetch(`${API}/api/v1/workspaces/${deletingId}`, { method: "DELETE" });
       if (!response.ok) throw new Error(await readError(response));
       let remaining = workspaces.filter((item) => item.id !== deletingId);
-      if (remaining.length === 0) {
+      if (remaining.length === 0 && !CLEAN_INSTALL) {
         const fallback = await createWorkspaceRecord("Мои документы");
         remaining = [fallback];
       }
       setWorkspaces(remaining);
-      switchWorkspace(remaining[0].id);
+      switchWorkspace(remaining[0]?.id || "");
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "Не удалось удалить workspace");
     } finally {
@@ -1002,7 +1172,7 @@ export function App() {
           retrieval_limit: 8,
           source_limit: 5,
           rerank: true,
-          max_tokens: 800,
+          max_tokens: answerMaxTokens,
         }),
       });
 
@@ -1033,8 +1203,11 @@ export function App() {
         }
 
         if (event.event === "error") {
-          const payload = JSON.parse(event.data) as { detail?: string; assistant_message_id?: string | null };
+          const payload = JSON.parse(event.data) as StreamDone & { detail?: string };
           persistedAssistantId = payload.assistant_message_id || null;
+          setMessages((current) => current.map((message) => message.id === assistantId && message.metadata
+            ? { ...message, metadata: { ...message.metadata, ...payload } }
+            : message));
           throw new Error(payload.detail || "Ошибка генерации ответа");
         }
 
@@ -1092,6 +1265,18 @@ export function App() {
         ? "Добавьте документ и дождитесь статуса «Готов»"
         : "Enter — отправить, Shift+Enter — новая строка";
 
+  if (CLEAN_INSTALL && !selectedWorkspace) {
+    return (
+      <div className="app-shell">
+        <header className="topbar">
+          <div className="brand">Скала<span>^р</span><small>RAG</small></div>
+          <div className="status"><i className={health === "API готов" ? "online" : "offline"} />{health}</div>
+        </header>
+        <CleanStart loading={workspaceLoading} error={error} busy={Boolean(workspaceActionId)} onCreate={createNamedWorkspace} />
+      </div>
+    );
+  }
+
   return (
     <div className="app-shell">
       <header className="topbar">
@@ -1099,8 +1284,9 @@ export function App() {
         <nav aria-label="Основная навигация">
           <button className={viewMode === "chat" ? "active" : ""} onClick={() => selectViewMode("chat")}>Чат</button>
           <button className={viewMode === "documents" ? "active" : ""} onClick={() => selectViewMode("documents")}>Документы</button>
-          <button className={viewMode === "confluence" ? "active" : ""} onClick={() => selectViewMode("confluence")}>Confluence</button>
+          {canUseConfluence && <button className={viewMode === "confluence" ? "active" : ""} onClick={() => selectViewMode("confluence")}>Confluence</button>}
           <button className={viewMode === "knowledge" ? "active" : ""} onClick={() => selectViewMode("knowledge")}>Базы знаний</button>
+          <button className={viewMode === "retrieval" ? "active" : ""} onClick={() => selectViewMode("retrieval")}>Разбор поиска</button>
           <button
             className={viewMode === "graph" ? "active" : ""}
             onClick={() => selectViewMode("graph")}
@@ -1112,8 +1298,18 @@ export function App() {
         <div className="status"><i className={health === "API готов" ? "online" : "offline"} />{health}</div>
       </header>
 
-      <div className="workspace">
-        <aside className="sidebar">
+      <button
+        type="button"
+        className="mobile-workspace-toggle"
+        aria-expanded={mobileSidebarOpen}
+        aria-controls="workspace-sidebar"
+        onClick={() => setMobileSidebarOpen((open) => !open)}
+      >
+        <span>{selectedWorkspace?.name || "Рабочая область"}</span>
+        <span>{mobileSidebarOpen ? "Скрыть ↑" : "Область и диалоги ↓"}</span>
+      </button>
+      <div className={`workspace ${mobileSidebarOpen ? "sidebar-open" : ""}`}>
+        <aside className="sidebar" id="workspace-sidebar">
           <section>
             <div className="section-title">
               <h3>Рабочая область</h3>
@@ -1128,6 +1324,7 @@ export function App() {
             <label>Workspace</label>
             <div className="workspace-selector-row">
               <select
+                aria-label="Рабочая область"
                 value={selectedWorkspaceId}
                 onChange={(event) => switchWorkspace(event.target.value)}
                 disabled={Boolean(workspaceActionId) || isStreaming}
@@ -1160,6 +1357,7 @@ export function App() {
 
             <label className="secondary-label">Готовая база знаний</label>
             <select
+              aria-label="Готовая база знаний"
               value={selectedWorkspace?.base_knowledge_base_id ?? ""}
               onChange={updateKnowledgeBase}
               disabled={!selectedWorkspace || Boolean(workspaceActionId)}
@@ -1174,6 +1372,7 @@ export function App() {
 
             <label className="secondary-label">Источники поиска</label>
             <select
+              aria-label="Источники поиска"
               value={selectedWorkspace?.source_mode ?? "USER_DOCUMENTS"}
               onChange={updateSourceMode}
               disabled={!selectedWorkspace || Boolean(workspaceActionId)}
@@ -1206,11 +1405,11 @@ export function App() {
               <span><strong>Документы</strong><small>{uploadedDocuments.length} файлов workspace</small></span>
               <i>›</i>
             </button>
-            <button type="button" onClick={() => selectViewMode("confluence")}>
+            {canUseConfluence && <button type="button" onClick={() => selectViewMode("confluence")}>
               <span className="source-shortcut-icon confluence">C</span>
               <span><strong>Confluence</strong><small>{confluenceDocuments.length} страниц</small></span>
               <i>›</i>
-            </button>
+            </button>}
             <button type="button" onClick={() => selectViewMode("knowledge")}>
               <span className="source-shortcut-icon knowledge">◆</span>
               <span><strong>Базы знаний</strong><small>{knowledgeBases.length} баз</small></span>
@@ -1226,7 +1425,7 @@ export function App() {
                 onClick={() => void createConversation()}
                 disabled={!selectedWorkspaceId || Boolean(conversationActionId) || isStreaming}
               >
-                + Новый
+                {conversationActionId === "new" ? "Создаю…" : "+ Новый"}
               </button>
             </div>
             <div className="chat-history-list">
@@ -1290,10 +1489,20 @@ export function App() {
           </section>
         </aside>
 
-        <main className={`chat ${["documents", "confluence", "knowledge"].includes(viewMode) ? "management-surface" : ""}`}>
-          {error && <div className="error-banner"><span>{error}</span><button onClick={() => setError("")}>×</button></div>}
+        <main className={`chat ${["documents", "confluence", "knowledge", "retrieval"].includes(viewMode) ? "management-surface" : ""}`}>
+          {error && <div className="error-banner" role="alert"><span>{error}</span><button aria-label="Закрыть сообщение об ошибке" onClick={() => setError("")}>×</button></div>}
 
-          {viewMode === "documents" ? (
+          {viewMode === "retrieval" ? (
+            <RetrievalInspector
+              key={`${selectedWorkspaceId}-${selectedWorkspace?.source_mode}-${selectedKnowledgeBase?.active_version_id || ""}`}
+              apiBaseUrl={API}
+              workspaceId={selectedWorkspaceId}
+              workspaceName={selectedWorkspace?.name || "Рабочая область"}
+              hasSearchableContent={hasSearchableContent}
+              initialQuery={question || [...activeBranchMessages].reverse().find((message) => message.role === "user")?.content || ""}
+              onAsk={(query) => { setQuestion(query); selectViewMode("chat"); }}
+            />
+          ) : viewMode === "documents" ? (
             <div className="management-page">
               <header className="management-hero">
                 <div>
@@ -1327,12 +1536,20 @@ export function App() {
                     onDragOver={(event) => { event.preventDefault(); setDragging(true); }}
                     onDragLeave={() => setDragging(false)}
                     onDrop={handleDrop}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter" || event.key === " ") {
+                        event.preventDefault();
+                        if (!uploading) fileInput.current?.click();
+                      }
+                    }}
                     role="button"
+                    aria-label="Выбрать файлы для загрузки"
+                    aria-disabled={uploading}
                     tabIndex={0}
                   >
                     <span className="upload-glyph" aria-hidden="true">⇧</span>
                     <strong>{uploading ? "Загружаю документы…" : "Перетащите файлы или выберите на компьютере"}</strong>
-                    <small>PDF, DOCX, TXT, MD, CSV, JSON, HTML и XML</small>
+                    <small>PDF, DOCX, TXT, MD, CSV, JSON, HTML, XML<br />Изображения: PNG, JPG, WEBP, TIFF</small>
                   </div>
                 </section>
 
@@ -1342,6 +1559,7 @@ export function App() {
                     <span className="counter">{uploadedDocuments.length}</span>
                   </div>
                   <WorkspaceDocumentList
+                    key={`${selectedWorkspaceId}:uploads`}
                     documents={uploadedDocuments}
                     emptyText="Файлов пока нет"
                     actionId={documentActionId}
@@ -1351,13 +1569,13 @@ export function App() {
                 </section>
               </div>
             </div>
-          ) : viewMode === "confluence" ? (
+          ) : viewMode === "confluence" && canUseConfluence ? (
             <div className="management-page confluence-page">
               <header className="management-hero confluence-hero">
                 <div>
                   <span className="eyebrow">Подключённый источник</span>
                   <h1>Confluence</h1>
-                  <p>Синхронизируйте отдельные страницы или целые пространства в выбранный workspace.</p>
+                  <p>Выбирайте страницы из корпоративного Confluence и добавляйте их в поиск workspace.</p>
                 </div>
                 <div className="management-metrics">
                   <span><strong>{confluenceDocuments.length}</strong> страниц</span>
@@ -1367,6 +1585,7 @@ export function App() {
 
               <div className="resource-layout confluence-layout">
                 <ConfluenceImportPanel
+                  key={selectedWorkspaceId}
                   apiBaseUrl={API}
                   workspaceId={selectedWorkspaceId}
                   onImported={async () => {
@@ -1377,10 +1596,11 @@ export function App() {
                 />
                 <section className="resource-card resource-list-card">
                   <div className="resource-card-heading compact">
-                    <div><h2>Синхронизированные страницы</h2><p>Ссылка открывает исходную страницу в Confluence.</p></div>
+                    <div><h2>Импортированные страницы</h2><p>Ссылка открывает исходную страницу в Confluence.</p></div>
                     <span className="counter">{confluenceDocuments.length}</span>
                   </div>
                   <WorkspaceDocumentList
+                    key={`${selectedWorkspaceId}:confluence`}
                     documents={confluenceDocuments}
                     emptyText="Страницы ещё не импортированы"
                     actionId={documentActionId}
@@ -1487,6 +1707,14 @@ export function App() {
                     )}
                   </div>
 
+                  {message.role === "assistant" && (
+                    <CodeIntegrityPanel
+                      audit={message.metadata?.code_integrity}
+                      sources={message.sources || []}
+                      withheld={message.metadata?.abstention_reason === "code_integrity_validation_failed"}
+                    />
+                  )}
+
                   {message.role === "assistant" && message.metadata && (
                     <div className="answer-meta">
                       <span>{message.metadata.retrieval_mode}</span>
@@ -1502,7 +1730,9 @@ export function App() {
                       </span>
                       {message.metadata.abstained && (
                         <span>
-                          {message.metadata.abstention_reason === "insufficient_retrieval_evidence"
+                          {message.metadata.abstention_reason === "code_integrity_validation_failed"
+                            ? "отказ: дословность кода не подтверждена"
+                            : message.metadata.abstention_reason === "insufficient_retrieval_evidence"
                             ? "безопасный отказ: слабые retrieval-доказательства"
                             : "безопасный отказ: контекст не подтверждает ответ"}
                         </span>
@@ -1515,6 +1745,24 @@ export function App() {
                         </span>
                       )}
                     </div>
+                  )}
+
+                  {message.role === "assistant" && message.metadata && (
+                    <details className="answer-evidence">
+                      <summary>Как выбран ответ <span aria-hidden="true">↗</span></summary>
+                      <div>
+                        <p className="evidence-query-label">Запрос к индексу</p>
+                        <p className="evidence-query">{message.metadata.retrieval_query || "Не сохранён для этого ответа"}</p>
+                        <dl>
+                          <div><dt>Кандидаты</dt><dd>{message.metadata.candidate_count}</dd></div>
+                          <div><dt>В контексте</dt><dd>{message.metadata.selected_source_count}</dd></div>
+                          <div><dt>Использовано ссылок</dt><dd>{(message.metadata.cited_source_indices || []).length}</dd></div>
+                          <div><dt>Точные идентификаторы</dt><dd>{message.metadata.matched_anchor_count} / {message.metadata.required_anchor_count}</dd></div>
+                        </dl>
+                        <p className="evidence-scope">Проверка ссылок подтверждает их наличие в выбранных источниках. Проверяйте сами утверждения по приведённым фрагментам.</p>
+                        <button type="button" onClick={() => { setQuestion(message.metadata?.retrieval_query || ""); selectViewMode("retrieval"); }}>Сравнить способы поиска</button>
+                      </div>
+                    </details>
                   )}
 
                   {message.role === "assistant"
@@ -1540,9 +1788,19 @@ export function App() {
                             </summary>
                             <p style={{ whiteSpace: "pre-wrap" }}>{source.excerpt}</p>
                             {source.source_url && /^https?:\/\//i.test(source.source_url) && (
-                              <a href={source.source_url} target="_blank" rel="noopener noreferrer">
-                                Открыть в Confluence{source.source_version ? ` · версия ${source.source_version}` : ""}
-                              </a>
+                              <div className="source-card-footer">
+                                <a className="source-external-link" href={source.source_url} target="_blank" rel="noopener noreferrer">
+                                  <span>Открыть в Confluence</span>
+                                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" aria-hidden="true">
+                                    <path d="M14 3h7v7M21 3l-11 11M10 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-5" />
+                                  </svg>
+                                </a>
+                                {source.source_version && (
+                                  <span className="source-version" title="Версия страницы при импорте; ссылка открывает оригинал в Confluence">
+                                    Версия {source.source_version}
+                                  </span>
+                                )}
+                              </div>
                             )}
                           </details>
                         ))}
@@ -1551,6 +1809,11 @@ export function App() {
                   )}
 
                   {message.status === "stopped" && <div className="message-note">Генерация остановлена</div>}
+                  {message.metadata?.finish_reason === "length" && (
+                    <div className="message-note" role="status">
+                      Ответ достиг лимита токенов и может быть неполным. Попросите продолжить или разбейте вопрос на части.
+                    </div>
+                  )}
                   {message.status === "error" && <div className="message-note error-note">Ответ завершился с ошибкой</div>}
                 </div>
               </article>
@@ -1574,7 +1837,30 @@ export function App() {
               </div>
             )}
             <div className={`composer ${!hasSearchableContent ? "disabled-composer" : ""}`}>
+              <input
+                ref={attachmentInput}
+                type="file"
+                accept={ACCEPTED_FILES}
+                multiple
+                hidden
+                onChange={(event) => {
+                  const files = Array.from(event.currentTarget.files ?? []);
+                  event.currentTarget.value = "";
+                  if (files.length) void uploadFiles(files);
+                }}
+              />
+              <button
+                className="composer-attachment"
+                type="button"
+                disabled={!selectedWorkspaceId || uploading || isStreaming || conversationLoading || selectedWorkspace?.source_mode === "KNOWLEDGE_BASE"}
+                onClick={() => attachmentInput.current?.click()}
+                title={selectedWorkspace?.source_mode === "KNOWLEDGE_BASE" ? "Для вложений выберите режим с документами рабочего пространства" : "Добавить документ или изображение в пространство"}
+                aria-label="Прикрепить документ или изображение"
+              >
+                <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" aria-hidden="true"><path d="m8 12 6-6a3 3 0 0 1 4.2 4.2L9.5 19a5 5 0 0 1-7.1-7.1l10-10" transform="translate(2 1) scale(.9)" /><path d="m8.5 12.5 5-5a1 1 0 0 1 1.4 1.4l-6 6" /></svg>
+              </button>
               <textarea
+                aria-label="Вопрос по источникам"
                 value={question}
                 disabled={!selectedWorkspaceId || !hasSearchableContent || conversationLoading}
                 placeholder={hasSearchableContent ? "Спросите по выбранным источникам…" : "Подключите источник с готовыми документами"}
@@ -1588,7 +1874,19 @@ export function App() {
                 <button onClick={() => void submitQuestion()} disabled={!canSubmit} title="Отправить" aria-label="Отправить вопрос">➤</button>
               )}
             </div>
+            <div className="composer-options">
+              <label>
+                Лимит ответа
+                <select value={answerMaxTokens} disabled={isStreaming} onChange={(event) => setAnswerMaxTokens(Number(event.target.value))}>
+                  <option value={800}>800 токенов</option>
+                  <option value={2048}>2048 токенов</option>
+                  <option value={4096}>4096 токенов</option>
+                </select>
+              </label>
+              <span className="composer-hint">Верхняя граница длины, не требование к объёму ответа</span>
+            </div>
             <div className="composer-hint">{composerHint}</div>
+            <div className="composer-hint composer-attachment-hint">{uploading ? "Загружаем вложения…" : "Вложения сохраняются в документах пространства. Для вопросов по ним дождитесь статуса «Готов»."}</div>
           </div>
           </>
           )}

@@ -14,7 +14,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.access import knowledge_base_for_principal
 from app.core.config import settings
-from app.core.security import Principal, get_current_principal, require_tenant_admin
+from app.core.security import (
+    Principal, get_current_principal, is_password_principal, require_knowledge_base_manager,
+)
 from app.db.models import Document, IngestionJob, KnowledgeBase, KnowledgeBaseVersion, Workspace
 from app.db.session import get_db
 from app.services.knowledge_base_lifecycle import (
@@ -29,10 +31,11 @@ from app.services.object_cleanup import (
 )
 from app.services.queue import ingestion_queue
 from app.services.storage import StorageError, storage
+from app.services.upload_validation import ALLOWED_EXTENSIONS, validated_content_type
+from app.services.upload_quota import check_knowledge_base_quota, check_upload_quota, upload_limit_bytes
 
 router = APIRouter(prefix="/knowledge-bases", tags=["knowledge-bases"])
 
-ALLOWED_EXTENSIONS = {".txt", ".md", ".csv", ".json", ".html", ".htm", ".xml", ".pdf", ".docx"}
 READ_CHUNK_SIZE = 1024 * 1024
 DEFAULT_CHUNKER_VERSION = "docling-hybrid-parent-child-v1"
 
@@ -57,6 +60,10 @@ class KnowledgeBaseVersionCreate(BaseModel):
 
 class KnowledgeBaseDocumentUpdate(BaseModel):
     search_enabled: bool
+
+
+class KnowledgeBaseDocumentUploadError(BaseModel):
+    detail: str
 
 
 class KnowledgeBaseDocumentOut(BaseModel):
@@ -121,16 +128,16 @@ def _normalise_slug(value: str | None, name: str) -> str:
     return slug[:110] or f"kb-{uuid.uuid4().hex[:10]}"
 
 
-async def _hash_and_measure(file: UploadFile) -> tuple[str, int]:
+async def _hash_and_measure(file: UploadFile, max_bytes: int | None = None) -> tuple[str, int]:
     digest = hashlib.sha256()
     total_size = 0
     while chunk := await file.read(READ_CHUNK_SIZE):
         digest.update(chunk)
         total_size += len(chunk)
-        if total_size > settings.upload_max_bytes:
+        if total_size > (max_bytes if max_bytes is not None else settings.upload_max_bytes):
             raise HTTPException(
                 status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-                detail=f"File exceeds the {settings.upload_max_mb} MB upload limit",
+                detail="File exceeds the upload size limit",
             )
     await file.seek(0)
     return digest.hexdigest(), total_size
@@ -260,6 +267,7 @@ async def _lock_editable_version(
 ) -> KnowledgeBaseVersion:
     """Serialize content changes with publication and re-check immutability."""
 
+    await _get_knowledge_base(db, knowledge_base_id, principal)
     locked_base = await db.scalar(
         select(KnowledgeBase.id)
         .where(
@@ -290,11 +298,10 @@ async def list_knowledge_bases(
     db: AsyncSession = Depends(get_db),
     principal: Principal = Depends(get_current_principal),
 ) -> list[KnowledgeBaseOut]:
-    result = await db.execute(
-        select(KnowledgeBase)
-        .where(KnowledgeBase.tenant_id == principal.tenant_id)
-        .order_by(KnowledgeBase.name)
-    )
+    query = select(KnowledgeBase).where(KnowledgeBase.tenant_id == principal.tenant_id)
+    if is_password_principal(principal) and not principal.has_role(settings.auth_admin_role):
+        query = query.where(KnowledgeBase.owner_subject == principal.subject)
+    result = await db.execute(query.order_by(KnowledgeBase.name))
     return [await _knowledge_base_out(db, knowledge_base) for knowledge_base in result.scalars()]
 
 
@@ -304,7 +311,8 @@ async def create_knowledge_base(
     db: AsyncSession = Depends(get_db),
     principal: Principal = Depends(get_current_principal),
 ) -> KnowledgeBaseOut:
-    require_tenant_admin(principal)
+    require_knowledge_base_manager(principal)
+    await check_knowledge_base_quota(db, principal)
     name = payload.name.strip()
     slug = _normalise_slug(payload.slug, name)
     existing = await db.scalar(
@@ -319,6 +327,7 @@ async def create_knowledge_base(
     knowledge_base = KnowledgeBase(
         id=uuid.uuid4(),
         tenant_id=principal.tenant_id,
+        owner_subject=principal.subject,
         slug=slug,
         name=name,
         description=payload.description,
@@ -338,7 +347,7 @@ async def update_knowledge_base(
     db: AsyncSession = Depends(get_db),
     principal: Principal = Depends(get_current_principal),
 ) -> KnowledgeBaseOut:
-    require_tenant_admin(principal)
+    require_knowledge_base_manager(principal)
     knowledge_base = await _get_knowledge_base(db, knowledge_base_id, principal)
     updates = payload.model_dump(exclude_unset=True)
     if "name" in updates and updates["name"] is not None:
@@ -358,7 +367,7 @@ async def delete_knowledge_base(
     db: AsyncSession = Depends(get_db),
     principal: Principal = Depends(get_current_principal),
 ) -> Response:
-    require_tenant_admin(principal)
+    require_knowledge_base_manager(principal)
     await _get_knowledge_base(db, knowledge_base_id, principal)
     knowledge_base = await db.scalar(
         select(KnowledgeBase)
@@ -441,8 +450,9 @@ async def create_knowledge_base_version(
     db: AsyncSession = Depends(get_db),
     principal: Principal = Depends(get_current_principal),
 ) -> KnowledgeBaseVersionOut:
-    require_tenant_admin(principal)
+    require_knowledge_base_manager(principal)
     await _get_knowledge_base(db, knowledge_base_id, principal)
+    await check_knowledge_base_quota(db, principal, knowledge_base_id)
     await db.execute(
         select(KnowledgeBase)
         .where(KnowledgeBase.id == knowledge_base_id)
@@ -488,7 +498,7 @@ async def delete_knowledge_base_version(
     db: AsyncSession = Depends(get_db),
     principal: Principal = Depends(get_current_principal),
 ) -> Response:
-    require_tenant_admin(principal)
+    require_knowledge_base_manager(principal)
     await _get_knowledge_base(db, knowledge_base_id, principal)
     knowledge_base = await db.scalar(
         select(KnowledgeBase)
@@ -538,7 +548,7 @@ async def publish_knowledge_base_version(
     db: AsyncSession = Depends(get_db),
     principal: Principal = Depends(get_current_principal),
 ) -> KnowledgeBaseOut:
-    require_tenant_admin(principal)
+    require_knowledge_base_manager(principal)
     await _get_knowledge_base(db, knowledge_base_id, principal)
     locked = await db.execute(
         select(KnowledgeBase)
@@ -597,6 +607,19 @@ async def list_knowledge_base_documents(
     "/{knowledge_base_id}/versions/{version_id}/documents",
     response_model=KnowledgeBaseDocumentOut,
     status_code=status.HTTP_201_CREATED,
+    responses={
+        code: {"model": KnowledgeBaseDocumentUploadError, "description": description}
+        for code, description in {
+            400: "The uploaded file is empty or has no filename",
+            401: "A valid OIDC bearer token is required when authentication is enabled",
+            403: "The tenant administrator role is required",
+            404: "The knowledge base or version was not found or is not accessible",
+            409: "The version is not editable or the same file content is already present",
+            413: "The file exceeds the configured upload size limit",
+            415: "The filename extension is not supported",
+            503: "Object storage or identity-provider signing keys are unavailable",
+        }.items()
+    },
 )
 async def upload_knowledge_base_document(
     knowledge_base_id: uuid.UUID,
@@ -605,7 +628,7 @@ async def upload_knowledge_base_document(
     db: AsyncSession = Depends(get_db),
     principal: Principal = Depends(get_current_principal),
 ) -> KnowledgeBaseDocumentOut:
-    require_tenant_admin(principal)
+    require_knowledge_base_manager(principal)
     version = await _get_version(db, knowledge_base_id, version_id, principal)
     await _ensure_editable_version(version)
 
@@ -620,9 +643,13 @@ async def upload_knowledge_base_document(
             detail=f"Unsupported file type. Allowed extensions: {allowed}",
         )
 
-    sha256, size = await _hash_and_measure(file)
+    sha256, size = await _hash_and_measure(file, upload_limit_bytes(principal, extension))
     if size == 0:
         raise HTTPException(status_code=400, detail="Uploaded file is empty")
+    header = await file.read(1024)
+    await file.seek(0)
+    content_type = validated_content_type(safe_filename, header, file.content_type)
+    await check_upload_quota(db, principal, None, size, version_id=version.id)
     await db.execute(
         text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
         {"lock_key": f"knowledge-base-upload:{version.id}:{sha256}"},
@@ -642,7 +669,6 @@ async def upload_knowledge_base_document(
         f"knowledge-bases/{knowledge_base_id}/versions/{version_id}/"
         f"documents/{document_id}/{safe_filename}"
     )
-    content_type = file.content_type or "application/octet-stream"
     uploaded = False
     committed = False
 
@@ -674,6 +700,7 @@ async def upload_knowledge_base_document(
             filename=safe_filename,
             object_key=object_key,
             mime_type=content_type,
+            size_bytes=size,
             sha256=sha256,
             status="QUEUED",
             search_enabled=True,
@@ -727,7 +754,7 @@ async def reindex_knowledge_base_document(
     db: AsyncSession = Depends(get_db),
     principal: Principal = Depends(get_current_principal),
 ) -> KnowledgeBaseDocumentOut:
-    require_tenant_admin(principal)
+    require_knowledge_base_manager(principal)
     version = await _lock_editable_version(
         db,
         knowledge_base_id,
@@ -775,7 +802,7 @@ async def update_knowledge_base_document(
     db: AsyncSession = Depends(get_db),
     principal: Principal = Depends(get_current_principal),
 ) -> KnowledgeBaseDocumentOut:
-    require_tenant_admin(principal)
+    require_knowledge_base_manager(principal)
     version = await _lock_editable_version(
         db,
         knowledge_base_id,
@@ -811,7 +838,7 @@ async def delete_knowledge_base_document(
     db: AsyncSession = Depends(get_db),
     principal: Principal = Depends(get_current_principal),
 ) -> Response:
-    require_tenant_admin(principal)
+    require_knowledge_base_manager(principal)
     version = await _lock_editable_version(
         db,
         knowledge_base_id,

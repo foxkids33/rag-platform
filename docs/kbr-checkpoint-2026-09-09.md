@@ -39,7 +39,7 @@
 Команда baseline (из apps/api, после обязательной проверки Python SDK через python-tools):
 
 ```bash
-/home/zakhar/PycharmProjects/rag-platfrom/rag-platform-bootstrap/apps/api/.venv/bin/python -m app.evaluation.runner \
+/path/to/PycharmProjects/rag-platfrom/rag-platform-bootstrap/apps/api/.venv/bin/python -m app.evaluation.runner \
   --workspace-id 328da7b9-10c3-4cbf-a2c5-50146d6fc942 \
   --dataset ../../evaluation/results/kbr.v1.prepared-v2.jsonl \
   --base-url http://127.0.0.1:8000 \
