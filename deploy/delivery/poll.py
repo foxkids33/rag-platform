@@ -25,7 +25,9 @@ def run(*args, output=False, **kwargs):
 
 
 def git(*args):
-    return run("git", "-C", SOURCE, *args, output=True)
+    # STATE is private, but Docker preserves source file permissions when copying
+    # them into non-root application images.
+    return run("git", "-C", SOURCE, *args, output=True, umask=0o022)
 
 
 def save(path, data):
@@ -89,6 +91,18 @@ def build(service, target, live):
             run("docker", "tag", live["old"], base)
         args += ["-f", SOURCE / "deploy/delivery/Dockerfile.web", "--build-arg", f"SITE_WEB_IMAGE={base}"]
     run(*args, directory)
+    checks = {
+        "api": ("python", "-c", "from app.main import app; assert app.routes"),
+        "worker": ("python", "-c", "from app.document_processing import parse_document; "
+                   "assert parse_document('check.txt', b'ready')"),
+        "web": ("sh", "-c", "test -r /usr/share/nginx/html/index.html && "
+                "test -r /usr/share/nginx/html/runtime-config.js"),
+        "connector": ("python", "-c", "from confluence_connector import runner"),
+    }
+    entrypoint, *command = checks[service]
+    run("docker", "run", "--rm", "--network", "none", "--read-only", "--tmpfs", "/tmp",
+        "--user", "10001:10001" if service == "connector" else "1000:1000",
+        "--entrypoint", entrypoint, tag, *command)
     return image(tag)
 
 
