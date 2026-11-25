@@ -182,7 +182,7 @@ def storage_blocks(storage: str, title: str, ancestors: list[str] | None = None)
 
     rendered = children(root)
     blocks: list[ConfluenceBlock] = []
-    headings: list[str] = []
+    headings: list[tuple[int, str]] = []
     breadcrumb_base = [*(ancestors or []), title]
     # Resolve typed code placeholders only after rendering surrounding markup.
     pieces: list[tuple[str, bool]] = []
@@ -202,8 +202,12 @@ def storage_blocks(storage: str, title: str, ancestors: list[str] | None = None)
                 match = re.match(r"^(#{1,6}) (.+)$", value)
                 if match:
                     depth = len(match[1])
-                    headings = headings[:depth - 1] + [match[2]]
-            blocks.append(ConfluenceBlock(value, kind, headings[-1] if headings else title, " > ".join(breadcrumb_base + headings)))
+                    while headings and headings[-1][0] >= depth:
+                        headings.pop()
+                    headings.append((depth, match[2]))
+            labels = [label for _, label in headings]
+            blocks.append(ConfluenceBlock(value, kind, labels[-1] if labels else title,
+                                          " > ".join(breadcrumb_base + labels)))
     if not blocks:
         blocks.append(ConfluenceBlock(title, heading=title, breadcrumb=" > ".join(breadcrumb_base)))
     return blocks, {"warnings": sorted(warnings), "macros": macros, "code_sha256": code_hashes}

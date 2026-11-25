@@ -122,3 +122,14 @@ def test_code_inside_tables_and_lists_stays_atomic(wrapper):
     code = 'curl https://example.test \\\n  --head\n\n  spaces'
     blocks, _ = storage_blocks(wrapper.format(macro(code)), 'Nested')
     assert sum(block.kind == 'code' and code in block.text for block in blocks) == 1
+
+
+def test_heading_paths_follow_html_levels_when_first_or_intermediate_level_is_missing():
+    html = "<h2>Requirements</h2><h4>CPU</h4><h4>Memory</h4><h2>Verification</h2>"
+    blocks, _ = storage_blocks(html, "Setup", ["Guide"])
+    assert [block.breadcrumb for block in blocks] == [
+        "Guide > Setup > Requirements",
+        "Guide > Setup > Requirements > CPU",
+        "Guide > Setup > Requirements > Memory",
+        "Guide > Setup > Verification",
+    ]
