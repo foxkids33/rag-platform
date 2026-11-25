@@ -1,0 +1,19 @@
+[Unit]
+Description=Cisco VPN for the RAG Confluence integration
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+EnvironmentFile=/etc/rag-confluence-vpn.env
+Type=exec
+RuntimeDirectory=rag-confluence-vpn
+RuntimeDirectoryMode=0711
+ExecStart=/usr/bin/python3 /usr/local/libexec/rag-confluence-vpn/host.py
+ExecStop=/usr/bin/python3 /usr/local/libexec/rag-confluence-vpn/host.py stop
+Restart=on-failure
+RestartSec=12
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

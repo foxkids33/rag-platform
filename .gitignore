@@ -48,3 +48,8 @@ apps/web/public/presentation-offline.zip
 *.key
 *.p12
 *.pfx
+
+# Site overrides and connector credentials
+/deploy/docker-compose.secure.json
+credential*.json
+.env.connector*

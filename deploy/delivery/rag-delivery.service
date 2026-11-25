@@ -1,0 +1,14 @@
+[Unit]
+Description=Publish a tested RAG revision
+After=docker.service network-online.target
+Requires=docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/rag-delivery/site.env
+StateDirectory=rag-delivery
+StateDirectoryMode=0700
+UMask=0077
+ExecStart=/usr/bin/python3 /usr/local/libexec/rag-delivery/poll.py
+TimeoutStartSec=45min

@@ -15,7 +15,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.access import knowledge_base_for_principal
 from app.core.config import settings
 from app.core.security import (
-    Principal, get_current_principal, is_password_principal, require_knowledge_base_manager,
+    Principal,
+    get_current_principal,
+    is_password_principal,
+    require_knowledge_base_manager,
 )
 from app.db.models import Document, IngestionJob, KnowledgeBase, KnowledgeBaseVersion, Workspace
 from app.db.session import get_db
@@ -31,8 +34,12 @@ from app.services.object_cleanup import (
 )
 from app.services.queue import ingestion_queue
 from app.services.storage import StorageError, storage
+from app.services.upload_quota import (
+    check_knowledge_base_quota,
+    check_upload_quota,
+    upload_limit_bytes,
+)
 from app.services.upload_validation import ALLOWED_EXTENSIONS, validated_content_type
-from app.services.upload_quota import check_knowledge_base_quota, check_upload_quota, upload_limit_bytes
 
 router = APIRouter(prefix="/knowledge-bases", tags=["knowledge-bases"])
 

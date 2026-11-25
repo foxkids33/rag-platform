@@ -23,8 +23,8 @@ from app.services.object_cleanup import (
 )
 from app.services.queue import ingestion_queue
 from app.services.storage import StorageError, storage
-from app.services.upload_validation import ALLOWED_EXTENSIONS, validated_content_type
 from app.services.upload_quota import check_upload_quota, upload_limit_bytes
+from app.services.upload_validation import ALLOWED_EXTENSIONS, validated_content_type
 
 router = APIRouter(prefix="/workspaces/{workspace_id}/documents", tags=["documents"])
 

@@ -3,18 +3,18 @@ from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
-from pydantic import ValidationError
 from fastapi import HTTPException
+from pydantic import ValidationError
 
 from app.api.routes.connectors import (
-    ConnectorHeartbeat,
     ConnectorEnrollRequest,
+    ConnectorHeartbeat,
     EnrollmentCreate,
-    SpacePagesOperationRequest,
     ImportOperationRequest,
     PageNode,
-    _validate_lease,
+    SpacePagesOperationRequest,
     _progress_deadline,
+    _validate_lease,
 )
 from app.core.config import settings
 from app.services.connector_queue import issue_bound_token, token_connector_id, token_matches
