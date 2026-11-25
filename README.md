@@ -1,65 +1,20 @@
 # RAG Platform
 
-Новый RAG-проект, который объединяет удобный UI текущей системы с более быстрым и точным retrieval-пайплайном.
+Приложение отвечает на вопросы по загруженным документам и страницам Confluence. Пользователь выбирает рабочую область, импортирует материалы и видит источники ответа.
 
-## Целевые пользовательские режимы
+## Запуск и разработка
 
-1. Работа с готовой базой знаний.
-2. Готовая база знаний + документы текущего workspace.
-3. Только пользовательские документы без базовой базы знаний.
+Для отдельного экземпляра с собственной БД и хранилищем используйте [чистую установку](CLEAN_INSTALL.md). Для локальной разработки с Docker выполните `cp .env.example .env` и `make dev`. Шаблоны содержат адреса для примера. Переменные действующего стенда хранятся на сервере.
 
-Во всех случаях запрос выполняется через одну модель `Workspace`: workspace может ссылаться на базовую KB и одновременно содержать собственные документы.
+| Задача | Где искать |
+| --- | --- |
+| API, права доступа и очередь импорта | [FastAPI](apps/api/app) |
+| Выбор парсера, границы чанков и индексация | [Как обрабатывается документ](docs/document-ingestion.md) |
+| Канал связи между RAG и Confluence | [Исходящий коннектор](docs/confluence-connector.md) · [серверный VPN](deploy/confluence-vpn/README.md) |
+| Веб-интерфейс | [React](apps/web/src) |
+| Поиск и сборка контекста для ответа | [Поиск](apps/api/app/api/routes/search.py) · [контекст](apps/api/app/services/context_builder.py) |
+| Работа через GitHub и выпуск на сервер | [Разработка и доставка](docs/delivery.md) |
 
-## Архитектура первого этапа
+Оригиналы документов хранятся в MinIO. PostgreSQL хранит задания, текст фрагментов, их векторы pgvector и полнотекстовый индекс. Redis будит воркер при поступлении задания. Для поиска используются модели эмбеддингов, для ответа — настроенная LLM.
 
-- `apps/api` — FastAPI API и orchestration.
-- `apps/worker` — ingestion jobs (пока skeleton).
-- `apps/web` — React/Vite UI в стиле существующего production UI.
-- PostgreSQL + pgvector — метаданные, chunks, dense vectors, full-text index.
-- Redis — очередь/координация фоновых задач.
-- MinIO — оригинальные документы.
-- Внешние сервисы — внутренний vLLM, embeddings и reranker endpoints.
-
-## Запуск локально
-
-```bash
-cp .env.example .env
-docker compose -f deploy/docker-compose.local.yml up --build
-```
-
-После запуска:
-
-- UI: `http://localhost:5173`
-- API: `http://localhost:8000`
-- API health: `http://localhost:8000/api/v1/health`
-- MinIO console: `http://localhost:9001`
-
-## Разработка без Docker
-
-API:
-
-```bash
-cd apps/api
-uv sync
-uv run uvicorn app.main:app --reload
-```
-
-UI:
-
-```bash
-cd apps/web
-npm install
-npm run dev
-```
-
-## Ближайшие этапы
-
-1. Поднять инфраструктуру и применить миграции.
-2. Реализовать CRUD knowledge bases и workspaces.
-3. Добавить upload + ingestion worker.
-4. Добавить Docling и hierarchical parent/child chunking.
-5. Добавить embeddings + pgvector HNSW.
-6. Добавить PostgreSQL FTS + RRF + cross-encoder reranking.
-7. Подключить внутренний vLLM и SSE streaming.
-8. Добавить историю диалога.
-9. Перенести граф исследования и добавить настоящий knowledge graph.
+В рабочей интеграции кнопка показа пространств обращается к Confluence через зарегистрированный коннектор. Импорт выбранных страниц создаёт документы в рабочей области RAG и запускает индексацию. Доступные пространства определяются правами учётной записи коннектора и его списком разрешённых пространств. Права сотрудников в Confluence учитывайте при выборе общей базы для команды.

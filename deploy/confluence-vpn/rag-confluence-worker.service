@@ -1,0 +1,17 @@
+[Unit]
+Description=RAG Confluence connector and private TLS transport
+BindsTo=rag-confluence-vpn.service
+After=rag-confluence-vpn.service docker.service
+PartOf=rag-confluence-vpn.service
+
+[Service]
+EnvironmentFile=/etc/rag-confluence-vpn.env
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/libexec/rag-confluence-vpn/workers.py
+ExecStop=/usr/bin/docker compose -f /usr/local/libexec/rag-confluence-vpn/worker.compose.yaml down --timeout 8
+Restart=always
+RestartSec=12
+TimeoutStopSec=35
+
+[Install]
+WantedBy=rag-confluence-vpn.service

@@ -1,0 +1,46 @@
+name: rag-confluence-connector
+services:
+  connector:
+    image: ${RAG_CONNECTOR_IMAGE:-rag-confluence-connector:local}
+    container_name: rag-confluence-worker
+    environment:
+      RAG_CONFLUENCE_HOST: ${RAG_CONFLUENCE_HOST:?Set the Confluence hostname}
+    network_mode: container:rag-confluence-vpn
+    user: "10001:10001"
+    read_only: true
+    init: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 256m
+    pids_limit: 100
+    volumes:
+      - /var/lib/rag-confluence-connector:/data:ro,Z
+      - /run/rag-confluence-vpn/connector-resolv.conf:/etc/resolv.conf:ro,z
+      - /usr/local/libexec/rag-confluence-vpn:/opt/rag-vpn:ro,z
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=32m
+    entrypoint: ["python", "/opt/rag-vpn/worker.py"]
+    logging:
+      driver: local
+      options: {max-size: "2m", max-file: "2"}
+  transport:
+    image: ${RAG_VPN_IMAGE:-rag-confluence-vpn:local}
+    container_name: rag-confluence-transport
+    environment:
+      RAG_CONFLUENCE_HOST: ${RAG_CONFLUENCE_HOST:?Set the Confluence hostname}
+    network_mode: container:rag-confluence-vpn
+    user: "1000:1000"
+    read_only: true
+    init: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 128m
+    pids_limit: 70
+    volumes:
+      - /var/lib/rag-confluence-transport:/transport:rw,z
+      - /run/rag-confluence-vpn/connector-resolv.conf:/etc/resolv.conf:ro,z
+      - /usr/local/libexec/rag-confluence-vpn:/opt/rag-vpn:ro,z
+    entrypoint: ["/usr/bin/python3", "/opt/rag-vpn/transport.py"]
+    logging:
+      driver: local
+      options: {max-size: "1m", max-file: "2"}

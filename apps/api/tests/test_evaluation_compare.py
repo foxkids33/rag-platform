@@ -1,0 +1,100 @@
+from __future__ import annotations
+
+from app.evaluation.compare import compare_reports
+
+
+def _report(*, recall_at_5: float, p95_ms: float) -> dict:
+    return {
+        "aggregate": {
+            "retrieval": {"recall_at_5": recall_at_5},
+            "answer": {},
+        },
+        "latency": {"search": {"p95_ms": p95_ms}, "answer": {}},
+    }
+
+
+def test_compare_reports_accepts_small_regression() -> None:
+    result = compare_reports(
+        _report(recall_at_5=0.89, p95_ms=110),
+        baseline=_report(recall_at_5=0.90, p95_ms=100),
+    )
+
+    assert result["passed"] is True
+
+
+def test_compare_reports_checks_verbatim_code_and_order():
+    baseline = {"aggregate": {"answer": {"code_block_coverage": 1.0, "code_order_accuracy": 1.0}}}
+    candidate = {"aggregate": {"answer": {"code_block_coverage": 0.8, "code_order_accuracy": 0.7}}}
+    result = compare_reports(candidate, baseline=baseline)
+    assert result["passed"] is False
+    assert result["failed_check_count"] == 2
+
+
+def test_compare_reports_rejects_quality_and_gate_regression() -> None:
+    result = compare_reports(
+        _report(recall_at_5=0.80, p95_ms=150),
+        baseline=_report(recall_at_5=0.90, p95_ms=100),
+        gates={"minimum": {"aggregate.retrieval.recall_at_5": 0.9}},
+    )
+
+    assert result["passed"] is False
+    assert result["failed_check_count"] == 3
+
+
+def test_compare_reports_checks_cited_gold_document_coverage() -> None:
+    baseline = _report(recall_at_5=0.90, p95_ms=100)
+    candidate = _report(recall_at_5=0.90, p95_ms=100)
+    baseline["aggregate"]["answer"]["citation_source_coverage"] = 0.8
+    candidate["aggregate"]["answer"]["citation_source_coverage"] = 0.6
+
+    result = compare_reports(candidate, baseline=baseline)
+
+    assert result["passed"] is False
+    assert any(
+        check["path"] == "aggregate.answer.citation_source_coverage"
+        and check["passed"] is False
+        for check in result["checks"]
+    )
+
+
+def test_compare_reports_checks_gold_context_fact_coverage() -> None:
+    baseline = _report(recall_at_5=0.90, p95_ms=100)
+    candidate = _report(recall_at_5=0.90, p95_ms=100)
+    baseline["aggregate"]["answer"]["gold_context_fact_coverage"] = 0.8
+    candidate["aggregate"]["answer"]["gold_context_fact_coverage"] = 0.6
+
+    result = compare_reports(candidate, baseline=baseline)
+
+    assert result["passed"] is False
+    assert any(
+        check["path"] == "aggregate.answer.gold_context_fact_coverage"
+        and check["passed"] is False
+        for check in result["checks"]
+    )
+
+
+def test_compare_reports_enforces_configuration_and_case_count() -> None:
+    candidate = _report(recall_at_5=0.90, p95_ms=100)
+    candidate.update(
+        {
+            "aggregate": {
+                **candidate["aggregate"],
+                "case_count": 24,
+            },
+            "configuration": {"rerank": False, "answers": True},
+        }
+    )
+
+    result = compare_reports(
+        candidate,
+        gates={
+            "equals": {
+                "aggregate.case_count": 24,
+                "configuration.rerank": False,
+                "configuration.answers": True,
+            }
+        },
+    )
+
+    assert result["passed"] is True
+    assert result["check_count"] == 3

@@ -1,0 +1,138 @@
+# Dedicated empty-data install; configure only through compose-clean.sh --env-file.
+name: ${COMPOSE_PROJECT_NAME:?A unique clean project name is required}
+
+x-application: &application
+  APP_ENV: server
+  WEB_ORIGIN: ${WEB_ORIGIN:-}
+  DATABASE_URL: postgresql+asyncpg://rag:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/rag
+  REDIS_URL: redis://redis:6379/0
+  MINIO_ENDPOINT: minio:9000
+  MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:?MINIO_ACCESS_KEY is required}
+  MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:?MINIO_SECRET_KEY is required}
+  MINIO_BUCKET: rag-documents
+  MINIO_SECURE: "false"
+  VLLM_BASE_URL: ${VLLM_BASE_URL:-}
+  VLLM_MODEL: ${VLLM_MODEL:-}
+  VLLM_API_KEY: ${VLLM_API_KEY:-}
+  EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL:-}
+  EMBEDDING_MODEL: ${EMBEDDING_MODEL:-}
+  EMBEDDING_DIM: ${EMBEDDING_DIM:-}
+  RERANK_ENABLED: "false"
+  CONFLUENCE_ENABLED: "true"
+  CONFLUENCE_CONNECTION_MODE: direct
+  CONFLUENCE_CONNECTOR_ENABLED: "false"
+  CONFLUENCE_BASE_URL: ${CONFLUENCE_BASE_URL:-}
+  CONFLUENCE_DEPLOYMENT: ${CONFLUENCE_DEPLOYMENT:-data_center}
+  CONFLUENCE_AUTH_MODE: ${CONFLUENCE_AUTH_MODE:-bearer}
+  CONFLUENCE_ALLOWED_SPACES: ${CONFLUENCE_ALLOWED_SPACES:-}
+  CONFLUENCE_VERIFY_SSL: "true"
+  CONFLUENCE_EMAIL: ${CONFLUENCE_EMAIL:-}
+  CONFLUENCE_API_TOKEN: ${CONFLUENCE_API_TOKEN:-}
+  CONFLUENCE_ACCESS_TOKEN: ${CONFLUENCE_ACCESS_TOKEN:-}
+  AUTH_ENABLED: ${AUTH_ENABLED:?Choose pilot or OIDC explicitly}
+  AUTH_ALLOW_UNAUTHENTICATED_PILOT: ${AUTH_ALLOW_UNAUTHENTICATED_PILOT:-false}
+  AUTH_LOCAL_SUBJECT: clean-user
+  AUTH_LOCAL_TENANT: ${COMPOSE_PROJECT_NAME}
+  OIDC_ISSUER: ${OIDC_ISSUER:-}
+  OIDC_AUDIENCE: ${OIDC_AUDIENCE:-}
+  OIDC_JWKS_URL: ${OIDC_JWKS_URL:-}
+  OIDC_ALGORITHM: ${OIDC_ALGORITHM:-RS256}
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_DB: rag
+      POSTGRES_USER: rag
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: [CMD, pg_isready, -U, rag, -d, rag]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+  redis:
+    image: redis:8-alpine
+    command: [redis-server, --appendonly, "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: [CMD, redis-cli, ping]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+  minio:
+    build:
+      context: ../apps/object_store
+      dockerfile: Dockerfile.clean
+      target: production-clean
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY}
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: [CMD, wget, --quiet, --spider, "http://127.0.0.1:9000/minio/health/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    restart: unless-stopped
+  api:
+    build:
+      context: ../apps/api
+      dockerfile: Dockerfile.clean
+      target: production-clean
+    environment:
+      <<: *application
+      EMBEDDING_SCHEMA_INITIALIZATION_ALLOWED: "true"
+    # Dimension changes refuse an existing nonempty vector table.
+    command: [sh, -c, "alembic upgrade head && python -m app.operations.initialize_embedding_schema --dimension $${EMBEDDING_DIM} --require-empty && uvicorn app.main:app --host 0.0.0.0 --port 8000"]
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+      minio: {condition: service_healthy}
+    healthcheck:
+      test: [CMD, /app/.venv/bin/python, -c, "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health', timeout=5)"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    restart: unless-stopped
+  worker:
+    build:
+      context: ../apps/worker
+      dockerfile: Dockerfile.clean
+      target: production-clean
+    environment: *application
+    depends_on:
+      api: {condition: service_healthy}
+    restart: unless-stopped
+  web:
+    build:
+      context: ../apps/web
+      target: production-clean
+      args:
+        VITE_API_BASE_URL: ""
+    environment:
+      AUTH_ENABLED: ${AUTH_ENABLED}
+      OIDC_ISSUER: ${OIDC_ISSUER:-}
+      OIDC_CLIENT_ID: ${OIDC_CLIENT_ID:-}
+      OIDC_SCOPES: ${OIDC_SCOPES:-openid profile email}
+      OIDC_REDIRECT_URI: ${OIDC_REDIRECT_URI:-}
+      OIDC_POST_LOGOUT_REDIRECT_URI: ${OIDC_POST_LOGOUT_REDIRECT_URI:-}
+    ports:
+      - "${RAG_BIND_HOST:-127.0.0.1}:${RAG_WEB_HOST_PORT:-18573}:80"
+    depends_on:
+      api: {condition: service_healthy}
+    restart: unless-stopped
+
+# No external/name overrides: project-scoped volumes are dedicated to this install.
+volumes:
+  postgres_data:
+  redis_data:
+  minio_data:

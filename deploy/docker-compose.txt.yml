@@ -1,0 +1,5 @@
+services:
+  worker:
+    build:
+      args:
+        WORKER_INSTALL_DOCLING: "false"

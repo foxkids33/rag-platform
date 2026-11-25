@@ -1,0 +1,7 @@
+# Retain the reviewed runtime dependencies of the existing deployment. Do not
+# install unrelated packages from the developer's dirty dependency workspace.
+ARG API_BASE_IMAGE
+FROM ${API_BASE_IMAGE}
+COPY apps/api/app /app/app
+COPY apps/api/alembic /app/alembic
+COPY apps/api/alembic.ini /app/alembic.ini

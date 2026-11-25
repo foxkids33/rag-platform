@@ -8,7 +8,9 @@ dependencies = [
   "asyncpg>=0.30,<1",
   "fastapi>=0.115,<1",
   "httpx>=0.28,<1",
+  "minio>=7.2,<8",
   "pgvector>=0.4,<1",
+  "pyjwt[crypto]>=2.10,<3",
   "pydantic-settings>=2.7,<3",
   "python-multipart>=0.0.20,<1",
   "redis>=5.2,<7",
@@ -30,3 +32,7 @@ testpaths = ["tests"]
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+
+[tool.ruff.lint]
+# FastAPI intentionally declares Depends()/File() calls as endpoint defaults.
+ignore = ["B008"]

@@ -1,6 +1,7 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 
 from app.core.config import settings
+from app.core.security import Principal, get_current_principal
 
 router = APIRouter(tags=["system"])
 
@@ -11,18 +12,30 @@ async def health() -> dict:
 
 
 @router.get("/system/info")
-async def system_info() -> dict:
+async def system_info(
+    _principal: Principal = Depends(get_current_principal),
+) -> dict:
     return {
         "service": settings.app_name,
         "environment": settings.app_env,
+        "authentication": {
+            "enabled": settings.auth_enabled,
+            "mode": "oidc" if settings.auth_enabled else "local",
+        },
         "embedding_model": settings.embedding_model,
         "embedding_dimension": settings.embedding_dim,
+        # The provider's configured API model ID may be a serving alias.
+        "generation_model": settings.vllm_model,
         "rerank_model": settings.rerank_model,
         "features": {
             "knowledge_bases": True,
             "workspace_overlay": True,
             "user_documents_only": True,
-            "hybrid_retrieval": "planned",
+            "hybrid_retrieval": True,
+            "code_integrity": True,
+            "reranking": settings.rerank_enabled,
+            "advanced_search": False,
+            "conversation_graph": True,
             "knowledge_graph": "planned",
         },
     }

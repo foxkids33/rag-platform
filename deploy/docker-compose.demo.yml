@@ -1,0 +1,143 @@
+name: rag-zmostovoy
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: rag
+      POSTGRES_USER: rag
+      POSTGRES_PASSWORD: ${DEMO_POSTGRES_PASSWORD:?Run setup-demo-env.sh}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rag -d rag"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    restart: unless-stopped
+
+  redis:
+    image: redis:7
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  minio:
+    image: chainguard/minio@sha256:6a1d0b45c8669726bba580ced0bfa4cb9fdeed1ed636dfabd81d1577beb6937b
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: rag-demo
+      MINIO_ROOT_PASSWORD: ${DEMO_MINIO_PASSWORD:?Run setup-demo-env.sh}
+    volumes:
+      - minio_data:/data
+    restart: unless-stopped
+
+  embedding:
+    build:
+      context: ../apps/embedding
+      dockerfile: Dockerfile.bge
+      args:
+        PYTORCH_IMAGE: ${DEMO_GPU_IMAGE:-vllm/vllm-openai:v0.30.0}
+        PYTHON_EXECUTABLE: /usr/bin/python3
+    # The existing vLLM image supplies CUDA/Torch, but its server entrypoint
+    # must not run in this independent embedding container.
+    entrypoint: []
+    command: ["/usr/bin/python3", "-m", "uvicorn", "app.bge_main:app", "--host", "0.0.0.0", "--port", "8080"]
+    environment:
+      EMBEDDING_MODEL: BAAI/bge-m3
+      EMBEDDING_NATIVE_DIM: 1024
+      EMBEDDING_DIM: 1024
+      EMBEDDING_CONTEXT_TOKENS: 1024
+      EMBEDDING_BATCH_SIZE: 4
+      EMBEDDING_MAX_CONCURRENCY: 1
+      EMBEDDING_DEVICE: cuda:0
+      EMBEDDING_USE_FP16: "true"
+      HF_HOME: /models
+    volumes:
+      - embedding_models:/models
+    healthcheck:
+      test: ["CMD", "/usr/bin/python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health/ready', timeout=5)"]
+      interval: 10s
+      timeout: 10s
+      start_period: 600s
+      retries: 60
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${DEMO_GPU_DEVICE_ID:-0}"]
+              capabilities: [gpu]
+    restart: unless-stopped
+
+  api:
+    build:
+      context: ../apps/api
+    env_file:
+      - ../.env.demo
+    environment:
+      DATABASE_URL: postgresql+asyncpg://rag:${DEMO_POSTGRES_PASSWORD}@postgres:5432/rag
+      MINIO_SECRET_KEY: ${DEMO_MINIO_PASSWORD}
+    volumes:
+      - ../.storage/confluence/KBR:/snapshots/kbr:ro,z
+    command: ["sh", "-c", "alembic upgrade head && /app/.venv/bin/python -m app.operations.initialize_embedding_schema --dimension 1024 --require-empty && /app/.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_started
+      embedding:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/.venv/bin/python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health', timeout=5)"]
+      interval: 5s
+      timeout: 5s
+      start_period: 60s
+      retries: 30
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: ../apps/worker
+      args:
+        WORKER_INSTALL_DOCLING: "false"
+    env_file:
+      - ../.env.demo
+    environment:
+      DATABASE_URL: postgresql+asyncpg://rag:${DEMO_POSTGRES_PASSWORD}@postgres:5432/rag
+      MINIO_SECRET_KEY: ${DEMO_MINIO_PASSWORD}
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+  web:
+    build:
+      context: ../apps/web
+      target: production
+      args:
+        VITE_API_BASE_URL: ""
+    environment:
+      AUTH_ENABLED: "false"
+    volumes:
+      - ../.storage/presentation-current:/usr/share/nginx/html/presentation/current:ro
+    ports:
+      - "${DEMO_BIND_HOST:-192.0.2.122}:${DEMO_WEB_PORT:-15173}:80"
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:
+  minio_data:
+  embedding_models:

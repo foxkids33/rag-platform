@@ -14,6 +14,8 @@ dist/
 # Environment
 .env
 .env.*
+*.env
+deploy/bge-m3.env
 !.env.example
 
 # IDE / OS
@@ -23,3 +25,31 @@ dist/
 
 # Local data
 .storage/
+evaluation/results/
+
+# Patch hand-off artifacts
+/*.patch
+
+# Local diagnostics and generated publication artifacts
+diagnostics/
+.playwright-mcp/
+docs/presentation/artifacts/
+apps/web/public/presentation/
+apps/web/public/presentation-offline.zip
+*.log
+*.har
+*.pdf
+*.zip
+*.sqlite
+*.sqlite3
+*.db
+*.dump
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Site overrides and connector credentials
+/deploy/docker-compose.secure.json
+credential*.json
+.env.connector*

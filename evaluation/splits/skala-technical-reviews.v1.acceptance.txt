@@ -1,0 +1,26 @@
+# Operational holdout: 24 cases (25%) stratified by question type and source.
+# The v1 cases have already been evaluated, so this is not a truly blind set.
+g-fact-04
+h-fact-03
+kkh-fact-02
+s-fact-04
+t-fact-03
+o-fact-04
+mdio-fact-03
+mdiv-fact-02
+g-exact-02
+kkh-exact-01
+t-exact-02
+mdio-exact-01
+h-arch-02
+s-arch-01
+o-arch-01
+mdiv-arch-02
+disamb-03
+disamb-09
+disamb-12
+multi-02
+multi-08
+no-answer-03
+no-answer-08
+no-answer-11

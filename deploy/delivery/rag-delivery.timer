@@ -1,0 +1,11 @@
+[Unit]
+Description=Check for tested RAG releases
+
+[Timer]
+OnBootSec=1min
+OnUnitInactiveSec=2min
+AccuracySec=10s
+Unit=rag-delivery.service
+
+[Install]
+WantedBy=timers.target

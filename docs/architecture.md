@@ -4,52 +4,102 @@
 
 Every user operation happens inside a workspace.
 
-A workspace may have:
+A workspace stores an explicit source mode:
 
-- `base_knowledge_base_id = null`: user documents only;
-- `base_knowledge_base_id = <uuid>`: predefined knowledge base;
-- any number of workspace-owned documents layered over the base knowledge base.
+- `USER_DOCUMENTS`: workspace-owned documents only;
+- `KNOWLEDGE_BASE`: the active immutable version of the selected knowledge base only;
+- `HYBRID`: both layers enter the same dense/lexical/RRF/reranker pipeline.
 
-The effective retrieval scope is therefore:
+`base_knowledge_base_id` selects the predefined knowledge base. Only its
+`active_version_id` is eligible for retrieval; older and staging versions remain
+isolated. Every returned source carries provenance identifying either the workspace
+document or the knowledge-base name and version.
 
-```text
-active version of selected knowledge base
-OR
-workspace-owned documents
-```
-
-## Planned online RAG path
+## Online RAG path
 
 ```text
 question
   -> optional conversation-aware rewrite
   -> dense retrieval (pgvector)
   -> lexical retrieval (PostgreSQL FTS)
+  -> punctuation-tolerant exact identifier retrieval
   -> RRF fusion
-  -> deterministic exact/domain-term boosts
   -> cross-encoder reranker
   -> parent/neighbor expansion
   -> context packing
   -> vLLM generation
-  -> citations + SSE
+  -> citation audit
+  -> validated JSON or buffered SSE
 ```
 
 The default fast path has no mandatory planner LLM call before retrieval.
 
-## Planned ingestion path
+## Ingestion path
 
 ```text
 upload/import
   -> object storage
-  -> ingestion job
+  -> durable PostgreSQL ingestion job (Redis wake-up is best effort)
+  -> lease, heartbeat and stale-job recovery
   -> parser (Docling where appropriate)
   -> hierarchical parent/child chunking
   -> SHA-256 deduplication
   -> embeddings
   -> PostgreSQL + pgvector
+  -> durable object-deletion outbox
   -> optional graph extraction
 ```
 
 ## Knowledge base versioning
 
 A knowledge base points to one active immutable version. New versions are indexed independently and activated only after successful completion, providing an alias-switching equivalent for PostgreSQL.
+
+## Knowledge-base publication lifecycle
+
+```text
+DRAFT
+  -> INDEXING
+  -> READY
+  -> ACTIVE
+  -> ARCHIVED
+       -> ACTIVE  (explicit rollback)
+```
+
+Documents are uploaded and indexed inside an isolated version. `ACTIVE` and
+`ARCHIVED` versions are immutable: content changes require a new draft. Publishing
+updates `knowledge_bases.active_version_id` in one database transaction, so
+workspaces never observe a partially indexed version.
+
+## Two graph features in the product plan
+
+The project intentionally keeps two different graph concepts separate:
+
+1. **Conversation explorer** — a visual canvas of question/answer cards. A user can
+   branch from any previous answer, drag cards, follow arrows and inspect a minimap.
+   This is a UI and conversation-navigation feature; it does not require Neo4j.
+2. **Semantic knowledge graph** — entities and relations extracted from a specific
+   immutable knowledge-base version and stored in Neo4j. It becomes an additional
+   retrieval signal for multi-hop and relationship questions.
+
+The conversation explorer can be delivered first. Semantic graph extraction is
+version-bound and is enabled only after the knowledge-base publication lifecycle is
+stable.
+
+## Conversation graph
+
+Chat messages form a persisted directed tree through `parent_message_id`. A user can
+select any assistant answer as the parent of the next question. Follow-up rewriting
+and answer history then use only that node's ancestor chain, preventing facts from
+unrelated branches from leaking into the current prompt. The UI provides an
+auto-layout canvas with arrows, pan/zoom controls and a minimap.
+
+## Remaining roadmap
+
+```text
+Confluence page/group ACL propagation
+  -> Neo4j entity/relation extraction per KB version
+  -> GraphRAG + deep query planning
+  -> semantic answer verification
+  -> Langfuse traces, metrics and feedback
+  -> frontend OIDC login flow and broader production hardening
+```

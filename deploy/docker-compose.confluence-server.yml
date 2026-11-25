@@ -1,0 +1,72 @@
+# Separate, outbound-only service. Does not modify/restart the RAG stack.
+# Configure through deploy/confluence-server.env.example; never use a personal PAT.
+name: rag-zmostovoy-confluence
+
+services:
+  connector:
+    build:
+      context: ../apps/confluence_connector
+      dockerfile: Dockerfile
+    image: rag-zmostovoy-confluence-connector:server
+    init: true
+    user: "10001:10001"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges=true"]
+    pids_limit: 64
+    mem_limit: 512m
+    cpus: 0.5
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=16m,mode=1777
+    restart: unless-stopped
+    environment:
+      RAG_URL: ${SERVER_CONNECTOR_RAG_URL:?An HTTPS RAG URL is required}
+      RAG_VERIFY_SSL: "true"
+      RAG_ALLOW_INSECURE_HTTP: "false"
+      RAG_CA_FILE: /run/certs/rag-ca.pem
+      RAG_CREDENTIAL_FILE: /state/credential.json
+      # Enroll a NEW machine identity once before starting this service.
+      # The service never receives a one-time enrollment token through env.
+      RAG_ENROLLMENT_TOKEN: ""
+      CONFLUENCE_URL: ${SERVER_CONNECTOR_CONFLUENCE_URL:?A Confluence HTTPS URL is required}
+      CONFLUENCE_AUTH_MODE: bearer
+      CONFLUENCE_TOKEN: ""
+      CONFLUENCE_TOKEN_FILE: /run/secrets/confluence-service-pat
+      CONFLUENCE_VERIFY_SSL: "true"
+      CONFLUENCE_CA_FILE: /run/certs/confluence-ca.pem
+      CONFLUENCE_ALLOWED_SPACES: ${SERVER_CONNECTOR_ALLOWED_SPACES:?Explicit approved space keys are required}
+      CONFLUENCE_MAX_RESULTS: "1000"
+    entrypoint: [python, /run/connector-preflight.py]
+    volumes:
+      - type: bind
+        source: ${SERVER_CONNECTOR_PAT_FILE:?A private technical-account PAT file is required}
+        target: /run/secrets/confluence-service-pat
+        read_only: true
+      - type: bind
+        source: ${SERVER_CONNECTOR_STATE_DIR:?A private persistent credential directory is required}
+        target: /state
+        read_only: true
+      - type: bind
+        source: ${SERVER_CONNECTOR_RAG_CA_FILE:?A trusted RAG CA/certificate file is required}
+        target: /run/certs/rag-ca.pem
+        read_only: true
+      - type: bind
+        source: ${SERVER_CONNECTOR_CONFLUENCE_CA_FILE:?A Confluence CA bundle is required}
+        target: /run/certs/confluence-ca.pem
+        read_only: true
+      - type: bind
+        source: ../scripts/deploy/server_connector_preflight.py
+        target: /run/connector-preflight.py
+        read_only: true
+    # Reuse the existing network: do not allocate another overlapping Docker subnet.
+    networks: [rag]
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+networks:
+  rag:
+    external: true
+    name: ${SERVER_CONNECTOR_NETWORK:-rag-zmostovoy_default}

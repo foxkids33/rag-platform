@@ -1,0 +1,63 @@
+{
+  "id": "skala-technical-reviews.v1",
+  "description": "Eight UTF-8 TXT exports of Skala^r technical reviews used for the first real RAG baseline.",
+  "document_count": 8,
+  "documents": [
+    {
+      "filename": "tekhnicheskiy_obzor_mashina_bolshikh_dannykh_skala_r_mbd_g_2024.txt",
+      "sha256": "ce6f7a9e41219ec777c9bf4f40e106c19505de394ea1caaca7c99fb9cf925d06",
+      "product": "Скала^р МБД.Г",
+      "version": "4.3",
+      "document_date": "2025-09-01"
+    },
+    {
+      "filename": "tekhnicheskiy_obzor_mashina_bolshikh_dannykh_skala_r_mbd_kh.txt",
+      "sha256": "4fbb30362ed98260b615f7fe9ed8b9dc24c27404cf2cb9ae8abec56a31f28832",
+      "product": "Скала^р МБД.Х",
+      "version": "3.1",
+      "document_date": "2026-04-06"
+    },
+    {
+      "filename": "tekhnicheskiy_obzor_mashina_bolshikh_dannykh_skala_r_mbd_kkh_2024.txt",
+      "sha256": "ad3ef4e90b24bfac4882e61168ffb44c4247d6821887acfdf8d8132f2c8013dd",
+      "product": "Скала^р МБД.КХ",
+      "version": "2.1",
+      "document_date": "2025-09-01"
+    },
+    {
+      "filename": "tekhnicheskiy_obzor_mashina_bolshikh_dannykh_skala_r_mbd_s.txt",
+      "sha256": "9a41ae9fb123edb600043e92fbe85296601e08429157b9d2e4a6f9e42b8cbed0",
+      "product": "Скала^р МБД.С",
+      "version": "2.1",
+      "document_date": "2025-09-01"
+    },
+    {
+      "filename": "tekhnicheskiy_obzor_mashina_bolshikh_dannykh_skala_r_mbd_t_2024.txt",
+      "sha256": "2ca69aa938fce152240f54110d7987f5aafb931b1fb2900d3c25abb43e5e801f",
+      "product": "Скала^р МБД.Т",
+      "version": "3.3",
+      "document_date": "2025-12-30"
+    },
+    {
+      "filename": "tekhnicheskiy_obzor_mashina_khraneniya_dannykh_skala_r_mkhd_o_2024.txt",
+      "sha256": "d12708411c02cbc2ac4a6af714a441a5c94eacd26fdaa319e764d8c919502956",
+      "product": "Скала^р МХД.О",
+      "version": "2.6",
+      "document_date": "2025-07-24"
+    },
+    {
+      "filename": "tekhnicheskiy_obzor_mashina_virtualizatsii_skala_r_mv_di_2024.txt",
+      "sha256": "6edde36c995ca47f79e45b1c464a0bcaff2a11be492511be9dbadb39692ce475",
+      "product": "Скала^р МДИ.О",
+      "version": "1.88",
+      "document_date": "2025-12-08"
+    },
+    {
+      "filename": "tekhnicheskiy_obzor_mashina_virtualizatsii_skala_r_mv_s.txt",
+      "sha256": "ed6062b5e9d2baffa24269d852c2ab73178a1996003c90ccb11d4613f1797166",
+      "product": "Скала^р МДИ.В",
+      "version": "1.85",
+      "document_date": "2026-01-27"
+    }
+  ]
+}

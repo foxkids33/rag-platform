@@ -1,0 +1,63 @@
+name: rag-kbr-bge-ab
+
+services:
+  embedding:
+    build:
+      context: ../apps/embedding
+      dockerfile: Dockerfile.bge
+      args:
+        PYTORCH_IMAGE: ${BGE_PYTORCH_IMAGE:?Choose a PyTorch CUDA image after server inventory}
+    environment:
+      EMBEDDING_MODEL: BAAI/bge-m3
+      EMBEDDING_NATIVE_DIM: 1024
+      EMBEDDING_DIM: 1024
+      EMBEDDING_CONTEXT_TOKENS: ${EMBEDDING_CONTEXT_TOKENS:-1024}
+      EMBEDDING_BATCH_SIZE: ${EMBEDDING_BATCH_SIZE:-4}
+      EMBEDDING_MAX_CONCURRENCY: 1
+      EMBEDDING_DEVICE: ${EMBEDDING_DEVICE:-cuda:0}
+      EMBEDDING_USE_FP16: ${EMBEDDING_USE_FP16:-true}
+      HF_HOME: /models
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health/ready', timeout=5)"]
+      start_period: 600s
+      retries: 60
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${BGE_GPU_DEVICE_ID:?Select an available GPU ID after server inventory}"]
+              capabilities: [gpu]
+
+  api:
+    environment:
+      DATABASE_URL: ${BGE_DATABASE_URL:?Set the isolated postgres service URL}
+      EMBEDDING_SCHEMA_INITIALIZATION_ALLOWED: "true"
+      REDIS_URL: redis://redis:6379/0
+      MINIO_ENDPOINT: minio:9000
+      EMBEDDING_MODEL: BAAI/bge-m3
+      EMBEDDING_DIM: 1024
+      EMBEDDING_BASE_URL: http://embedding:8080
+      RERANK_ENABLED: "false"
+    volumes:
+      - ../evaluation:/evaluation
+    command:
+      - sh
+      - -c
+      - >-
+        alembic upgrade head &&
+        python -m app.operations.initialize_embedding_schema --dimension 1024 --require-empty &&
+        uvicorn app.main:app --host 0.0.0.0 --port 8000
+
+  worker:
+    environment:
+      DATABASE_URL: ${BGE_DATABASE_URL:?Set the isolated postgres service URL}
+      REDIS_URL: redis://redis:6379/0
+      MINIO_ENDPOINT: minio:9000
+      EMBEDDING_MODEL: BAAI/bge-m3
+      EMBEDDING_DIM: 1024
+      EMBEDDING_BASE_URL: http://embedding:8080
+
+  web:
+    profiles: ["bge-ui"]
+    ports: !reset []
