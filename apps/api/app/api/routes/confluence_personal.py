@@ -80,12 +80,15 @@ async def workspace_client(
 
 
 def connection_status(connected: bool) -> ConfluenceConnectionStatus:
+    enabled = personal.enabled()
+    base_url = settings.confluence_base_url.rstrip("/")
     return ConfluenceConnectionStatus(
         mode="personal",
-        enabled=personal.enabled(),
-        configured=personal.enabled(),
+        enabled=enabled,
+        configured=enabled,
         ready=connected,
-        host=settings.confluence_base_url.rstrip("/").split("://")[-1].split("/")[0],
+        host=base_url.split("://")[-1].split("/")[0],
+        personal_token_url=(f"{base_url}/plugins/personalaccesstokens/usertokens.action" if enabled else None),
         capabilities=sorted(SUPPORTED_CAPABILITIES),
         max_pages_per_job=min(100, settings.confluence_max_pages_per_import),
         max_job_seconds=settings.confluence_connector_max_job_seconds,

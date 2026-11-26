@@ -153,3 +153,12 @@ async def test_personal_token_ciphertext_cannot_be_moved_between_tenants(configu
     await personal.save_token(a, "dummy-private-token", datetime.now(UTC) + timedelta(minutes=1))
     storage[b] = storage[a]
     assert a != b and await personal.get_token(b) is None
+
+
+def test_token_settings_link_uses_confluence_context(configured, monkeypatch):
+    monkeypatch.setattr(settings, "confluence_base_url", "https://wiki.example.test/wiki/")
+    assert routes.connection_status(False).personal_token_url == (
+        "https://wiki.example.test/wiki/plugins/personalaccesstokens/usertokens.action"
+    )
+    monkeypatch.setattr(settings, "confluence_personal_socket", "")
+    assert routes.connection_status(False).personal_token_url is None

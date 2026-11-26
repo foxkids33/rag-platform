@@ -35,6 +35,7 @@ type ConfluenceConnection = {
   readiness_reason: string | null;
   missing_configuration: string[];
   host: string | null;
+  personal_token_url?: string | null;
   allowed_spaces: string[];
   capabilities: string[];
   max_pages_per_job: number;
@@ -273,6 +274,11 @@ function PersonalConnection(props: Props) {
 
   const target = new URL(url, window.location.href);
   const secure = target.origin === window.location.origin && target.protocol === "https:";
+  let tokenSettings: URL | null = null;
+  if (connection?.personal_token_url && URL.canParse(connection.personal_token_url)) {
+    const link = new URL(connection.personal_token_url);
+    if (link.protocol === "https:" && link.host === connection.host && !link.username && !link.password) tokenSettings = link;
+  }
   return (
     <>
       <section className="resource-card confluence-import-card">
@@ -296,9 +302,16 @@ function PersonalConnection(props: Props) {
               form.reset();
               void updateConnection(token);
             }}>
+              <ol className="personal-token-steps" id="personal-token-steps">
+                <li>{tokenSettings
+                  ? <a href={tokenSettings.href} target="_blank" rel="noopener noreferrer">Откройте личные токены в Confluence</a>
+                  : "Откройте личные токены в Confluence"}. В меню это аватар → Настройки → Personal access tokens.</li>
+                <li>Нажмите <strong>Create token</strong>, назовите токен <strong>RAG</strong> и нажмите <strong>Create</strong>.</li>
+                <li>Скопируйте токен до закрытия окна, вставьте его ниже и нажмите «Подключить».</li>
+              </ol>
               <label htmlFor="confluence-personal-token">Личный токен доступа Confluence</label>
               <div className="connector-enrollment-row">
-                <input id="confluence-personal-token" name="personal-token" type="password" autoComplete="off" spellCheck={false} maxLength={4096} required disabled={busy} />
+                <input id="confluence-personal-token" name="personal-token" type="password" aria-describedby="personal-token-steps" autoComplete="off" spellCheck={false} maxLength={4096} required disabled={busy} />
                 <button type="submit" className="primary-button" disabled={busy}>{busy ? "Проверяю…" : "Подключить"}</button>
               </div>
               <small>Токен действует для текущего сеанса RAG. Пространства и страницы открываются с вашими правами.</small>

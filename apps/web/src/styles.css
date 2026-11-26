@@ -390,6 +390,8 @@
 .confluence-source-panel { display: grid; align-content: start; min-width: 0; gap: 12px; }
 .confluence-source-picker { display: grid; gap: 6px; color: #526078; font-size: 12px; }
 .confluence-source-picker select { width: 100%; padding: 9px; border: 1px solid #dce2eb; border-radius: 8px; background: #fff; color: inherit; }
+.personal-token-steps { display: grid; gap: 6px; margin: 0; padding-left: 20px; color: #48556b; font-size: 13px; line-height: 1.5; }
+.personal-token-steps a { color: #304eb7; text-underline-offset: 2px; }
 .confluence-page .resource-document-list {
   max-height: min(44vh, 420px);
   overflow-x: hidden;

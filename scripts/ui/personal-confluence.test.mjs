@@ -31,6 +31,7 @@ for (const isAdmin of [false, true]) {
     const personal = workspace + "/integrations/confluence/personal/";
     const pageInfo = { id: "101", title: "Моя страница", space_key: "~my", version: "1", has_children: false };
     const token = "test-user-token";
+    const tokenUrl = `https://wiki.example${isAdmin ? "/wiki" : ""}/plugins/personalaccesstokens/usertokens.action`;
     let imported = false;
     await page.route("**/*", async (route) => {
       const req = route.request();
@@ -57,7 +58,7 @@ for (const isAdmin of [false, true]) {
           connected = false;
           return route.fulfill({ status: 204 });
         }
-        return reply({ mode: "personal", enabled: true, ready: connected, host: "wiki.example",
+        return reply({ mode: "personal", enabled: true, ready: connected, host: "wiki.example", personal_token_url: tokenUrl,
           allowed_spaces: [], capabilities: ["LIST_SPACE_PAGES"], max_pages_per_job: 50 });
       }
       assert.ok(!req.url().includes(token) && !req.postData()?.includes(token));
@@ -81,6 +82,12 @@ for (const isAdmin of [false, true]) {
     });
     try {
       await page.goto("https://rag.test/#confluence");
+      const tokenLink = page.getByRole("link", { name: "Откройте личные токены в Confluence" });
+      await tokenLink.waitFor();
+      assert.equal(await tokenLink.getAttribute("href"), tokenUrl);
+      assert.equal(await tokenLink.getAttribute("target"), "_blank");
+      assert.equal(await tokenLink.getAttribute("rel"), "noopener noreferrer");
+      assert.equal(await page.locator("#personal-token-steps > li").count(), 3);
       await page.getByLabel("Личный токен доступа Confluence").fill(token);
       assert.equal(await page.getByRole("option", { name: "Общий коннектор администратора" }).count(), isAdmin ? 1 : 0);
       await page.getByRole("button", { name: "Подключить", exact: true }).click();

@@ -160,6 +160,7 @@ class ConfluenceConnectionStatus(BaseModel):
     readiness_reason: str | None = None
     missing_configuration: list[str] = Field(default_factory=list)
     host: str | None = None
+    personal_token_url: str | None = None
     allowed_spaces: list[str] = Field(default_factory=list)
     capabilities: list[str] = Field(default_factory=list)
     max_pages_per_job: int
