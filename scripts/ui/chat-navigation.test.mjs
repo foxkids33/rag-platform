@@ -215,7 +215,7 @@ async function scenario(run, { failCreate = false, documents = [], messages = []
 }
 
 test("greeting works in an empty workspace without retrieval diagnostics", async () => scenario(async (page, _, state) => {
-  const input = page.getByRole("textbox", { name: "Вопрос по источникам" });
+  const input = page.getByRole("textbox", { name: "Сообщение", exact: true });
   await input.fill("Привет");
   await input.press("Enter");
   await page.getByText("Тестовый ответ", { exact: true }).waitFor();
@@ -227,8 +227,8 @@ test("greeting works in an empty workspace without retrieval diagnostics", async
 }, { answerMode: "conversation", answerFinishReason: "stop" }));
 
 test("general mode passes follow-ups in the same conversation and displays history without source claims", async () => scenario(async (page, _, state) => {
-  const mode = page.getByRole("combobox", { name: "Режим ответа" });
-  const input = page.getByRole("textbox", { name: "Вопрос по источникам" });
+  const mode = page.getByRole("combobox", { name: "Режим ответа", exact: true });
+  const input = page.getByRole("textbox", { name: "Сообщение", exact: true });
   await mode.selectOption("general");
   for (const text of ["Как подготовиться к собеседованию?", "А если опыта пока нет?"]) {
     await input.fill(text);
@@ -247,8 +247,8 @@ test("general mode passes follow-ups in the same conversation and displays histo
 }, { documents: [documentRecord("ready")], answerMode: "conversation", answerFinishReason: "stop" }));
 
 test("explicit source mode reaches the answer API", async () => scenario(async (page, _, state) => {
-  await page.getByRole("combobox", { name: "Режим ответа" }).selectOption("sources");
-  await page.getByRole("textbox", { name: "Вопрос по источникам" }).fill("Какие сроки указаны в документе?");
+  await page.getByRole("combobox", { name: "Режим ответа", exact: true }).selectOption("sources");
+  await page.getByRole("textbox", { name: "Сообщение", exact: true }).fill("Какие сроки указаны в документе?");
   await page.getByRole("button", { name: "Отправить вопрос" }).click();
   await page.getByText("Тестовый ответ", { exact: true }).waitFor();
   assert.equal(state.answerRequests[0].chat_mode, "sources");
@@ -256,7 +256,7 @@ test("explicit source mode reaches the answer API", async () => scenario(async (
 
 for (const count of [1, 3]) {
   test(`summary sends ${count} selected ready articles and preserves the ordinary chat draft`, async () => scenario(async (page, _, state) => {
-    const draft = page.getByRole("textbox", { name: "Вопрос по источникам" });
+    const draft = page.getByRole("textbox", { name: "Сообщение", exact: true });
     await draft.fill("Следующий вопрос");
     await page.getByRole("button", { name: "Выжимка по документам", exact: true }).click();
     const choices = page.locator(".summary-picker").getByRole("checkbox");
@@ -279,7 +279,7 @@ for (const limit of [2048, 800, 4096]) {
     const selector = page.getByRole("combobox", { name: "Лимит ответа", exact: true });
     assert.equal(await selector.inputValue(), "2048");
     await selector.selectOption(String(limit));
-    await page.getByRole("textbox", { name: "Вопрос по источникам", exact: true }).fill("Тестовый вопрос");
+    await page.getByRole("textbox", { name: "Сообщение", exact: true }).fill("Тестовый вопрос");
     await page.getByRole("button", { name: "Отправить вопрос", exact: true }).click();
     await page.getByText("Тестовый ответ", { exact: true }).waitFor();
     assert.equal(state.answerRequests[0].max_tokens, limit);
@@ -293,7 +293,7 @@ for (const limit of [2048, 800, 4096]) {
 }
 
 test("normal answer finish has no truncation warning", async () => scenario(async page => {
-  await page.getByRole("textbox", { name: "Вопрос по источникам", exact: true }).fill("Тестовый вопрос");
+  await page.getByRole("textbox", { name: "Сообщение", exact: true }).fill("Тестовый вопрос");
   await page.getByRole("button", { name: "Отправить вопрос", exact: true }).click();
   await page.getByText("Тестовый ответ", { exact: true }).waitFor();
   assert.equal(await page.getByText(/Ответ достиг лимита токенов/).count(), 0);

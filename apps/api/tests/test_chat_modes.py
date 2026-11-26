@@ -117,3 +117,74 @@ async def test_selected_articles_have_fair_ordered_evidence_and_complete_citatio
     with pytest.raises(HTTPException) as disabled:
         await summaries.summary_evidence(db, w, [docs[0].id], "выжимка", 1200)
     assert disabled.value.status_code == 404
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("repair_valid", [False, True])
+async def test_short_multi_article_repair_is_bounded_and_hidden(monkeypatch, streaming, repair_valid):
+    w = workspace()
+    docs = [article(name) for name in ("Развёртывание", "Владельцы", "Проверка")]
+    rows = [SimpleNamespace(id=uuid4(), document_id=d.id, chunk_index=0, text=f"Ключевой факт {i}",
+                            page_start=None, page_end=None) for i, d in enumerate(docs, 1)]
+    db = AsyncMock()
+    db.scalars.return_value = Mock(all=lambda: docs)
+    db.execute.return_value = Mock(all=lambda: rows)
+    monkeypatch.setattr(route, "workspace_for_principal", AsyncMock(return_value=w))
+    first = LLMOutput("[[ANSWER]] Черновая формулировка [1].", "model", "length")
+    final = LLMOutput("[[ANSWER]] Главное А [1]. Главное Б [2]. Главное В [3].", "model", "stop")
+    repaired = final if repair_valid else first
+    chat = AsyncMock(side_effect=[repaired] if streaming else [first, repaired])
+    monkeypatch.setattr(route.llm, "chat", chat)
+
+    async def stream(*args, **kwargs):
+        yield first.text
+        yield LLMStreamEnd("length")
+
+    monkeypatch.setattr(route.llm, "stream_chat", stream)
+    payload = route.AnswerRequest(question="Сравни статьи", summary_document_ids=[d.id for d in docs], max_tokens=800)
+    if streaming:
+        res = await route.answer_stream(w.id, payload, db, None)
+        body = "".join([event async for event in res.body_iterator])
+        assert chat.await_count == 1 and "event: done" in body
+    else:
+        response = await route.answer(w.id, payload, db, None)
+        body = response.answer
+        assert chat.await_count == 2
+        assert response.citation_valid and response.cited_source_indices == [1, 2, 3]
+    assert chat.await_args.kwargs["max_tokens"] <= 512
+    assert "Черновая формулировка" not in body
+    assert ("Главное В [3]" if repair_valid else "Ключевые фрагменты выбранных материалов") in body
+
+
+@pytest.mark.asyncio
+async def test_cancelled_summary_starts_no_repair_and_saves_no_rejected_text(monkeypatch):
+    import asyncio
+
+    w = workspace()
+    docs = [article("A"), article("B")]
+    row = lambda d: SimpleNamespace(id=uuid4(), document_id=d.id, chunk_index=0, text=d.title,
+                                    page_start=None, page_end=None)
+    db = AsyncMock()
+    db.scalars.return_value = Mock(all=lambda: docs)
+    db.execute.return_value = Mock(all=lambda: [row(d) for d in docs])
+    monkeypatch.setattr(route, "workspace_for_principal", AsyncMock(return_value=w))
+
+    async def cancel(*args, **kwargs):
+        yield "[[ANSWER]] Неполный черновик [1]"
+        raise asyncio.CancelledError()
+
+    repair = AsyncMock(side_effect=AssertionError("retry after disconnect"))
+    save = AsyncMock()
+    monkeypatch.setattr(route.llm, "chat", repair)
+    monkeypatch.setattr(route.llm, "stream_chat", cancel)
+    monkeypatch.setattr(route, "_persist_stream_assistant", save)
+    payload = route.AnswerRequest(question="Сравни", summary_document_ids=[d.id for d in docs])
+    response = await route.answer_stream(w.id, payload, db, None)
+    emitted = []
+    with pytest.raises(asyncio.CancelledError):
+        async for event in response.body_iterator:
+            emitted.append(event)
+    assert not any("Неполный черновик" in event for event in emitted)
+    assert save.await_args.args[1] == ""
+    repair.assert_not_called()

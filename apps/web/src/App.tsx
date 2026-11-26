@@ -1884,7 +1884,7 @@ export function App() {
                 <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" aria-hidden="true"><path d="m8 12 6-6a3 3 0 0 1 4.2 4.2L9.5 19a5 5 0 0 1-7.1-7.1l10-10" transform="translate(2 1) scale(.9)" /><path d="m8.5 12.5 5-5a1 1 0 0 1 1.4 1.4l-6 6" /></svg>
               </button>
               <textarea
-                aria-label="Вопрос по источникам"
+                aria-label="Сообщение"
                 value={question}
                 disabled={!selectedWorkspaceId || conversationLoading}
                 placeholder={chatMode === "sources" ? "Задайте вопрос по источникам…" : "Напишите сообщение…"}
@@ -1901,7 +1901,7 @@ export function App() {
             <div className="composer-options">
               <label>
                 Режим ответа
-                <select value={chatMode} disabled={isStreaming} onChange={(event) => setChatMode(event.target.value as ChatMode)}>
+                <select aria-label="Режим ответа" value={chatMode} disabled={isStreaming} onChange={(event) => setChatMode(event.target.value as ChatMode)}>
                   <option value="auto">Авто</option>
                   <option value="general">Общий чат</option>
                   <option value="sources">Только по источникам</option>
