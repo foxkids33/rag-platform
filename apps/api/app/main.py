@@ -7,6 +7,7 @@ from fastapi.responses import JSONResponse
 
 from app.api.router import api_router
 from app.core.config import settings
+from app.services import confluence_personal
 from app.services.confluence import confluence
 from app.services.connector_queue import connector_queue
 from app.services.embeddings import embeddings
@@ -22,6 +23,7 @@ async def lifespan(_: FastAPI):
     await llm.close()
     await ingestion_queue.close()
     await connector_queue.close()
+    await confluence_personal.redis.aclose()
 
 
 app = FastAPI(

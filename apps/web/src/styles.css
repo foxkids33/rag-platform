@@ -387,6 +387,9 @@
 .resource-empty small { max-width: 330px; margin-top: 5px; line-height: 1.5; }
 
 .confluence-layout { grid-template-columns: minmax(0, .82fr) minmax(0, 1.18fr); }
+.confluence-source-panel { display: grid; align-content: start; min-width: 0; gap: 12px; }
+.confluence-source-picker { display: grid; gap: 6px; color: #526078; font-size: 12px; }
+.confluence-source-picker select { width: 100%; padding: 9px; border: 1px solid #dce2eb; border-radius: 8px; background: #fff; color: inherit; }
 .confluence-page .resource-document-list {
   max-height: min(44vh, 420px);
   overflow-x: hidden;

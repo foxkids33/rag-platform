@@ -92,7 +92,7 @@ jobs:
         with:
           python-version: "3.12"
       - run: python -m pip install "pytest>=8,<9"
-      - run: python -m pytest -q tests
+      - run: python -m pytest -q tests deploy/delivery/test_personal_confluence.py
       - run: python -m compileall -q deploy/confluence-vpn deploy/delivery
       - run: docker compose --env-file deploy/confluence-vpn/settings.env.example -f deploy/confluence-vpn/worker.compose.yaml config --quiet
 

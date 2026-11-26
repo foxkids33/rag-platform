@@ -13,6 +13,14 @@ class ConfluenceError(RuntimeError):
     """A sanitized Confluence transport or response error."""
 
 
+class ConfluenceUnavailableError(ConfluenceError):
+    """The live Confluence connection failed."""
+
+
+class ConfluencePermissionError(ConfluenceError):
+    """The upstream account or resource permission was denied."""
+
+
 @dataclass(frozen=True, slots=True)
 class ConfluencePage:
     id: str
@@ -111,12 +119,12 @@ class ConfluenceClient:
         try:
             response = await self._get_client().get(url, params=params)
         except httpx.HTTPError as exc:
-            raise ConfluenceError("Confluence is unavailable") from exc
+            raise ConfluenceUnavailableError("Confluence is unavailable") from exc
 
         if response.status_code in {301, 302, 303, 307, 308}:
             raise ConfluenceError("Confluence returned an unexpected redirect")
         if response.status_code in {401, 403}:
-            raise ConfluenceError("Confluence authentication or page permission was denied")
+            raise ConfluencePermissionError("Confluence authentication or page permission was denied")
         if response.status_code == 404:
             raise ConfluenceError("Confluence page or space was not found")
         if response.status_code >= 400:

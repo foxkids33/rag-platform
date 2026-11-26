@@ -152,3 +152,11 @@ async def logout(
 ) -> None:
     _password_mode()
     await revoke_session(db, request, response)
+    from app.services import confluence_personal as personal
+
+    if personal.enabled() and getattr(request.state, "auth_session_hash", None):
+        try:
+            await personal.forget_token(personal.session_key(request, _principal))
+        except HTTPException:
+            # The RAG session is already revoked. The inaccessible entry also expires in Redis.
+            pass

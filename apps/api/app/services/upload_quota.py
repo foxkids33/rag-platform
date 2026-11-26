@@ -48,7 +48,7 @@ async def check_knowledge_base_quota(db: AsyncSession, principal: Principal, kno
 
 
 async def check_upload_quota(db: AsyncSession, principal: Principal, workspace_id, size: int,
-                            *, version_id=None) -> None:
+                            *, version_id=None, replacing: Document | None = None) -> None:
     if not is_private_account(principal):
         return
     # Serialize accounting across new accounts. The check and document INSERT
@@ -58,8 +58,12 @@ async def check_upload_quota(db: AsyncSession, principal: Principal, workspace_i
     scope = (Document.workspace_id == workspace_id if workspace_id is not None
              else Document.knowledge_base_version_id == version_id)
     count = await db.scalar(select(func.count(Document.id)).where(scope))
-    if int(count or 0) >= getattr(settings, "user_max_documents_per_workspace", 100):
+    if replacing is None and int(count or 0) >= getattr(settings, "user_max_documents_per_workspace", 100):
         raise HTTPException(status_code=413, detail="Document quota exceeded")
+    if replacing is not None:
+        size -= replacing.size_bytes or 0
+        if size <= 0:
+            return
     accounting = (select(func.coalesce(func.sum(Document.size_bytes), 0))
         .select_from(Document).outerjoin(Workspace, Document.workspace_id == Workspace.id)
         .outerjoin(KnowledgeBaseVersion, Document.knowledge_base_version_id == KnowledgeBaseVersion.id)

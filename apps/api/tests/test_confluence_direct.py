@@ -275,7 +275,8 @@ async def test_import_enforces_actual_space_and_version_not_browser_claim(
             space_key=actual_space,
         )
 
-    async def save(db, workspace_id, page, *, force):
+    async def save(db, workspace_id, page, *, force, principal):
+        assert principal is None
         imported.append(page.id)
         return routes.ConfluenceImportItem(
             page_id=page.id, page_version=page.version, title=page.title, status="created"

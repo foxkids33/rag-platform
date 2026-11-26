@@ -25,8 +25,6 @@ export function useIsAdmin(): boolean {
 }
 
 export function useCanUseConfluence(): boolean {
-  const isAdmin = useIsAdmin();
-  // OIDC deployments retain their existing tenant permissions. The backend
-  // remains authoritative: this only avoids offering forbidden pilot controls.
-  return runtimeConfig.authMode !== "password" || isAdmin;
+  const user = useAuthUser();
+  return !runtimeConfig.authEnabled || runtimeConfig.authMode !== "password" || Boolean(user);
 }

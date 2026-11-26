@@ -74,6 +74,9 @@ class Settings(BaseSettings):
     confluence_email: str = ""
     confluence_api_token: SecretStr = SecretStr("")
     confluence_access_token: SecretStr = SecretStr("")
+    confluence_personal_socket: str = ""
+    confluence_personal_key_file: str = ""
+    confluence_personal_ca_file: str = ""
     confluence_timeout_seconds: float = Field(default=30.0, gt=0, le=180)
     confluence_verify_ssl: bool = True
     confluence_allow_insecure_http: bool = False

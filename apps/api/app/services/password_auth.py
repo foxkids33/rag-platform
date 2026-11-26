@@ -204,6 +204,7 @@ async def authenticate_session(request: Request, db: AsyncSession) -> Principal:
             raise HTTPException(status_code=403, detail="CSRF token is missing or invalid")
     request.state.auth_csrf_token = csrf_token
     request.state.auth_session_hash = session.token_hash
+    request.state.auth_session_expires_at = session.expires_at
     return principal_for_user(user)
 
 

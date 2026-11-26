@@ -21,7 +21,7 @@ from app.core.integration_access import confluence_principal as get_current_prin
 from app.core.security import Principal, require_tenant_admin
 from app.db.models import Connector, ConnectorJob
 from app.db.session import get_db
-from app.services.confluence import ConfluenceError, ConfluencePage
+from app.services.confluence import ConfluenceError, ConfluencePage, ConfluenceUnavailableError
 from app.services.confluence_direct import DirectConfluenceClient, selected_confluence_mode
 from app.services.connector_queue import (
     connector_queue,
@@ -153,7 +153,7 @@ class ConnectorIntegrationStatus(BaseModel):
 
 
 class ConfluenceConnectionStatus(BaseModel):
-    mode: Literal["direct", "connector"]
+    mode: Literal["direct", "connector", "personal"]
     enabled: bool
     configured: bool
     ready: bool
@@ -573,33 +573,57 @@ async def import_direct_pages(
     db: AsyncSession = Depends(get_db),
     principal: Principal = Depends(get_current_principal),
 ) -> ConfluenceImportResponse:
-    results = []
     async with _direct_workspace_client(workspace_id, db, principal) as client:
-        for space in payload.page_spaces.values():
-            _require_direct_space(client, space)
-        for page_id in payload.page_ids:
-            try:
-                page = await client.get_page(page_id)
-                # Never trust the space claimed by the browser for a page ID.
-                client.require_allowed(page.space_key)
-                if (page.space_key or "").casefold() != payload.page_spaces[page_id].casefold():
-                    raise ConfluenceError("Confluence returned a page from another space")
-                expected = payload.expected_versions.get(page_id)
-                if expected is not None and page.version != expected:
-                    raise ConfluenceError("Page version changed; refresh the page selection")
-                item = await _import_page(db, workspace_id, page, force=payload.force)
-            except ConfluenceError as exc:
-                item = ConfluenceImportItem(
-                    page_id=page_id, page_version="unknown", title=f"Confluence page {page_id}",
-                    status="failed", detail=str(exc),
-                )
-            except StorageError:
-                await db.rollback()
-                item = ConfluenceImportItem(
-                    page_id=page_id, page_version="unknown", title=f"Confluence page {page_id}",
-                    status="failed", detail="Object storage is unavailable",
-                )
-            results.append(item)
+        return await import_selection(db, workspace_id, payload, client)
+
+
+async def import_selection(
+    db: AsyncSession, workspace_id: uuid.UUID, payload: DirectImportRequest,
+    client: DirectConfluenceClient, principal: Principal | None = None,
+) -> ConfluenceImportResponse:
+    results = []
+    for space in payload.page_spaces.values():
+        _require_direct_space(client, space)
+    for page_id in payload.page_ids:
+        try:
+            page = await client.get_page(page_id)
+            # Never trust the space claimed by the browser for a page ID.
+            client.require_allowed(page.space_key)
+            if (page.space_key or "").casefold() != payload.page_spaces[page_id].casefold():
+                raise ConfluenceError("Confluence returned a page from another space")
+            expected = payload.expected_versions.get(page_id)
+            if expected is not None and page.version != expected:
+                raise ConfluenceError("Page version changed; refresh the page selection")
+            item = await _import_page(db, workspace_id, page, force=payload.force, principal=principal)
+        except ConfluenceError as exc:
+            if isinstance(exc, ConfluenceUnavailableError) and principal is not None:
+                if not results:
+                    raise
+                for unprocessed in payload.page_ids[len(results):]:
+                    results.append(ConfluenceImportItem(
+                        page_id=unprocessed, page_version="unknown", title=f"Confluence page {unprocessed}",
+                        status="failed", detail="Confluence недоступен через серверный VPN.",
+                    ))
+                break
+            item = ConfluenceImportItem(
+                page_id=page_id, page_version="unknown", title=f"Confluence page {page_id}",
+                status="failed", detail=str(exc),
+            )
+        except HTTPException as exc:
+            if exc.status_code not in {413, 507}:
+                raise
+            await db.rollback()
+            item = ConfluenceImportItem(
+                page_id=page_id, page_version="unknown", title=f"Confluence page {page_id}",
+                status="failed", detail=str(exc.detail),
+            )
+        except StorageError:
+            await db.rollback()
+            item = ConfluenceImportItem(
+                page_id=page_id, page_version="unknown", title=f"Confluence page {page_id}",
+                status="failed", detail="Object storage is unavailable",
+            )
+        results.append(item)
     return ConfluenceImportResponse(
         requested=len(payload.page_ids),
         queued=sum(item.status in {"created", "updated", "reindexed"} for item in results),

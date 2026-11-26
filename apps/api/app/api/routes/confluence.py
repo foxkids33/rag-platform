@@ -34,6 +34,7 @@ from app.services.object_cleanup import (
 )
 from app.services.queue import ingestion_queue
 from app.services.storage import StorageError, storage
+from app.services.upload_quota import check_upload_quota, upload_limit_bytes
 
 router = APIRouter(tags=["confluence"])
 logger = logging.getLogger(__name__)
@@ -173,6 +174,7 @@ async def _import_page(
     page: ConfluencePage,
     *,
     force: bool,
+    principal: Principal | None = None,
 ) -> ConfluenceImportItem:
     # Versioned envelope preserves provenance and storage CDATA. Empty landing
     # pages remain representable by their title instead of failing ingestion.
@@ -187,13 +189,14 @@ async def _import_page(
         "labels": page.labels,
         "storage_html": page.storage_html,
     }, ensure_ascii=False, sort_keys=True).encode("utf-8")
-    if len(content) > settings.upload_max_bytes:
+    limit = upload_limit_bytes(principal, ".json") if principal else settings.upload_max_bytes
+    if len(content) > limit:
         return ConfluenceImportItem(
             page_id=page.id,
             page_version=page.version,
             title=page.title,
             status="failed",
-            detail=f"Page exceeds the {settings.upload_max_mb} MB import limit",
+            detail=f"Page exceeds the {limit // (1024 * 1024)} MB import limit",
         )
 
     await db.execute(
@@ -248,6 +251,8 @@ async def _import_page(
     object_key = previous_object_key
     uploaded = False
     if not unchanged:
+        if principal is not None:
+            await check_upload_quota(db, principal, workspace_id, len(content), replacing=existing)
         object_key = (
             f"workspaces/{workspace_id}/confluence/{page.id}/"
             f"{page.version}-{uuid.uuid4().hex[:12]}/{filename}"
@@ -303,6 +308,7 @@ async def _import_page(
         document.synced_at = now
         result_status = "reindexed" if unchanged else "updated"
 
+    document.size_bytes = len(content)
     retired_keys: list[str] = []
     try:
         if existing is None:
