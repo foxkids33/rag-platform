@@ -188,3 +188,56 @@ async def test_cancelled_summary_starts_no_repair_and_saves_no_rejected_text(mon
     assert not any("Неполный черновик" in event for event in emitted)
     assert save.await_args.args[1] == ""
     repair.assert_not_called()
+
+
+@pytest.mark.parametrize("claim,quote", [
+    ("Сотрудники проверяют состояние сервера.", "Эта цитата отсутствует в выбранной статье."),
+    ("Всем пользователям разрешили вывод средств.", "Инженеры проверяют состояние сервера перед релизом."),
+    ("Инженеры проверяют состояние 99 серверов.", "Инженеры проверяют состояние сервера перед релизом."),
+    ("Инженеры не проверяют состояние сервера.", "Инженеры проверяют состояние сервера перед релизом."),
+    ("[[ANSWER]] Инженеры проверяют состояние сервера.", "Инженеры проверяют состояние сервера перед релизом."),
+    ("Инженеры проверяют состояние сервера [2].", "Инженеры проверяют состояние сервера перед релизом."),
+])
+def test_single_article_repair_rejects_unverified_claim(claim, quote):
+    import json
+    source = "Регламент. Инженеры проверяют состояние сервера перед релизом."
+    assert summaries.verified_summary_claim(json.dumps({"summary": claim, "quote": quote}), source) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_single_article_repair_uses_verbatim_grounding_before_attaching_citation(monkeypatch, streaming):
+    import json
+
+    w = workspace()
+    doc = article("Проверка")
+    text = "Перед релизом инженеры проверяют состояние сервера."
+    claim = "Инженеры проверяют состояние сервера перед релизом."
+    db = AsyncMock()
+    db.scalars.return_value = Mock(all=lambda: [doc])
+    db.execute.return_value = Mock(all=lambda: [SimpleNamespace(id=uuid4(), document_id=doc.id,
+                                   chunk_index=0, text=text, page_start=None, page_end=None)])
+    monkeypatch.setattr(route, "workspace_for_principal", AsyncMock(return_value=w))
+    provisional = LLMOutput("Черновик без ссылок", "model", "length")
+    proof = LLMOutput(json.dumps({"summary": claim, "quote": text}, ensure_ascii=False), "model", "stop")
+    chat = AsyncMock(side_effect=[proof] if streaming else [provisional, proof])
+    monkeypatch.setattr(route.llm, "chat", chat)
+
+    async def stream(*args, **kwargs):
+        yield provisional.text
+        yield LLMStreamEnd("length")
+
+    monkeypatch.setattr(route.llm, "stream_chat", stream)
+    payload = route.AnswerRequest(question="Сделай выжимку", summary_document_ids=[doc.id], max_tokens=800)
+    if streaming:
+        reply = await route.answer_stream(w.id, payload, db, None)
+        body = "".join([event async for event in reply.body_iterator])
+        assert chat.await_count == 1
+    else:
+        reply = await route.answer(w.id, payload, db, None)
+        body = reply.answer
+        assert reply.cited_source_indices == [1] and reply.citation_valid
+        assert chat.await_count == 2
+    assert claim + " [1]" in body and provisional.text not in body
+    assert '"summary"' in chat.await_args.args[0][0]["content"]
+    assert chat.await_args.kwargs["max_tokens"] <= 512

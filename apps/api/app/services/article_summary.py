@@ -1,6 +1,7 @@
 """Build document-level evidence for chat summaries of indexed workspace articles."""
 from __future__ import annotations
 
+import json
 import re
 import uuid
 from collections import defaultdict
@@ -17,6 +18,45 @@ from app.services.workspace_sources import includes_workspace_documents
 GREETING = "Привет! Могу обсудить вопрос, помочь с текстом или сделать выжимку по вашим статьям. Чем помочь?"
 CHOOSE_ARTICLES = "Какие статьи взять для выжимки? Выберите в чате от одной до трёх статей или укажите их полные названия."
 EXCERPT_NOTE = "Для длинных материалов выжимка составлена по фрагментам из начала, середины и конца текста."
+
+
+def verified_summary_claim(raw: str, article_text: str) -> str | None:
+    """Accept one concise claim paired with a real, relevant quotation from this article."""
+    block = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", raw.strip(), re.DOTALL | re.IGNORECASE)
+    try:
+        data = json.loads(block[1] if block else raw)
+    except (ValueError, RecursionError):
+        return None
+    if not isinstance(data, dict) or set(data) != {"summary", "quote"}:
+        return None
+    summary, quote = data["summary"], data["quote"]
+    if not isinstance(summary, str) or not isinstance(quote, str):
+        return None
+    summary, quote = " ".join(summary.split()), " ".join(quote.split())
+    if not (12 <= len(summary) <= 420 and 12 <= len(quote) <= 600):
+        return None
+    if re.search(r"\[\[|\[\s*\d|<[^>]+>|https?://|\]\(|```", summary + " " + quote, re.IGNORECASE):
+        return None
+    if quote not in " ".join(article_text.split()):
+        return None
+    # A real quote pasted alongside an unrelated claim is insufficient support.
+    # Use shared word stems for Russian inflection; numbers must match literally.
+    def anchors(text: str) -> set[str]:
+        return {w[:5] for w in re.findall(r"[^\W\d_]{4,}", text.casefold())
+                if w not in {"этого", "этот", "которые", "который", "также", "этой", "статья", "статье",
+                             "this", "that", "with", "article", "which"}}
+
+    claims = anchors(summary)
+    if len(claims & anchors(quote)) < max(2, (len(claims) + 2) // 3):
+        return None
+    numbers = r"\d+(?:[.,]\d+)*"
+    if set(re.findall(numbers, summary)) - set(re.findall(numbers, quote)):
+        return None
+    # Reversing a negation changes the claim even when the keywords match.
+    negation = r"\b(?:не|ни|нельзя|запрещ\w*|без|нет|no|not|never|without)\b"
+    if bool(re.search(negation, summary, re.IGNORECASE)) != bool(re.search(negation, quote, re.IGNORECASE)):
+        return None
+    return summary
 
 
 def is_greeting(question: str) -> bool:
