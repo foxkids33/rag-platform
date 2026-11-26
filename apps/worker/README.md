@@ -33,7 +33,8 @@ OCR_LANGUAGES=rus+eng
 OCR_TIMEOUT_SECONDS=20
 OCR_TOTAL_TIMEOUT_SECONDS=120
 OCR_MAX_PAGES=10
-PDF_MAX_PAGES=100
+# 0 снимает лимит числа страниц PDF. Положительное число задаёт лимит.
+PDF_MAX_PAGES=0
 IMAGE_MAX_PIXELS=16000000
 IMAGE_MAX_FRAMES=10
 
@@ -81,7 +82,8 @@ PARSER_MEMORY_MB=1536
 PARSER_CPU_SECONDS=120
 ```
 
-Дополнительно ограничены PDF pages, image pixels/frames, размер и распаковка
+Количество страниц с OCR ограничено отдельно от общего числа страниц PDF.
+Дополнительно ограничены image pixels/frames, размер и распаковка
 DOCX XML/ZIP. Неправильное расширение изображения не принимается за другой
 формат; SVG и анимированные изображения не разрешены. PDF JavaScript,
 Office macros и команды документов не исполняются. Эти меры не заменяют

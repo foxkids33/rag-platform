@@ -30,13 +30,13 @@ def image_bytes(format="PNG", size=(900, 200), text="BLUE-KB-942 SERVICE READY")
     return output.getvalue()
 
 
-def text_pdf(text="BLUE-KB-942 native PDF text"):
+def text_pdf(text="BLUE-KB-942 native PDF text", pages=1):
     """Generate a valid small text PDF without pulling in a document SDK."""
     content = f"BT /F1 16 Tf 40 120 Td ({text}) Tj ET".encode("ascii")
+    page_refs = " ".join(f"{5 + index} 0 R" for index in range(pages))
     objects = [
         b"<< /Type /Catalog /Pages 2 0 R >>",
-        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
-        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 600 200] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
+        f"<< /Type /Pages /Kids [{page_refs}] /Count {pages} >>".encode(),
         b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
         b"<< /Length "
         + str(len(content)).encode()
@@ -44,6 +44,8 @@ def text_pdf(text="BLUE-KB-942 native PDF text"):
         + content
         + b"\nendstream",
     ]
+    page = b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 600 200] /Resources << /Font << /F1 3 0 R >> >> /Contents 4 0 R >>"
+    objects.extend([page] * pages)
     output = bytearray(b"%PDF-1.4\n")
     offsets = []
     for index, obj in enumerate(objects, 1):
@@ -369,10 +371,15 @@ def test_pixel_limit_applied_before_decode(monkeypatch):
         parse_document("large.png", image_bytes())
 
 
-def test_pdf_page_limit(monkeypatch):
-    monkeypatch.setattr(settings, "pdf_max_pages", 0)
+def test_pdf_over_100_pages_keeps_all_page_references():
+    chunks = parse_document("book.pdf", text_pdf(pages=101))
+    assert [chunk.page_start for chunk in chunks] == list(range(1, 102))
+
+
+def test_configured_pdf_page_limit(monkeypatch):
+    monkeypatch.setattr(settings, "pdf_max_pages", 1)
     with pytest.raises(ValueError, match="page limit"):
-        parse_document("native.pdf", text_pdf())
+        parse_document("native.pdf", text_pdf(pages=2))
 
 
 def test_ocr_page_budget_is_not_silently_truncated(monkeypatch):

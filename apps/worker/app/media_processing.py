@@ -297,11 +297,12 @@ def extract_pdf(data: bytes) -> list[MediaPage]:
         except pdfium.PdfiumError as exc:
             raise ValueError("PDF is invalid, encrypted or cannot be opened") from exc
         try:
-            if len(document) > settings.pdf_max_pages:
+            page_count = len(document)
+            if settings.pdf_max_pages and page_count > settings.pdf_max_pages:
                 raise ValueError(
                     f"PDF exceeds the {settings.pdf_max_pages} page limit; split it"
                 )
-            for index in range(len(document)):
+            for index in range(page_count):
                 page = document[index]
                 try:
                     textpage = page.get_textpage()
