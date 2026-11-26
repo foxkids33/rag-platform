@@ -87,7 +87,7 @@ const kbVersions = (id) => [{
   embedding_model: "test", chunker_version: "test", created_at: now, activated_at: null,
 }];
 
-async function scenario(run, { failCreate = false, documents = [], messages = [], failImportBatch = 0, importPending = false, withKnowledgeBases = false, spacePageCount = 11, spacePageTitle = "Page", answerFinishReason } = {}) {
+async function scenario(run, { failCreate = false, documents = [], messages = [], failImportBatch = 0, importPending = false, withKnowledgeBases = false, spacePageCount = 11, spacePageTitle = "Page", answerFinishReason, answerMode = "hybrid" } = {}) {
   const context = await browser.newContext({ serviceWorkers: "block", viewport: { width: 1440, height: 1000 } });
   const unexpected = [];
   const pageErrors = [];
@@ -108,7 +108,7 @@ async function scenario(run, { failCreate = false, documents = [], messages = []
     if (path.endsWith("/answer/stream") && method === "POST" && answerFinishReason) {
       answerRequests.push(route.request().postDataJSON());
       const metadata = {
-        model: "test-model", retrieval_mode: "hybrid", context_chars: 120,
+        model: "test-model", retrieval_mode: answerMode, context_chars: 120,
         workspace_source_mode: "USER_DOCUMENTS", evidence_status: "strong",
         sources: [], cited_source_indices: [], finish_reason: answerFinishReason,
       };
@@ -187,11 +187,13 @@ async function scenario(run, { failCreate = false, documents = [], messages = []
     } else if (path.includes("/integrations/confluence/operations/")) {
       data = operations.get(path.split("/").at(-1));
       if (data.status === "LEASED") importPolls++;
-    } else if (path.endsWith("/integrations/confluence/connector")) {
-      data = { enabled: true, configured: true, online: true, can_manage: false,
+    } else if (path.endsWith("/integrations/confluence/connection")) {
+      const connector = { enabled: true, configured: true, online: true, can_manage: false,
         max_pages_per_job: 50, max_job_seconds: 1800,
         connectors: [{ id: "connector-test", name: "Тестовый коннектор", online: true, allowed_spaces: ["KBR"], capabilities: ["LIST_SPACE_PAGES"] }],
       };
+      data = { mode: "connector", enabled: true, configured: true, ready: true,
+        connector, max_pages_per_job: 50, max_job_seconds: 1800 };
     } else {
       unexpected.push(`${method} ${path}`);
       return route.abort();
@@ -210,6 +212,66 @@ async function scenario(run, { failCreate = false, documents = [], messages = []
   } finally {
     await context.close();
   }
+}
+
+test("greeting works in an empty workspace without retrieval diagnostics", async () => scenario(async (page, _, state) => {
+  const input = page.getByRole("textbox", { name: "Вопрос по источникам" });
+  await input.fill("Привет");
+  await input.press("Enter");
+  await page.getByText("Тестовый ответ", { exact: true }).waitFor();
+  assert.equal(state.answerRequests[0].question, "Привет");
+  assert.equal(Object.hasOwn(state.answerRequests[0], "summary_document_ids"), false);
+  assert.equal(state.answerRequests[0].chat_mode, "auto");
+  assert.equal(await page.locator(".answer-evidence").count(), 0);
+  await page.getByText("Без поиска по источникам", { exact: true }).waitFor();
+}, { answerMode: "conversation", answerFinishReason: "stop" }));
+
+test("general mode passes follow-ups in the same conversation and displays history without source claims", async () => scenario(async (page, _, state) => {
+  const mode = page.getByRole("combobox", { name: "Режим ответа" });
+  const input = page.getByRole("textbox", { name: "Вопрос по источникам" });
+  await mode.selectOption("general");
+  for (const text of ["Как подготовиться к собеседованию?", "А если опыта пока нет?"]) {
+    await input.fill(text);
+    const saved = page.waitForResponse(response => response.url().endsWith("/conversations/existing"));
+    await input.press("Enter");
+    await saved;
+    await page.getByText("Тестовый ответ", { exact: true }).last().waitFor();
+  }
+  assert.equal(state.answerRequests.length, 2);
+  assert.deepEqual(state.answerRequests.map(req => req.chat_mode), ["general", "general"]);
+  assert.equal(state.answerRequests[0].conversation_id, state.answerRequests[1].conversation_id);
+  assert.equal(state.answerRequests[1].parent_message_id, "generated");
+  await page.reload();
+  await page.getByText("Без поиска по источникам", { exact: true }).waitFor();
+  assert.equal(await page.locator(".answer-evidence").count(), 0);
+}, { documents: [documentRecord("ready")], answerMode: "conversation", answerFinishReason: "stop" }));
+
+test("explicit source mode reaches the answer API", async () => scenario(async (page, _, state) => {
+  await page.getByRole("combobox", { name: "Режим ответа" }).selectOption("sources");
+  await page.getByRole("textbox", { name: "Вопрос по источникам" }).fill("Какие сроки указаны в документе?");
+  await page.getByRole("button", { name: "Отправить вопрос" }).click();
+  await page.getByText("Тестовый ответ", { exact: true }).waitFor();
+  assert.equal(state.answerRequests[0].chat_mode, "sources");
+}, { documents: [documentRecord("ready")], answerFinishReason: "stop" }));
+
+for (const count of [1, 3]) {
+  test(`summary sends ${count} selected ready articles and preserves the ordinary chat draft`, async () => scenario(async (page, _, state) => {
+    const draft = page.getByRole("textbox", { name: "Вопрос по источникам" });
+    await draft.fill("Следующий вопрос");
+    await page.getByRole("button", { name: "Выжимка по документам", exact: true }).click();
+    const choices = page.locator(".summary-picker").getByRole("checkbox");
+    assert.equal(await choices.count(), 4);
+    for (let i = 0; i < count; i++) await choices.nth(i).check();
+    if (count === 3) assert.equal(await choices.last().isDisabled(), true);
+    await page.getByRole("button", { name: "Сделать выжимку", exact: true }).click();
+    await page.getByText("Тестовый ответ", { exact: true }).waitFor();
+    assert.deepEqual(state.answerRequests[0].summary_document_ids, ["a", "b", "c"].slice(0, count));
+    assert.equal(await draft.inputValue(), "Следующий вопрос");
+    assert.equal(await page.locator(".answer-evidence").count(), 0);
+  }, { documents: [
+    ...["a", "b", "c", "d"].map(id => documentRecord(id, { source_type: "CONFLUENCE" })),
+    documentRecord("disabled", { search_enabled: false }), documentRecord("pending", { status: "PROCESSING" }),
+  ], answerMode: "document_summary", answerFinishReason: "stop" }));
 }
 
 for (const limit of [2048, 800, 4096]) {

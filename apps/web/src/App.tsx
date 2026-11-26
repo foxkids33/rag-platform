@@ -20,6 +20,9 @@ import { CleanStart } from "./CleanStart";
 import { apiFetch as fetch } from "./api";
 import { useCanUseConfluence } from "./auth-context";
 import "./evidence-ui.css";
+import { DocumentSummaryPicker } from "./DocumentSummaryPicker";
+
+type ChatMode = "auto" | "general" | "sources";
 
 type WorkspaceSourceMode = "USER_DOCUMENTS" | "KNOWLEDGE_BASE" | "HYBRID";
 
@@ -76,7 +79,7 @@ type StoredMessageMetadata = {
   context_chars?: number;
   abstained?: boolean;
   abstention_reason?: AbstentionReason | null;
-  evidence_status?: "strong" | "limited" | "insufficient";
+  evidence_status?: "strong" | "limited" | "insufficient" | "not_applicable" | "selected_documents";
   evidence_score?: number | null;
   candidate_count?: number;
   selected_source_count?: number;
@@ -164,7 +167,7 @@ type StreamMetadata = {
   context_chars: number;
   abstained: boolean;
   abstention_reason: AbstentionReason | null;
-  evidence_status: "strong" | "limited" | "insufficient";
+  evidence_status: "strong" | "limited" | "insufficient" | "not_applicable" | "selected_documents";
   evidence_score: number | null;
   candidate_count: number;
   selected_source_count: number;
@@ -185,7 +188,7 @@ type StreamDone = {
   invalid_citations?: number[];
   abstained?: boolean;
   abstention_reason?: AbstentionReason | null;
-  evidence_status?: "strong" | "limited" | "insufficient";
+  evidence_status?: "strong" | "limited" | "insufficient" | "not_applicable" | "selected_documents";
   evidence_score?: number | null;
   query_selection_weight?: number;
   candidate_count?: number;
@@ -583,6 +586,7 @@ export function App() {
   });
   const [branchParentId, setBranchParentId] = useState<string | null>(null);
   const [question, setQuestion] = useState("");
+  const [chatMode, setChatMode] = useState<ChatMode>("auto");
   const [answerMaxTokens, setAnswerMaxTokens] = useState(2048);
   const [streamStage, setStreamStage] = useState<StreamStage>("idle");
   const [error, setError] = useState("");
@@ -640,14 +644,17 @@ export function App() {
     : selectedWorkspace?.source_mode === "KNOWLEDGE_BASE"
       ? hasActiveKnowledgeBase
       : searchableCount > 0 || hasActiveKnowledgeBase;
+  const summaryDocuments = selectedWorkspace?.source_mode === "KNOWLEDGE_BASE" ? [] : documents.filter(
+    (doc) => doc.workspace_id === selectedWorkspaceId && doc.status === "READY" && doc.search_enabled,
+  );
   const isStreaming = streamStage !== "idle";
   const visibleConversations = showAllConversations
     ? conversations
     : conversations.slice(0, COLLAPSED_CONVERSATION_COUNT);
   const canSubmit = Boolean(
     selectedWorkspaceId
-    && hasSearchableContent
-    && question.trim()
+    && !conversationActionId
+    && question.trim().length >= 2
     && !isStreaming
     && !conversationLoading
   );
@@ -840,6 +847,7 @@ export function App() {
     setSelectedConversationId("");
     setQuestion("");
     setError("");
+    setChatMode("auto");
     setSelectedWorkspaceId(workspaceId);
   };
 
@@ -1122,9 +1130,9 @@ export function App() {
     )));
   };
 
-  const submitQuestion = async (rawQuestion?: string) => {
+  const submitQuestion = async (rawQuestion?: string, summaryDocumentIds?: string[]) => {
     const text = (rawQuestion ?? question).trim();
-    if (!selectedWorkspaceId || !hasSearchableContent || !text || isStreaming) return;
+    if (!selectedWorkspaceId || text.length < 2 || isStreaming || conversationLoading || conversationActionId) return;
 
     let conversationId = selectedConversationId;
     if (!conversationId) {
@@ -1151,7 +1159,7 @@ export function App() {
 
     setMessages((current) => [...current, userMessage, assistantMessage]);
     setBranchParentId(assistantId);
-    setQuestion("");
+    if (!summaryDocumentIds) setQuestion("");
     setError("");
     setStreamStage("retrieving");
 
@@ -1166,6 +1174,7 @@ export function App() {
         signal: controller.signal,
         body: JSON.stringify({
           question: text,
+          ...(summaryDocumentIds ? { summary_document_ids: summaryDocumentIds } : { chat_mode: chatMode }),
           conversation_id: conversationId,
           parent_message_id: userMessage.parentMessageId || null,
           mode: "hybrid",
@@ -1237,15 +1246,19 @@ export function App() {
           : message
       )));
     } finally {
-      if (activeRequest.current === controller) activeRequest.current = null;
-      setStreamStage("idle");
       try {
         await refreshConversations(selectedWorkspaceId);
-        if (conversationId) {
+        if (conversationId && workspaceIdRef.current === selectedWorkspaceId &&
+            (!activeRequest.current || activeRequest.current === controller)) {
           await loadConversation(selectedWorkspaceId, conversationId, persistedAssistantId);
         }
       } catch {
         // The completed answer remains visible even if the sidebar refresh fails.
+      } finally {
+        if (activeRequest.current === controller) {
+          activeRequest.current = null;
+          setStreamStage("idle");
+        }
       }
     }
   };
@@ -1261,9 +1274,7 @@ export function App() {
     ? "Выберите рабочую область"
     : conversationLoading
       ? "Загружается история диалога"
-      : !hasSearchableContent
-        ? "Добавьте документ и дождитесь статуса «Готов»"
-        : "Enter — отправить, Shift+Enter — новая строка";
+      : "Enter — отправить, Shift+Enter — новая строка";
 
   if (CLEAN_INSTALL && !selectedWorkspace) {
     return (
@@ -1675,8 +1686,8 @@ export function App() {
             {!conversationLoading && messages.length === 0 && (
               <div className="empty-state">
                 <div className="spark">✦</div>
-                <h1>Задайте вопрос по документам</h1>
-                <p>Ответ строится по hybrid retrieval и выбранным источникам. Проверяйте утверждения по ссылкам под ответом.</p>
+                <h1>Чем помочь?</h1>
+                <p>{hasSearchableContent ? "Задайте вопрос по материалам пространства или попросите выжимку." : "Начните диалог. Для вопросов по источникам добавьте документы."}</p>
                 <div className="summary-card">
                   <span><strong>{documents.length}</strong> документов workspace</span>
                   <span><strong>{searchableCount}</strong> включено в поиск</span>
@@ -1684,7 +1695,7 @@ export function App() {
                     <span><strong>{selectedKnowledgeBase.active_document_count}</strong> в базе знаний</span>
                   )}
                 </div>
-                {hasSearchableContent && (
+                {hasSearchableContent && chatMode !== "general" && (
                   <div className="suggestions">
                     {SUGGESTED_QUESTIONS.map((item) => (
                       <button key={item} onClick={() => void submitQuestion(item)}>{item}</button>
@@ -1715,7 +1726,13 @@ export function App() {
                     />
                   )}
 
-                  {message.role === "assistant" && message.metadata && (
+                  {message.metadata?.retrieval_mode === "conversation" && (
+                    <div className="answer-meta"><span>Без поиска по источникам</span></div>
+                  )}
+                  {message.metadata?.retrieval_mode === "document_summary" && (
+                    <div className="answer-meta"><span>Выжимка по документам</span></div>
+                  )}
+                  {message.role === "assistant" && message.metadata && !["conversation", "document_summary"].includes(message.metadata.retrieval_mode) && (
                     <div className="answer-meta">
                       <span>{message.metadata.retrieval_mode}</span>
                       <span>{workspaceModeLabel(message.metadata.workspace_source_mode)}</span>
@@ -1747,7 +1764,7 @@ export function App() {
                     </div>
                   )}
 
-                  {message.role === "assistant" && message.metadata && (
+                  {message.role === "assistant" && message.metadata && !["conversation", "document_summary"].includes(message.metadata.retrieval_mode) && (
                     <details className="answer-evidence">
                       <summary>Как выбран ответ <span aria-hidden="true">↗</span></summary>
                       <div>
@@ -1822,7 +1839,7 @@ export function App() {
             {isStreaming && (
               <div className="stream-status">
                 <span className="spinner" />
-                {streamStage === "retrieving" ? "Ищу и ранжирую источники…" : "Формирую ответ…"}
+                {streamStage === "retrieving" ? "Обрабатываю запрос…" : "Формирую ответ…"}
               </div>
             )}
             <div ref={chatEnd} />
@@ -1836,7 +1853,14 @@ export function App() {
                 <button type="button" onClick={() => selectViewMode("graph")}>Выбрать другую карточку</button>
               </div>
             )}
-            <div className={`composer ${!hasSearchableContent ? "disabled-composer" : ""}`}>
+            {summaryDocuments.length > 0 && (
+              <DocumentSummaryPicker key={`${selectedWorkspaceId}/${selectedConversationId}`}
+                documents={summaryDocuments}
+                disabled={isStreaming || conversationLoading || Boolean(conversationActionId)}
+                onSubmit={(text, ids) => void submitQuestion(text, ids)}
+              />
+            )}
+            <div className="composer">
               <input
                 ref={attachmentInput}
                 type="file"
@@ -1862,8 +1886,8 @@ export function App() {
               <textarea
                 aria-label="Вопрос по источникам"
                 value={question}
-                disabled={!selectedWorkspaceId || !hasSearchableContent || conversationLoading}
-                placeholder={hasSearchableContent ? "Спросите по выбранным источникам…" : "Подключите источник с готовыми документами"}
+                disabled={!selectedWorkspaceId || conversationLoading}
+                placeholder={chatMode === "sources" ? "Задайте вопрос по источникам…" : "Напишите сообщение…"}
                 rows={1}
                 onChange={(event) => setQuestion(event.target.value)}
                 onKeyDown={handleComposerKeyDown}
@@ -1875,6 +1899,14 @@ export function App() {
               )}
             </div>
             <div className="composer-options">
+              <label>
+                Режим ответа
+                <select value={chatMode} disabled={isStreaming} onChange={(event) => setChatMode(event.target.value as ChatMode)}>
+                  <option value="auto">Авто</option>
+                  <option value="general">Общий чат</option>
+                  <option value="sources">Только по источникам</option>
+                </select>
+              </label>
               <label>
                 Лимит ответа
                 <select value={answerMaxTokens} disabled={isStreaming} onChange={(event) => setAnswerMaxTokens(Number(event.target.value))}>
