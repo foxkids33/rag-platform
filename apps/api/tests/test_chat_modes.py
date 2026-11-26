@@ -241,3 +241,39 @@ async def test_single_article_repair_uses_verbatim_grounding_before_attaching_ci
     assert claim + " [1]" in body and provisional.text not in body
     assert '"summary"' in chat.await_args.args[0][0]["content"]
     assert chat.await_args.kwargs["max_tokens"] <= 512
+
+
+def test_extractive_summary_keeps_substantive_complete_sentences_from_across_article():
+    intro = "Партнёр передаёт инженеру документацию для приёмки сборки."
+    body = "Инженеры проверяют контрольную сумму образа перед испытаниями."
+    end = "В итоговом отчёте менеджер фиксирует согласованные результаты."
+    title = "Как сотрудники проводят приёмку новой сборки?"
+    lines = [
+        title, "Автор: Администратор портала управления проектами.",
+        "Перейти к списку разделов корпоративного портала.", "![Снимок экрана](https://img.test/i)",
+        intro, "[Макрос Jira: содержимое не извлечено]", intro, "```python",
+        "Инженеры исполняют код, который нельзя цитировать в выжимке.", "```",
+        body, "Это обрезанный фрагмент без завершающего знака", end,
+    ]
+    text = "\n".join(lines)
+    chosen = summaries.representative_sentences(text, title)
+    assert chosen == [intro, body, end]
+    assert all(sentence in text for sentence in chosen)
+    assert summaries.representative_sentences(intro + "\n" + intro) == []
+
+
+@pytest.mark.asyncio
+async def test_single_article_extractive_summary_keeps_one_verified_source(monkeypatch):
+    doc, w, db = article("Приёмка"), workspace(), AsyncMock()
+    text = ("Инженеры сравнивают контрольную сумму перед испытаниями.\n"
+            "Менеджер регистрирует результат в рабочей карточке.")
+    db.scalars.return_value = Mock(all=lambda: [doc])
+    db.execute.return_value = Mock(all=lambda: [SimpleNamespace(id=uuid4(), document_id=doc.id, chunk_index=0,
+                                                               text=text, page_start=None, page_end=None)])
+    monkeypatch.setattr(route, "workspace_for_principal", AsyncMock(return_value=w))
+    prepared = await route._prepare_answer(w.id, route.AnswerRequest(question="Выжимка", summary_document_ids=[doc.id]), db, None)
+    assert "Тезис статьи 1 [1]." in prepared.messages[0]["content"] and "[2]" not in prepared.messages[0]["content"]
+    resolved, audit, _ = route._finish_generated("Ответ без ссылок", prepared, route._answer_sources(prepared.context.sources))
+    assert resolved.text.startswith("Выжимка из предложений статьи")
+    assert all(sentence + " [1]" in resolved.text for sentence in text.splitlines())
+    assert audit.valid and audit.cited_source_indices == [1]

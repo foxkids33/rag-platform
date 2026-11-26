@@ -413,6 +413,13 @@ def _finish_generated(
                 excerpt = re.sub(r"\[(\d+)\]", r"(\1)", excerpt)
                 quotes.append(f"«{excerpt}» {source.citation}")
             text = "Ключевые фрагменты выбранных материалов:\n\n" + "\n\n".join(quotes)
+            if len(sources) == 1:
+                body = prepared.context.text.partition("\n")[2]
+                sentences = article_summary.representative_sentences(body, sources[0].heading)
+                if sentences:
+                    text = "Выжимка из предложений статьи:\n\n" + "\n\n".join(
+                        f"{sentence} {sources[0].citation}" for sentence in sentences
+                    )
             resolved = ResolvedAnswer(text, False, None)
             audit = _audit_resolved_answer(resolved, sources)
             code = CodeIntegrityAudit()
@@ -605,8 +612,15 @@ async def _prepare_answer(
             reply = article_summary.GREETING
         mode = "document_summary" if context.sources else "conversation"
         if mode == "document_summary":
+            examples = " ".join(
+                f"Тезис статьи {src.index} {src.citation}." for src in context.sources
+            )
             messages = [
-                {"role": "system", "content": SUMMARY_PROMPT},
+                {"role": "system", "content": (
+                    SUMMARY_PROMPT + " Ссылка — номер в квадратных скобках. "
+                    f"Формат ответа после управляющей строки: {examples} "
+                    "Замени примеры тезисов конкретными выводами из соответствующих статей."
+                )},
                 {"role": "user", "content": f"МАТЕРИАЛЫ:\n{context.text}\n\nЗАПРОС:\n{question}"},
             ]
         else:

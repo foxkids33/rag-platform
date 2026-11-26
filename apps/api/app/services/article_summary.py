@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import re
 import uuid
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Sequence
 
 from fastapi import HTTPException
@@ -18,6 +18,61 @@ from app.services.workspace_sources import includes_workspace_documents
 GREETING = "Привет! Могу обсудить вопрос, помочь с текстом или сделать выжимку по вашим статьям. Чем помочь?"
 CHOOSE_ARTICLES = "Какие статьи взять для выжимки? Выберите в чате от одной до трёх статей или укажите их полные названия."
 EXCERPT_NOTE = "Для длинных материалов выжимка составлена по фрагментам из начала, середины и конца текста."
+
+
+def representative_sentences(article_text: str, title: str | None = None) -> list[str]:
+    """Choose complete, verbatim sentences from different parts of bounded model context."""
+    candidates: list[tuple[str, set[str]]] = []
+    seen = {" ".join((title or "").casefold().split())}
+    stop = {"когда", "также", "этого", "этой", "этом", "котор", "после", "перед", "своих",
+            "which", "with", "that", "from", "this", "their", "этот", "чтобы"}
+    for section_no, section in enumerate(article_text.split("\n[…]\n")):
+        fence = ""
+        for line_no, raw_line in enumerate(section.splitlines()):
+            line = raw_line.strip()
+            if line.startswith(("```", "~~~")):
+                fence = "" if fence == line[:3] else fence or line[:3]
+                continue
+            if fence or not line or line.startswith(("#", "|", "!", "<", "[", "$ ", "> ", "{")):
+                continue
+            if re.match(
+                r"(?:Автор|Владелец страницы|Дата (?:создания|изменения)|Версия страницы|"
+                r"Навигация|Содержание|Оглавление|См\. также|Метки|Источник|Заголовок|Page ID|"
+                r"Last updated|Table of contents)\s*[:—]|(?:Перейти к|Back to top|Skip to)\b",
+                line, re.IGNORECASE,
+            ):
+                continue
+            line = re.sub(r"^(?:[-*•]|\d+[.)])\s+", "", line)
+            for index, sentence in enumerate(re.split(r"(?<=[.!?])\s+", line)):
+                # The second and third sampled sections may start mid-sentence.
+                if section_no and line_no == index == 0:
+                    continue
+                if not 30 <= len(sentence) <= 470 or sentence[-1] not in ".!?" or not sentence[0].isupper():
+                    continue
+                if any(marker in sentence for marker in ("[", "]", "`", "{", "}", "<", "://", "|", "…")):
+                    continue
+                words = re.findall(r"[^\W\d_]{4,}", sentence.casefold())
+                terms = {word[:5] for word in words if word[:5] not in stop}
+                key = " ".join(sentence.casefold().split())
+                if len(terms) >= 3 and key not in seen:
+                    candidates.append((sentence, terms))
+                    seen.add(key)
+    if len(candidates) < 2:
+        return []
+    frequency = Counter(term for _, terms in candidates for term in terms)
+    ranks = [sum(frequency[word] for word in terms) / len(terms) for _, terms in candidates]
+    size = min(3, len(candidates))
+    chosen = []
+    # Rank by recurring terms inside each third, so a conclusion or final topic
+    # can survive even when a long introduction repeats the same vocabulary.
+    for group in range(size):
+        region = range(group * len(candidates) // size, (group + 1) * len(candidates) // size)
+        for idx in sorted(region, key=lambda i: ranks[i], reverse=True):
+            words = candidates[idx][1]
+            if all(len(words & candidates[j][1]) / len(words | candidates[j][1]) < .6 for j in chosen):
+                chosen.append(idx)
+                break
+    return [candidates[i][0] for i in chosen] if len(chosen) >= 2 else []
 
 
 def verified_summary_claim(raw: str, article_text: str) -> str | None:
