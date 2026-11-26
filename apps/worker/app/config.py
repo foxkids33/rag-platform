@@ -39,6 +39,7 @@ class Settings(BaseSettings):
     parser_memory_mb: int = Field(default=1536, ge=384, le=4096)
     parser_cpu_seconds: int = Field(default=120, ge=5, le=300)
     pdf_max_pages: int = Field(default=0, ge=0)
+    pdf_timeout_seconds: float = Field(default=3600, ge=5, le=86_400)
     image_max_pixels: int = Field(default=16_000_000, ge=10_000, le=40_000_000)
     image_max_frames: int = Field(default=10, ge=1, le=30)
     ocr_enabled: bool = True
@@ -57,6 +58,10 @@ class Settings(BaseSettings):
     vision_max_image_edge: int = Field(default=1600, ge=256, le=2048)
     vision_max_tokens: int = Field(default=900, ge=64, le=2000)
     vision_enable_thinking: bool | None = None
+
+    @property
+    def pdf_batch_pages(self) -> int:
+        return min(10, self.ocr_max_pages)
 
     @field_validator("ocr_languages")
     @classmethod

@@ -468,3 +468,69 @@ def test_real_tesseract_russian_ocr(monkeypatch):
     )
     text = "\n".join(chunk.text for chunk in chunks)
     assert "проверка" in text.lower() and "подключения" in text.lower()
+
+
+@pytest.mark.parametrize("fail_on_last_page", [False, True])
+def test_isolated_pdf_recognizes_scans_past_first_batch(tmp_path, monkeypatch, fail_on_last_page):
+    import os
+    import pypdfium2 as pdfium
+    from app.parser_process import parse_document_isolated
+
+    # The actual PDF renderer and parser subprocesses run; only Tesseract is a stand-in.
+    executable = tmp_path / "tesseract"
+    executable.write_text(
+        "#!/bin/sh\ncat >/dev/null\n"
+        'state="$TEST_OCR_COUNT"\ncount=0\n'
+        'if [ -f "$state" ]; then read -r count < "$state"; fi\n'
+        'count=$((count + 1))\necho "$count" > "$state"\n'
+        'if [ "$count" = "$TEST_OCR_FAIL_AT" ]; then exit 1; fi\n'
+        'echo "Scanned page $count"\n'
+    )
+    executable.chmod(0o700)
+    counter = tmp_path / "calls"
+    monkeypatch.setenv("PATH", str(tmp_path) + os.pathsep + os.environ["PATH"])
+    monkeypatch.setenv("TEST_OCR_COUNT", str(counter))
+    monkeypatch.setenv("TEST_OCR_FAIL_AT", "12" if fail_on_last_page else "0")
+    monkeypatch.setenv("VISION_ENABLED", "false")
+    output = BytesIO()
+    with pdfium.PdfDocument.new() as book, pdfium.PdfDocument(image_bytes("PDF", size=(100, 100))) as source:
+        for _ in range(12):
+            book.import_pages(source)
+        book.save(output)
+
+    if fail_on_last_page:
+        with pytest.raises(ValueError, match="PDF page 12: Required OCR failed"):
+            parse_document_isolated("scan.pdf", output.getvalue())
+    else:
+        chunks = parse_document_isolated("scan.pdf", output.getvalue())
+        assert [chunk.page_start for chunk in chunks] == list(range(1, 13))
+        assert "Scanned page 12" in chunks[-1].text
+        assert chunks[-1].metadata["extraction_methods"] == ["ocr"]
+    assert int(counter.read_text()) == 12
+
+
+def test_isolated_pdf_applies_text_budget_across_batches(monkeypatch):
+    from app.parser_process import parse_document_isolated
+
+    monkeypatch.setenv("PARSER_MAX_TEXT_CHARS", "1000")
+    monkeypatch.setattr(settings, "parser_max_text_chars", 1000)
+    with pytest.raises(ValueError, match="extracted text safety limit"):
+        parse_document_isolated("large.pdf", text_pdf(text="abc def " * 6, pages=23))
+
+
+def test_pdf_graphics_after_vision_budget_do_not_render(monkeypatch):
+    import pypdfium2 as pdfium
+
+    data = text_pdf(text="Blue) Tj ET 0 0 m 10 10 l S BT (diagram", pages=2)
+    monkeypatch.setattr(settings, "vision_enabled", True)
+    monkeypatch.setattr(settings, "vision_max_images_per_document", 1)
+    def vision(image, budget):
+        budget.vision_images += 1
+        return "Diagram", []
+    monkeypatch.setattr(media_processing, "_vision", vision)
+    pages, _, calls = media_processing.extract_pdf_range(data, 0, 1, 0, 10000)
+    assert "vision" in pages[0].metadata["extraction_methods"] and calls == 1
+    monkeypatch.setattr(pdfium.PdfPage, "render", lambda *a, **kw: pytest.fail("vision budget exhausted"))
+    pages, _, calls = media_processing.extract_pdf_range(data, 1, 2, calls, 10000)
+    assert calls == 1 and pages[0].page_number == 2
+    assert "vision_image_budget_exceeded" in pages[0].metadata["warnings"]

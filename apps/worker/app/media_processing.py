@@ -283,12 +283,21 @@ def extract_image(filename: str, data: bytes) -> list[MediaPage]:
 
 
 def extract_pdf(data: bytes) -> list[MediaPage]:
-    """Extract PDF text locally; OCR scanned pages without optional Docling."""
+    pages, _, _ = extract_pdf_range(data, 0, None, 0, settings.parser_max_text_chars)
+    if not pages:
+        raise ValueError("PDF produced no readable text; check the scan or vision configuration")
+    return pages
+
+
+def extract_pdf_range(
+    data: bytes, start: int, stop: int | None, vision_images: int, char_limit: int
+) -> tuple[list[MediaPage], int, int]:
+    """Read an original page range. Return total pages and cumulative vision calls."""
     import pypdfium2 as pdfium
 
     if not data.startswith(b"%PDF-"):
         raise ValueError("PDF signature is invalid")
-    budget = MediaBudget()
+    budget = MediaBudget(vision_images=vision_images)
     pages = []
     total_chars = 0
     with _PDF_LOCK:
@@ -302,14 +311,19 @@ def extract_pdf(data: bytes) -> list[MediaPage]:
                 raise ValueError(
                     f"PDF exceeds the {settings.pdf_max_pages} page limit; split it"
                 )
-            for index in range(page_count):
+            batch_size = settings.pdf_batch_pages
+            for index in range(start, min(page_count, stop) if stop is not None else page_count):
+                # Direct callers and isolated workers use the same OCR batch boundaries.
+                if index % batch_size == 0:
+                    budget.ocr_pages = 0
+                    budget.ocr_seconds = 0
                 page = document[index]
                 try:
                     textpage = page.get_textpage()
                     try:
                         if (
                             textpage.count_chars()
-                            > settings.parser_max_text_chars - total_chars
+                            > char_limit - total_chars
                         ):
                             raise ValueError(
                                 "PDF exceeds the extracted text safety limit"
@@ -319,6 +333,8 @@ def extract_pdf(data: bytes) -> list[MediaPage]:
                         )
                     finally:
                         textpage.close()
+                    if not native_text and next(page.get_objects(max_depth=5), None) is None:
+                        continue
                     has_images = (
                         next(
                             page.get_objects(
@@ -356,7 +372,11 @@ def extract_pdf(data: bytes) -> list[MediaPage]:
                         "warnings": [],
                     }
                     text = native_text
-                    if needs_ocr or (has_graphics and settings.vision_enabled):
+                    want_vision = has_graphics and settings.vision_enabled
+                    vision_available = budget.vision_images < settings.vision_max_images_per_document
+                    if want_vision and not vision_available and not needs_ocr:
+                        metadata["warnings"].append("vision_image_budget_exceeded")
+                    if needs_ocr or (want_vision and vision_available):
                         width, height = page.get_size()
                         if not all(math.isfinite(v) and v > 0 for v in (width, height)):
                             raise ValueError("PDF page dimensions are invalid")
@@ -385,6 +405,9 @@ def extract_pdf(data: bytes) -> list[MediaPage]:
                                 image.close()
                         finally:
                             bitmap.close()
+                        failures = {"ocr_timeout", "ocr_failed_check_installed_languages", "ocr_engine_unavailable"}
+                        if needs_ocr and failures.intersection(extracted.metadata["warnings"]):
+                            raise ValueError("Required OCR failed: " + ", ".join(extracted.metadata["warnings"]))
                         metadata["extraction_methods"].extend(
                             extracted.metadata["extraction_methods"]
                         )
@@ -412,17 +435,15 @@ def extract_pdf(data: bytes) -> list[MediaPage]:
                             )
                         continue
                     total_chars += len(text)
-                    if total_chars > settings.parser_max_text_chars:
+                    if total_chars > char_limit:
                         raise ValueError("PDF exceeds the extracted text safety limit")
                     pages.append(MediaPage(text, index + 1, metadata))
+                except ValueError as exc:
+                    raise ValueError(f"PDF page {index + 1}: {exc}") from exc
                 finally:
                     page.close()
         except pdfium.PdfiumError as exc:
             raise ValueError("PDF page is damaged or cannot be decoded") from exc
         finally:
             document.close()
-    if not pages:
-        raise ValueError(
-            "PDF produced no readable text; check the scan or vision configuration"
-        )
-    return pages
+    return pages, page_count, budget.vision_images

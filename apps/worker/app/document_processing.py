@@ -49,11 +49,11 @@ def parse_document(filename: str, data: bytes) -> list[ParsedChunk]:
         elif extension == ".pdf":
             from app.media_processing import extract_pdf
 
-            chunks = _media_chunks(filename, extract_pdf(data), "pdf_cpu_v1")
+            chunks = media_chunks(filename, extract_pdf(data), "pdf_cpu_v1")
         elif extension in {".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff"}:
             from app.media_processing import extract_image
 
-            chunks = _media_chunks(filename, extract_image(filename, data), "image_ocr_vision_v1")
+            chunks = media_chunks(filename, extract_image(filename, data), "image_ocr_vision_v1")
         elif extension in TEXT_EXTENSIONS:
             chunks = _parse_plain_text(filename, data)
         else:
@@ -65,7 +65,7 @@ def parse_document(filename: str, data: bytes) -> list[ParsedChunk]:
     return chunks
 
 
-def _media_chunks(filename: str, pages: Iterable[Any], parser: str) -> list[ParsedChunk]:
+def media_chunks(filename: str, pages: Iterable[Any], parser: str) -> list[ParsedChunk]:
     records = []
     for page in pages:
         heading = f"{filename} — страница {page.page_number}"
