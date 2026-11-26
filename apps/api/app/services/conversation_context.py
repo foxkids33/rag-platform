@@ -89,22 +89,25 @@ def branch_history(
     max_messages: int,
     max_chars: int,
 ) -> list[HistoryMessage]:
+    chain = ordered_ancestors(messages, parent_message_id)
+    return trim_history(
+        [HistoryMessage(role=message.role, content=message.content) for message in chain],
+        max_messages=max_messages, max_chars=max_chars,
+    )
+
+
+def ordered_ancestors(messages: list[BranchMessage], parent_message_id: object | None) -> list[BranchMessage]:
     """Return only ancestors of the selected graph node, oldest first."""
-    if parent_message_id is None:
-        return []
-
     by_id = {message.id: message for message in messages}
-    chain: list[HistoryMessage] = []
+    chain: list[BranchMessage] = []
     visited: set[object] = set()
-    current_id: object | None = parent_message_id
-
+    current_id = parent_message_id
     while current_id is not None and current_id not in visited:
-        visited.add(current_id)
         current = by_id.get(current_id)
         if current is None:
             break
-        chain.append(HistoryMessage(role=current.role, content=current.content))
+        visited.add(current_id)
+        chain.append(current)
         current_id = current.parent_message_id
-
     chain.reverse()
-    return trim_history(chain, max_messages=max_messages, max_chars=max_chars)
+    return chain

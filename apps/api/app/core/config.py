@@ -125,6 +125,7 @@ class Settings(BaseSettings):
     rag_source_limit: int = 5
     rag_history_messages: int = 8
     rag_history_max_chars: int = 8000
+    rag_history_summary_chars: int = Field(default=2400, ge=0, le=8000)
     rag_rewrite_followups: bool = True
     rag_rewrite_max_tokens: int = 160
     rag_min_source_score: float = 0.05

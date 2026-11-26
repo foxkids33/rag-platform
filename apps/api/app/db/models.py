@@ -279,6 +279,21 @@ class ChatMessage(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+class ChatHistoryCheckpoint(Base):
+    """Private summary of a branch through the anchor message, inclusive."""
+
+    __tablename__ = "chat_history_checkpoints"
+    __table_args__ = (
+        CheckConstraint("scope IN ('general', 'grounded')", name="ck_chat_history_checkpoint_scope"),
+    )
+
+    message_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("chat_messages.id", ondelete="CASCADE"), primary_key=True
+    )
+    scope: Mapped[str] = mapped_column(String(16), primary_key=True)
+    summary: Mapped[str] = mapped_column(Text, nullable=False)
+
+
 class IngestionJob(Base):
     __tablename__ = "ingestion_jobs"
     __table_args__ = (

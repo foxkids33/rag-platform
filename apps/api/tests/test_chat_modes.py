@@ -78,7 +78,10 @@ async def test_general_history_excludes_questions_and_answers_from_grounded_exch
             ))
     db = AsyncMock()
     db.get.return_value = SimpleNamespace(id=session, workspace_id=w.id)
-    db.execute.return_value = Mock(scalars=lambda: rows)
+    projected = [SimpleNamespace(id=row.id, parent_message_id=row.parent_message_id, role=row.role,
+                                 content=row.content if row.metadata_["retrieval_mode"] == "conversation" else "")
+                 for row in rows]
+    db.execute.return_value = Mock(all=lambda: projected)
     _, history, _ = await route._load_conversation_history(db, w.id, session, rows[-1].id, general_only=True)
     assert [msg.content for msg in history] == ["мой цвет", "синий"]
 

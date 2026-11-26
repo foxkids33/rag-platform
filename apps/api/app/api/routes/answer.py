@@ -11,7 +11,7 @@ from typing import Literal
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator
-from sqlalchemy import or_, select
+from sqlalchemy import case, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.routes.search import SearchRequest, SearchResponse, search
@@ -20,7 +20,7 @@ from app.core.config import settings
 from app.core.security import Principal, get_current_principal
 from app.db.models import ChatMessage, ChatSession, Document, KnowledgeBase, Workspace
 from app.db.session import SessionLocal, get_db
-from app.services import article_summary
+from app.services import article_summary, conversation_memory
 from app.services.answer_contract import (
     ABSTAIN_MARKER,
     ANSWER_MARKER,
@@ -40,8 +40,8 @@ from app.services.conversation_context import (
     BranchMessage,
     HistoryMessage,
     answer_history_messages,
-    branch_history,
     derive_conversation_title,
+    ordered_ancestors,
     rewrite_messages,
 )
 from app.services.llm import LLMError, LLMOutput, LLMStreamEnd, llm
@@ -466,7 +466,7 @@ async def _load_conversation_history(
     workspace_id: uuid.UUID,
     conversation_id: uuid.UUID | None,
     parent_message_id: uuid.UUID | None,
-    *, general_only: bool = False,
+    *, general_only: bool = False, compact: bool = True,
 ) -> tuple[ChatSession | None, list[HistoryMessage], uuid.UUID | None]:
     if conversation_id is None:
         if parent_message_id is not None:
@@ -479,12 +479,34 @@ async def _load_conversation_history(
     if conversation is None or conversation.workspace_id != workspace_id:
         raise HTTPException(status_code=404, detail="Conversation not found")
 
+    endpoint = parent_message_id
+    if endpoint is None:
+        endpoint = (
+            select(ChatMessage.id)
+            .where(ChatMessage.session_id == conversation.id, ChatMessage.role == "assistant")
+            .order_by(ChatMessage.created_at.desc(), ChatMessage.id.desc())
+            .limit(1).correlate(None).scalar_subquery()
+        )
+    # The recursive term cannot cross a conversation boundary, even for a
+    # legacy malformed parent link. UNION terminates on a repeated id.
+    ancestry = select(ChatMessage.id, ChatMessage.parent_message_id).where(
+        ChatMessage.session_id == conversation.id, ChatMessage.id == endpoint,
+    ).cte("ancestry", recursive=True)
+    ancestry = ancestry.union(select(ChatMessage.id, ChatMessage.parent_message_id).join(
+        ancestry, ChatMessage.id == ancestry.c.parent_message_id,
+    ).where(ChatMessage.session_id == conversation.id))
+    content = ChatMessage.content
+    if general_only:
+        content = case(
+            (ChatMessage.metadata_["retrieval_mode"].as_string() == "conversation", ChatMessage.content),
+            else_="",
+        )
     result = await db.execute(
-        select(ChatMessage)
-        .where(ChatMessage.session_id == conversation.id)
-        .order_by(ChatMessage.created_at.asc(), ChatMessage.role.desc(), ChatMessage.id.asc())
+        select(ChatMessage.id, ChatMessage.parent_message_id, ChatMessage.role, content.label("content"))
+        .join(ancestry, ChatMessage.id == ancestry.c.id)
+        .order_by(ChatMessage.created_at.asc(), ChatMessage.id.asc())
     )
-    rows = list(result.scalars())
+    rows = result.all()
     by_id = {row.id: row for row in rows}
 
     resolved_parent_id = parent_message_id
@@ -503,19 +525,20 @@ async def _load_conversation_history(
                 status_code=400, detail="Branches must continue from an assistant message"
             )
 
-    history = branch_history(
+    branch = ordered_ancestors(
         [
             BranchMessage(
                 id=row.id,
                 parent_message_id=row.parent_message_id,
                 role=row.role,
-                content=(row.content if not general_only or (row.metadata_ or {}).get("retrieval_mode") == "conversation" else ""),
+                content=row.content,
             )
             for row in rows
         ],
         resolved_parent_id,
-        max_messages=settings.rag_history_messages,
-        max_chars=settings.rag_history_max_chars,
+    )
+    history = await conversation_memory.prompt_history(
+        db, conversation.id, branch, "general" if general_only else "grounded", compact=compact,
     )
     return conversation, history, resolved_parent_id
 
@@ -601,6 +624,7 @@ async def _prepare_answer(
     )
     conversation, history, parent_message_id = await _load_conversation_history(
         db, workspace_id, payload.conversation_id, payload.parent_message_id, general_only=general,
+        compact=not (summarize or greet),
     )
     if summarize or greet or general:
         context, reply, excerpted = article_summary.empty_context(), None, False
